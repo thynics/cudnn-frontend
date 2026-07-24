@@ -50,6 +50,22 @@ python benchmark_dsa_sparse_attention_backward.py --seqlens 4096,8192,16384 --to
 python benchmark_dsa_sparse_attention_backward.py --head-dim 576   # 512 value dims + 64 RoPE dims
 ```
 
+## Correctness smoke test
+
+Run the single SM100 target case (`GQA=128`, `d_qk = d_v = 512`, bf16) before
+collecting performance results:
+
+```bash
+python check_dsa_bwd_gqa128_d512.py
+```
+
+This smoke test is validated on B200 with NVIDIA's official NGC PyTorch
+container `nvcr.io/nvidia/pytorch:26.05-py3` and this checkout's `cutedsl` extra.
+
+The script checks `dQ`, `dKV`, and `dSink` against the repository's FP32
+PyTorch autograd reference. It intentionally uses one small sparse shape
+rather than a parameter sweep.
+
 Options:
 
 - `--seqlens` — comma-separated total query lengths; `seqlen_kv = seqlen_q`
