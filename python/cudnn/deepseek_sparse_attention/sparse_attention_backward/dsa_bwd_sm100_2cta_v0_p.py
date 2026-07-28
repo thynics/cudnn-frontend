@@ -6626,17 +6626,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             tmem_ptr + self.TMEM_S_OFFSET,
             sdp_c_layout,
         )
-        t_sdp_epi = cute.flat_divide(
-            t_sdp[((None, None), 0, 0)],
-            (self.H_TILE_CTA, self.N_TILE),
+        # The fused M256 accumulator aliases the same two TMEM column
+        # ranges as the former pair of M128 accumulators.  Retain the
+        # original fragment layouts for T2R so its copy atom sees exactly
+        # the rank and shape it was built for.
+        t_score = cute.make_tensor(
+            tmem_ptr + self.TMEM_S_OFFSET,
+            score_c_layout,
         )
-        # M256 is local-M128 per CTA. Its low H64 rows are QK^T and its
-        # high H64 rows are dO V^T, so both existing H64xN64 T2R paths can
-        # consume subviews of the fused accumulator.
-        t_score = t_sdp_epi[(None, None, 0, 0)]
-        t_dp = t_sdp_epi[(None, None, 1, 0)]
-        assert cute.size(t_score) == cute.size(score_c_layout)
-        assert cute.size(t_dp) == cute.size(dp_c_layout)
+        t_dp = cute.make_tensor(
+            tmem_ptr + self.TMEM_DP_OFFSET,
+            dp_c_layout,
+        )
         t_dkv = (
             cute.make_tensor(
                 tmem_ptr + self.TMEM_DKV0_OFFSET,
