@@ -5080,39 +5080,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         ):
             do_empty_pipeline.producer_commit(do_state)
             do_state.advance()
-            q_full_pipeline.consumer_wait(q_state)
-
-        if cutlass.const_expr(
-            self.DIAGNOSTIC_AUX_STAGE >= 2
-            and round_index == 0
-        ):
-            ds_dk_pipeline.consumer_wait(dsk_wait_state)
-            dsk_wait_state.advance()
-
-        dk_mma = dkv_tiled_mma.with_()
-        dk_mma.set(tcgen05.Field.ACCUMULATE, True)
-        for k_block in cutlass.range_constexpr(
-            cute.size(dk_a_fragment, mode=[2])
-        ):
-            cute.gemm(
-                dk_mma,
-                t_dkv_round,
-                dk_a_fragment[None, None, k_block],
-                dsk_fragment[None, None, k_block],
-                t_dkv_round,
-            )
-
-        if cutlass.const_expr(
-            self.DIAGNOSTIC_AUX_STAGE >= 3
-        ):
-            q_full_pipeline.consumer_release(q_state)
-            q_state.advance()
-        cute.arch.fence_view_async_tmem_store()
-        if cutlass.const_expr(
-            self.DIAGNOSTIC_AUX_STAGE >= 4
-        ):
-            dkv_pipeline.producer_commit(dkv_state)
-            dkv_state.advance()
 
         # Acquire the final-full generation before issuing the last dQ GEMM.
         # Otherwise a consumer can observe a generation that did not order
@@ -5154,6 +5121,46 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 cute.arch.fence_view_async_tmem_store()
                 dq_final_pipeline.producer_commit(dq_state)
                 dq_state.advance()
+
+        # dQ only consumes the side K operand and dS_q.  Issue it while W7 is
+        # replacing the main dO operand with Q, so the BQ TMA latency is not a
+        # hard dependency on the otherwise-independent dQ work.
+        if cutlass.const_expr(
+            self.DIAGNOSTIC_AUX_STAGE >= 3
+        ):
+            q_full_pipeline.consumer_wait(q_state)
+
+        if cutlass.const_expr(
+            self.DIAGNOSTIC_AUX_STAGE >= 2
+            and round_index == 0
+        ):
+            ds_dk_pipeline.consumer_wait(dsk_wait_state)
+            dsk_wait_state.advance()
+
+        dk_mma = dkv_tiled_mma.with_()
+        dk_mma.set(tcgen05.Field.ACCUMULATE, True)
+        for k_block in cutlass.range_constexpr(
+            cute.size(dk_a_fragment, mode=[2])
+        ):
+            cute.gemm(
+                dk_mma,
+                t_dkv_round,
+                dk_a_fragment[None, None, k_block],
+                dsk_fragment[None, None, k_block],
+                t_dkv_round,
+            )
+
+        if cutlass.const_expr(
+            self.DIAGNOSTIC_AUX_STAGE >= 3
+        ):
+            q_full_pipeline.consumer_release(q_state)
+            q_state.advance()
+        cute.arch.fence_view_async_tmem_store()
+        if cutlass.const_expr(
+            self.DIAGNOSTIC_AUX_STAGE >= 4
+        ):
+            dkv_pipeline.producer_commit(dkv_state)
+            dkv_state.advance()
 
         op_pipeline.consumer_release(op_state)
         op_state.advance()
