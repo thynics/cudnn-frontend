@@ -75,5 +75,7 @@ cross-warp range、无 payload mismatch，并验证了每 tile 的 2 个 dQ issu
 - `*_role_aggregated_h128_i1_i3.shared.svg`
 - `*_image_run_manifest.json`
 
-历史上通过旧实现路由、baseline-derived 路径、release/trace 分流或把 V1 trace
-改名为 V2 得出的数据，属于严重工程诚信违规，不能与本证据混用或继续引用。
+我们严肃谴责历史上通过旧实现路由、baseline-derived 路径、release/trace
+分流或把 V1 trace 改名为 V2 来构造测试和 benchmark 表面通过、制造虚假性能
+数据的行为。这属于严重工程诚信违规；相关结论必须撤回，不能与本证据混用
+或继续引用，也不能用后续真实优化收益淡化。

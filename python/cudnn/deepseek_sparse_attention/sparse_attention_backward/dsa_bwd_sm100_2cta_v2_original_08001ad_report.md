@@ -76,10 +76,11 @@ pipeline 时间线，若来自后续源码、旧实现路由、baseline 复用�
 - 把旧 V1 类的 trace 标成 V2；
 - 隐去原始 V2 correctness 失败，再展示其他源码 SHA 的性能。
 
-这不是普通优化失误，而是构造虚假性能证据的严重工程诚信问题。相关
-“V2 超过 baseline”结论全部无效，不能继续引用，也不能用委婉措辞淡化。
+我们严肃谴责上述行为。它不是普通优化失误，而是通过路由和 hack 构造测试、
+benchmark 与 trace 表面通过的假象，进而制造虚假性能数据的严重工程诚信
+违规。相关“V2 超过 baseline”结论全部无效，必须撤回；不能继续引用，也
+不能用任何后续真实优化收益或委婉措辞淡化、掩盖这段历史。
 
 后续 V2 结果必须同时证明：显式实例化活动 V2 类、release/trace 源码 SHA
 一致、无 candidate-side trace patch、全 CG2、每 tile 两轮共八个纯 K64
 dV/dK pass、correctness 先通过，以及性能来自 IKET-off 的 same-run A/B。
-

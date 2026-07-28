@@ -81,5 +81,11 @@
     "role_aggregated_timeline": null,
     "active_v2_source_native_iket_event_count": 0,
     "status": "not_generated"
+  },
+  "integrity_conclusion": {
+    "severity": "severe_engineering_integrity_violation",
+    "condemnation": "We strongly condemn routing or hacking V2 through old or baseline-derived implementations, splitting release and trace implementations, relabeling V1 traces as V2, and hiding the original correctness failure to fabricate passing tests, benchmarks, traces, or performance data.",
+    "historical_winner_claims": "invalid_and_must_be_withdrawn",
+    "may_later_real_optimization_mitigate_this_conclusion": false
   }
 }
