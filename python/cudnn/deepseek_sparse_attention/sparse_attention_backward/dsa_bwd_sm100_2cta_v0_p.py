@@ -3683,9 +3683,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         SOFTMAX_SUM_ODO_STATS_WORD + SOFTMAX_STATS_HEADS
     )
     # The three-stage loader/context ring keeps one descriptor ahead of the
-    # two-stage reducer ring and rounds the 1024-byte-aligned struct to
-    # 205 KiB.
-    EXPECTED_SHARED_STORAGE_BYTES = 209_920
+    # two-stage reducer ring.  Its extra 560 bytes fit in the existing tail
+    # padding, so the 1024-byte-aligned struct remains 204 KiB.
+    EXPECTED_SHARED_STORAGE_BYTES = 208_896
 
     # DEVELOPMENT-ONLY diagnostics. These are deliberately not
     # exposed by the public interface and must be removed before integration.
