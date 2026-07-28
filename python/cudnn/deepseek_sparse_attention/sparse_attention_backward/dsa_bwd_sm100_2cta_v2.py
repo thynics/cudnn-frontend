@@ -12707,6 +12707,50 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # The inherited canonical kernel still receives block_tile=64 normally.
     N_TILE = FlashAttentionDSABackwardSm100TwoCTA.N_TILE
 
+    def __call__(
+        self,
+        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
+        mQ: cute.Tensor,
+        mKV: cute.Tensor,
+        mOut: cute.Tensor,
+        mdO: cute.Tensor,
+        mLSE: cute.Tensor,
+        mAttnSink: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        mTopkLength: Optional[cute.Tensor],
+        mdQ: cute.Tensor,
+        mdKV: cute.Tensor,
+        mdSink: cute.Tensor,
+        workspace_LSE_OdO: cute.Tensor,
+        workspace_dKV: cute.Tensor,
+        trace_buffer: Optional[cute.Tensor],
+        trace_token_idx: Int32,
+        trace_batch_idx: Int32,
+        softmax_scale: Float32 | float,
+        stream: cuda.CUstream,
+    ):
+        """Adapt the V2 harness signature to the canonical CG1 launcher."""
+
+        del trace_buffer, trace_token_idx, trace_batch_idx
+        return super().__call__(
+            problem_shape,
+            mQ,
+            mKV,
+            mOut,
+            mdO,
+            mLSE,
+            mAttnSink,
+            mTopkIdxs,
+            mTopkLength,
+            mdQ,
+            mdKV,
+            mdSink,
+            workspace_LSE_OdO,
+            workspace_dKV,
+            softmax_scale,
+            stream,
+        )
+
     @cute.jit
     def _atomic_dKV_128_visit_v2(
         self,
