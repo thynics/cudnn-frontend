@@ -1636,7 +1636,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         _ = trace_buffer
         _ = trace_token_idx
         _ = trace_batch_idx
-
         physical_x, _, batch_idx = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -10949,6 +10948,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     H_PASSES = 2
     PDS_BLOCK_ELEMENTS = 2_048
     PDS_BLOCK_BYTES = 4_096
+    DKV_A_QUAD_ELEMENTS = 8_192
+    DKV_A_QUAD_BYTES = 16_384
+    DKV_A_QUAD_U64S = 2_048
 
     # 64-column-aligned TMEM map (the layout the v1 CG2 T2R code ran with).
     TMEM_S_OFFSET = 0
@@ -11007,10 +11009,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         #   dS image + local+xchg+landing  20,480
         #   softmax stats                     512
         #   mbarriers / holding buf        <= 512
-        assert cute.cosize(score_a_layout_staged) <= 32768
+        assert (
+            cute.cosize(score_a_layout_staged)
+            == 4 * self.DKV_A_QUAD_ELEMENTS
+        )
         assert cute.cosize(score_b_layout_staged) <= 16384
         # Re-tiled DKV (K = H64): quadrant slab and 4 KiB B blocks.
-        assert cute.cosize(dkv_a_layout_staged) <= 8192
+        assert (
+            cute.cosize(dkv_a_layout_staged)
+            == self.DKV_A_QUAD_ELEMENTS
+        )
+        assert (
+            score_a_layout_staged.inner
+            == dkv_a_layout_staged.inner
+        )
         assert cute.cosize(dkv_b_layout_staged) <= 2048
         assert cute.cosize(dq_a_layout_staged) <= 8192
         assert cute.cosize(dq_b_layout_staged) <= 4096
@@ -11227,6 +11239,45 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
 
     @cute.jit
+    def _copy_resident_quad_local_v2(
+        self,
+        source: cute.Pointer,
+        destination: cute.Pointer,
+        lane_idx: Int32,
+    ) -> None:
+        """Copy one byte-identical 16-KiB Q/dO quadrant within SMEM."""
+
+        source_u64 = cute.make_tensor(
+            cute.recast_ptr(
+                source,
+                dtype=cutlass.Uint64,
+            ),
+            cute.make_layout(
+                (self.DKV_A_QUAD_U64S,),
+                stride=(1,),
+            ),
+        )
+        destination_u64 = cute.make_tensor(
+            cute.recast_ptr(
+                destination,
+                dtype=cutlass.Uint64,
+            ),
+            cute.make_layout(
+                (self.DKV_A_QUAD_U64S,),
+                stride=(1,),
+            ),
+        )
+        for iteration in cutlass.range(32, unroll=1):
+            index = (
+                iteration * Int32(64)
+                + lane_idx * Int32(2)
+            )
+            value_0 = source_u64[index]
+            value_1 = source_u64[index + Int32(1)]
+            destination_u64[index] = value_0
+            destination_u64[index + Int32(1)] = value_1
+
+    @cute.jit
     def _issue_dkv_pass_v2(
         self,
         dkv_tiled_mma: cute.TiledMma,
@@ -11394,6 +11445,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     ):
         """v2 rotated-schedule two-CTA backward (design: 优化设计文档_v2.md)."""
 
+        assert grad_a_stage_bytes == self.DKV_A_QUAD_BYTES
         _ = problem_shape
         _ = mQ
         _ = mdO
@@ -11439,6 +11491,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # ------------------------------------------------------------------
         # SMEM tensor views.
         # ------------------------------------------------------------------
+        stationary_q_raw = storage.stationary_q.data_ptr()
+        stationary_do_raw = storage.stationary_do.data_ptr()
+        round_raw = (
+            storage.round_buf_a.data_ptr(),
+            storage.round_buf_b.data_ptr(),
+        )
         stationary_q = storage.stationary_q.get_tensor(
             score_a_layout_staged.outer,
             swizzle=score_a_layout_staged.inner,
@@ -12700,63 +12758,86 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     round_completion_mbars
                                     + round_issue_state.index
                                 )
-                                with cute.arch.elect_one():
-                                    cute.arch.mbarrier_expect_tx(
-                                        completion_mbar,
-                                        grad_a_stage_bytes,
+                                if rank == Int32(h_half):
+                                    if cutlass.const_expr(
+                                        tensor_kind == 0
+                                    ):
+                                        resident_source = (
+                                            stationary_do_raw
+                                        )
+                                    else:
+                                        resident_source = (
+                                            stationary_q_raw
+                                        )
+                                    source_chunk = (
+                                        2 * grad_round + h_half
                                     )
-                                if cutlass.const_expr(
-                                    tensor_kind == 0
-                                ):
-                                    if cutlass.const_expr(
-                                        h_half == 0
-                                    ):
-                                        cute.copy(
-                                            tma_atom_dot,
-                                            t_dot_gmem[
-                                                None,
-                                                grad_round,
-                                                0,
-                                            ],
-                                            t_dot_smem_a[None, 0],
-                                            tma_bar_ptr=completion_mbar,
-                                        )
-                                    else:
-                                        cute.copy(
-                                            tma_atom_dot,
-                                            t_dot_gmem[
-                                                None,
-                                                grad_round,
-                                                1,
-                                            ],
-                                            t_dot_smem_b[None, 0],
-                                            tma_bar_ptr=completion_mbar,
-                                        )
+                                    self._copy_resident_quad_local_v2(
+                                        resident_source
+                                        + source_chunk
+                                        * self.DKV_A_QUAD_ELEMENTS,
+                                        round_raw[h_half],
+                                        lane_idx,
+                                    )
+                                    cute.arch.fence_view_async_shared()
                                 else:
+                                    with cute.arch.elect_one():
+                                        cute.arch.mbarrier_expect_tx(
+                                            completion_mbar,
+                                            grad_a_stage_bytes,
+                                        )
                                     if cutlass.const_expr(
-                                        h_half == 0
+                                        tensor_kind == 0
                                     ):
-                                        cute.copy(
-                                            tma_atom_qt,
-                                            t_qt_gmem[
-                                                None,
-                                                grad_round,
-                                                0,
-                                            ],
-                                            t_qt_smem_a[None, 0],
-                                            tma_bar_ptr=completion_mbar,
-                                        )
+                                        if cutlass.const_expr(
+                                            h_half == 0
+                                        ):
+                                            cute.copy(
+                                                tma_atom_dot,
+                                                t_dot_gmem[
+                                                    None,
+                                                    grad_round,
+                                                    0,
+                                                ],
+                                                t_dot_smem_a[None, 0],
+                                                tma_bar_ptr=completion_mbar,
+                                            )
+                                        else:
+                                            cute.copy(
+                                                tma_atom_dot,
+                                                t_dot_gmem[
+                                                    None,
+                                                    grad_round,
+                                                    1,
+                                                ],
+                                                t_dot_smem_b[None, 0],
+                                                tma_bar_ptr=completion_mbar,
+                                            )
                                     else:
-                                        cute.copy(
-                                            tma_atom_qt,
-                                            t_qt_gmem[
-                                                None,
-                                                grad_round,
-                                                1,
-                                            ],
-                                            t_qt_smem_b[None, 0],
-                                            tma_bar_ptr=completion_mbar,
-                                        )
+                                        if cutlass.const_expr(
+                                            h_half == 0
+                                        ):
+                                            cute.copy(
+                                                tma_atom_qt,
+                                                t_qt_gmem[
+                                                    None,
+                                                    grad_round,
+                                                    0,
+                                                ],
+                                                t_qt_smem_a[None, 0],
+                                                tma_bar_ptr=completion_mbar,
+                                            )
+                                        else:
+                                            cute.copy(
+                                                tma_atom_qt,
+                                                t_qt_gmem[
+                                                    None,
+                                                    grad_round,
+                                                    1,
+                                                ],
+                                                t_qt_smem_b[None, 0],
+                                                tma_bar_ptr=completion_mbar,
+                                            )
                                 cute.arch.mbarrier_arrive(
                                     completion_mbar
                                 )
