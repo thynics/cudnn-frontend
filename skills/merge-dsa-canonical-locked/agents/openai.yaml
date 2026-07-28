@@ -1,0 +1,4 @@
+interface:
+  display_name: "Merge DSA Canonical with Lock"
+  short_description: "Serialize promotion into canonical DSA v0 or v1"
+  default_prompt: "Use $merge-dsa-canonical-locked to promote a validated DSA candidate into canonical v1 under its exclusive lock."
