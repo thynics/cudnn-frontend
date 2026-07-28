@@ -13372,16 +13372,3 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             packed_issue,
         )
         return consumer_state
-
-
-# Workspace-only host alias used by the harness integration patch.  The
-# isolated B200 harness imports this module under the canonical filename and
-# selects the candidate through the legacy class symbols; rebinding them here
-# routes the run to the v2 rotated-schedule implementation while leaving the
-# production interface untouched.
-FlashAttentionDSABackwardSm100TwoCTAV1 = (
-    FlashAttentionDSABackwardSm100TwoCTAV2
-)
-FlashAttentionDSABackwardSm100TwoCTAV0 = (
-    FlashAttentionDSABackwardSm100TwoCTAV2
-)
