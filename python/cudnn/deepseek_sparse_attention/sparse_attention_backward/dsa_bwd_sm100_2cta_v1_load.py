@@ -10149,6 +10149,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
 
                 # V1_SPAN_LOAD_STATS_BEGIN
                 if tidx < Int32(self.H_TILE_CTA):
+                    global_h = (
+                        rank * Int32(self.H_TILE_CTA) + tidx
+                    )
                     if warp_idx == Int32(0):
                         cute.copy(
                             stats_copy_atom,
@@ -10162,6 +10165,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         )
                         cute.arch.cp_async_commit_group()
                         cute.arch.cp_async_wait_group(0)
+                    _ = softmax_stats[
+                        global_h,
+                        1,
+                    ]
                 cute.arch.fence_view_async_shared()
                 self.main_barrier.arrive_and_wait()
                 # V1_SPAN_LOAD_STATS_END
