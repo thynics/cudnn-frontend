@@ -12146,7 +12146,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 score_coordinates.shape,
                 self.element_dtype,
             )
-            landing_phase = Int32(0)
 
             for loop_iter in cutlass.range(tile_count):
                 pipe_s_done.consumer_wait(s_state)
@@ -12155,19 +12154,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipe_s_done.consumer_release(s_state)
                 s_state.advance()
 
-                pipe_dp_done.consumer_wait(dp_state)
-                cute.copy(dp_copy, dp_source, r_dp)
-                cute.arch.fence_view_async_tmem_load()
-                pipe_dp_done.consumer_release(dp_state)
-                dp_state.advance()
-
                 local_h = mtx % Int32(self.H_TILE_CTA)
                 softmax_scale_log2_e = scale_softmax * Float32(
                     math.log2(math.e)
                 )
                 lse = softmax_stats[local_h, 0]
-                delta = softmax_stats[local_h, 1]
                 assert cute.size(r_score) == self.N_TILE_CTA
+
+                # P depends only on S and can overlap this tile's dP MMA.
+                # Keep FP32 P in the dead score fragment for the later dS
+                # computation while publishing its BF16 image immediately.
                 for local_n in cutlass.range_constexpr(
                     self.N_TILE_CTA
                 ):
@@ -12179,34 +12175,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         ),
                         fastmath=True,
                     )
-                    ds_value = (
-                        (r_dp[local_n] + delta)
-                        * p_value
-                        * scale_softmax
-                    )
+                    r_score[local_n] = p_value
                     r_p[local_n] = self.element_dtype(p_value)
-                    r_ds[local_n] = self.element_dtype(ds_value)
 
                 pipe_pds.producer_acquire(pds_state)
 
-                # Publish P/dS with stmatrix.  Each pair of warps owns one
-                # N32 half, so this branch is warp-uniform.
+                # Publish P with stmatrix.  Each pair of warps owns one N32
+                # half, so this branch is warp-uniform.
                 r_p_store = thread_copy_r2s.retile(r_p)
-                r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_p_local_tile.shape == r_p_store.shape
-                assert t_rs_ds_local_tile.shape == r_ds_store.shape
                 assert t_rs_p_xchg_tile.shape == r_p_store.shape
-                assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
                 if owns_n:
                     cute.copy(
                         tiled_copy_r2s,
                         r_p_store,
                         t_rs_p_local_tile,
-                    )
-                    cute.copy(
-                        tiled_copy_r2s,
-                        r_ds_store,
-                        t_rs_ds_local_tile,
                     )
                 else:
                     cute.copy(
@@ -12214,6 +12197,63 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         r_p_store,
                         t_rs_p_xchg_tile,
                     )
+
+                cute.arch.fence_view_async_shared()
+                self.math_barrier.arrive_and_wait()
+
+                if mtx == Int32(0):
+                    # Route P while the leader computes dP for this tile.
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        landing_mbars,
+                        self.PDS_BLOCK_BYTES,
+                        peer_cta_rank_in_cluster=peer_rank,
+                    )
+                    if rank == Int32(0):
+                        _cpasync_bulk_s2cluster(
+                            p_xchg_raw.iterator,
+                            p_block_raw_ptrs[0],
+                            landing_mbars,
+                            self.PDS_BLOCK_BYTES,
+                            peer_rank,
+                        )
+                    else:
+                        _cpasync_bulk_s2cluster(
+                            p_xchg_raw.iterator,
+                            p_block_raw_ptrs[1],
+                            landing_mbars,
+                            self.PDS_BLOCK_BYTES,
+                            peer_rank,
+                        )
+
+                pipe_dp_done.consumer_wait(dp_state)
+                cute.copy(dp_copy, dp_source, r_dp)
+                cute.arch.fence_view_async_tmem_load()
+                pipe_dp_done.consumer_release(dp_state)
+                dp_state.advance()
+
+                delta = softmax_stats[local_h, 1]
+                for local_n in cutlass.range_constexpr(
+                    self.N_TILE_CTA
+                ):
+                    ds_value = (
+                        (r_dp[local_n] + delta)
+                        * r_score[local_n]
+                        * scale_softmax
+                    )
+                    r_ds[local_n] = self.element_dtype(ds_value)
+
+                # Publish dS to its local/xchg dKV blocks and to the dQ
+                # whole-image operand.
+                r_ds_store = thread_copy_r2s.retile(r_ds)
+                assert t_rs_ds_local_tile.shape == r_ds_store.shape
+                assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
+                if owns_n:
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_ds_store,
+                        t_rs_ds_local_tile,
+                    )
+                else:
                     cute.copy(
                         tiled_copy_r2s,
                         r_ds_store,
@@ -12238,29 +12278,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self.math_barrier.arrive_and_wait()
 
                 if mtx == Int32(0):
-                    # Send my [H64_c, N32_peer] quarters into the peer's
-                    # block field for my head half (same struct offset).
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        landing_mbars,
-                        self.PDS_BLOCK_BYTES,
-                        peer_cta_rank_in_cluster=peer_rank,
-                    )
-                    if rank == Int32(0):
-                        _cpasync_bulk_s2cluster(
-                            p_xchg_raw.iterator,
-                            p_block_raw_ptrs[0],
-                            landing_mbars,
-                            self.PDS_BLOCK_BYTES,
-                            peer_rank,
-                        )
-                    else:
-                        _cpasync_bulk_s2cluster(
-                            p_xchg_raw.iterator,
-                            p_block_raw_ptrs[1],
-                            landing_mbars,
-                            self.PDS_BLOCK_BYTES,
-                            peer_rank,
-                        )
+                    # Route dS after dP; W18 independently relays both DSM
+                    # completion events to the leader.
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         landing_mbars + 1,
                         self.PDS_BLOCK_BYTES,
@@ -12283,22 +12302,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             peer_rank,
                         )
 
-                # The DSM payload already is the destination CG2-B byte
-                # image.  Wait for both local landings before publishing the
-                # completed P/dS generation; no receiver reorder is needed.
-                if mtx == Int32(0):
-                    _mbarrier_wait_acquire_cluster(
-                        landing_mbars,
-                        landing_phase,
-                    )
-                    _mbarrier_wait_acquire_cluster(
-                        landing_mbars + 1,
-                        landing_phase,
-                    )
+                # Publish local readiness after both routes are issued.
+                # W18, rather than math, owns remote-completion waiting.
                 self.math_barrier.arrive_and_wait()
                 pipe_pds.producer_commit(pds_state)
                 pds_state.advance()
-                landing_phase = Int32(1) - landing_phase
             if tile_count > Int32(0):
                 pipe_pds.producer_tail(pds_state)
 
