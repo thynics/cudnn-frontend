@@ -12242,38 +12242,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     loop_iter,
                 )
 
-                wait_dp_token = _iket.range_start(
-                    "WAIT_dP(i)",
-                    loop_iter,
-                )
-                pipe_dp_done.consumer_wait(dp_state)
-                _iket.range_end(
-                    wait_dp_token,
-                    loop_iter,
-                )
-                t2r_dp_token = _iket.range_start(
-                    "T2R_dP(i)",
-                    loop_iter,
-                )
-                cute.copy(dp_copy, dp_source, r_dp)
-                cute.arch.fence_view_async_tmem_load()
-                pipe_dp_done.consumer_release(dp_state)
-                dp_state.advance()
-                _iket.range_end(
-                    t2r_dp_token,
-                    loop_iter,
-                )
-
-                math_pd_token = _iket.range_start(
-                    "MATH_PD(i)",
-                    loop_iter,
+                # P depends only on S. Publish it while the score-side
+                # leader is still producing dP for this tile, and retain
+                # FP32 P in the now-dead score fragment for the later dS
+                # computation.
+                math_p_payload = loop_iter * Int32(2)
+                math_p_token = _iket.range_start(
+                    "MATH_PD(i,phase)",
+                    math_p_payload,
                 )
                 local_h = mtx % Int32(self.H_TILE_CTA)
                 softmax_scale_log2_e = scale_softmax * Float32(
                     math.log2(math.e)
                 )
                 lse = softmax_stats[local_h, 0]
-                delta = softmax_stats[local_h, 1]
                 assert cute.size(r_score) == self.N_TILE_CTA
                 for local_n in cutlass.range_constexpr(
                     self.N_TILE_CTA
@@ -12286,34 +12268,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         ),
                         fastmath=True,
                     )
-                    ds_value = (
-                        (r_dp[local_n] + delta)
-                        * p_value
-                        * scale_softmax
-                    )
+                    r_score[local_n] = p_value
                     r_p[local_n] = self.element_dtype(p_value)
-                    r_ds[local_n] = self.element_dtype(ds_value)
 
                 pipe_pds.producer_acquire(pds_state)
 
-                # Publish P/dS with stmatrix. Each pair of warps owns one
-                # N32 half, so this branch is warp-uniform.
+                # Publish P with stmatrix. Each pair of warps owns one N32
+                # half, so this branch is warp-uniform.
                 r_p_store = thread_copy_r2s.retile(r_p)
-                r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_p_local_tile.shape == r_p_store.shape
-                assert t_rs_ds_local_tile.shape == r_ds_store.shape
                 assert t_rs_p_xchg_tile.shape == r_p_store.shape
-                assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
                 if owns_n:
                     cute.copy(
                         tiled_copy_r2s,
                         r_p_store,
                         t_rs_p_local_tile,
-                    )
-                    cute.copy(
-                        tiled_copy_r2s,
-                        r_ds_store,
-                        t_rs_ds_local_tile,
                     )
                 else:
                     cute.copy(
@@ -12321,25 +12290,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         r_p_store,
                         t_rs_p_xchg_tile,
                     )
-                    cute.copy(
-                        tiled_copy_r2s,
-                        r_ds_store,
-                        t_rs_ds_xchg_tile,
-                    )
-
-                # Whole-image dS store for the dQ B operand.
-                assert t_rs_ds_tile.shape == r_ds_store.shape
-                cute.copy(
-                    tiled_copy_r2s,
-                    r_ds_store,
-                    t_rs_ds_tile,
-                )
-
-                # No validity mask (baseline-identical invariant pair):
-                # invalid columns see S=dP=0 from zero-filled K rows, so
-                # P/dS stay finite; dQ is protected by zero-filled K_dQ
-                # rows and dKV garbage columns are dropped by the drain
-                # predicates (global_n < topk, kv_index >= 0).
 
                 cute.arch.fence_view_async_shared()
                 self.math_barrier.arrive_and_wait()
@@ -12350,8 +12300,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         loop_iter,
                     )
                     if mtx == Int32(0):
-                        # Send my [H64_c, N32_peer] quarters into the peer's
-                        # block field for my head half (same struct offset).
+                        # Send P while dP is still in flight. The payload is
+                        # my [H64_c, N32_peer] quarter in the peer's final
+                        # block field for my head half.
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             landing_mbars,
                             self.PDS_BLOCK_BYTES,
@@ -12377,7 +12328,85 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         route_p_token,
                         loop_iter,
                     )
+                _iket.range_end(
+                    math_p_token,
+                    math_p_payload,
+                )
 
+                wait_dp_token = _iket.range_start(
+                    "WAIT_dP(i)",
+                    loop_iter,
+                )
+                pipe_dp_done.consumer_wait(dp_state)
+                _iket.range_end(
+                    wait_dp_token,
+                    loop_iter,
+                )
+                t2r_dp_token = _iket.range_start(
+                    "T2R_dP(i)",
+                    loop_iter,
+                )
+                cute.copy(dp_copy, dp_source, r_dp)
+                cute.arch.fence_view_async_tmem_load()
+                pipe_dp_done.consumer_release(dp_state)
+                dp_state.advance()
+                _iket.range_end(
+                    t2r_dp_token,
+                    loop_iter,
+                )
+
+                math_ds_payload = (
+                    loop_iter * Int32(2) + Int32(1)
+                )
+                math_ds_token = _iket.range_start(
+                    "MATH_PD(i,phase)",
+                    math_ds_payload,
+                )
+                delta = softmax_stats[local_h, 1]
+                for local_n in cutlass.range_constexpr(
+                    self.N_TILE_CTA
+                ):
+                    ds_value = (
+                        (r_dp[local_n] + delta)
+                        * r_score[local_n]
+                        * scale_softmax
+                    )
+                    r_ds[local_n] = self.element_dtype(ds_value)
+
+                # Publish dS to the two dKV blocks and to the complete dQ
+                # B operand image.
+                r_ds_store = thread_copy_r2s.retile(r_ds)
+                assert t_rs_ds_local_tile.shape == r_ds_store.shape
+                assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
+                if owns_n:
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_ds_store,
+                        t_rs_ds_local_tile,
+                    )
+                else:
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_ds_store,
+                        t_rs_ds_xchg_tile,
+                    )
+
+                assert t_rs_ds_tile.shape == r_ds_store.shape
+                cute.copy(
+                    tiled_copy_r2s,
+                    r_ds_store,
+                    t_rs_ds_tile,
+                )
+
+                # No validity mask (baseline-identical invariant pair):
+                # invalid columns see S=dP=0 from zero-filled K rows, so
+                # P/dS stay finite; dQ is protected by zero-filled K_dQ
+                # rows and dKV garbage columns are dropped by the drain
+                # predicates (global_n < topk, kv_index >= 0).
+                cute.arch.fence_view_async_shared()
+                self.math_barrier.arrive_and_wait()
+
+                if warp_idx == Int32(self.MATH_WARP_BEGIN):
                     route_ds_token = _iket.range_start(
                         "ROUTE_dS(i)",
                         loop_iter,
@@ -12416,8 +12445,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipe_pds.producer_commit(pds_state)
                 pds_state.advance()
                 _iket.range_end(
-                    math_pd_token,
-                    loop_iter,
+                    math_ds_token,
+                    math_ds_payload,
                 )
             if tile_count > Int32(0):
                 pipe_pds.producer_tail(pds_state)
