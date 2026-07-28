@@ -2670,6 +2670,7 @@ def _compute_and_store_pd(
     owner: cutlass.Constexpr[object],
     r_score: cute.Tensor,
     r_dp: cute.Tensor,
+    score_coordinates: cute.Tensor,
     softmax_stats: cute.Tensor,
     valid_lo: Int32,
     valid_hi: Int32,
@@ -2682,21 +2683,10 @@ def _compute_and_store_pd(
 ) -> None:
     """Compute one score-distributed BF16 P/dS fragment in registers."""
 
-    # For the CG2 H128xN64 accumulator copied by W8-W11, each thread owns
-    # one rank-local H row and one contiguous N32 quadrant:
-    #
-    #   local_h = math_tidx % 64
-    #   n_owner = math_tidx // 64
-    #   local_n = value_index
-    #
-    # This mapping has been exhaustively validated over the H64xN64 rank
-    # tile.  Keep the x4 FP32/BF16 fragments and the three scalar destinations,
-    # but remove per-value identity-coordinate decoding and address rebuilds.
-    local_h = math_tidx % Int32(owner.H_TILE_CTA)
+    # The M256 accumulator is read through native H64xN32 quadrants, while
+    # P/dS retain the legacy R2S register layout.  Decode the native T2R
+    # coordinates and place each result at its legacy local-N index.
     n_owner = math_tidx // Int32(owner.H_TILE_CTA)
-
-    lse = softmax_stats[local_h, 0]
-    sum_odo = softmax_stats[local_h, 1]
     if cutlass.const_expr(apply_mask):
         valid_bits = valid_lo
         if n_owner != Int32(0):
@@ -2714,18 +2704,34 @@ def _compute_and_store_pd(
             value_index_0 = fragment_index * 4 + pair_index * 2
             value_index_1 = value_index_0 + 1
             pair_offset = pair_index * 2
-            lse_0 = lse
-            lse_1 = lse
+            coordinate_0 = score_coordinates[value_index_0]
+            coordinate_1 = score_coordinates[value_index_1]
+            local_h_0 = Int32(
+                cute.get(coordinate_0, mode=[0])
+            )
+            local_h_1 = Int32(
+                cute.get(coordinate_1, mode=[0])
+            )
+            local_n_0 = Int32(
+                cute.get(coordinate_0, mode=[1])
+            )
+            local_n_1 = Int32(
+                cute.get(coordinate_1, mode=[1])
+            )
+            lse_0 = softmax_stats[local_h_0, 0]
+            lse_1 = softmax_stats[local_h_1, 0]
+            sum_odo_0 = softmax_stats[local_h_0, 1]
+            sum_odo_1 = softmax_stats[local_h_1, 1]
             if cutlass.const_expr(apply_mask):
                 is_valid_0 = (
                     (
-                        valid_bits >> Int32(value_index_0)
+                        valid_bits >> local_n_0
                     )
                     & Int32(1)
                 ) != Int32(0)
                 is_valid_1 = (
                     (
-                        valid_bits >> Int32(value_index_1)
+                        valid_bits >> local_n_1
                     )
                     & Int32(1)
                 ) != Int32(0)
@@ -2754,8 +2760,8 @@ def _compute_and_store_pd(
                     r_dp[value_index_1],
                 ),
                 (
-                    sum_odo,
-                    sum_odo,
+                    sum_odo_0,
+                    sum_odo_1,
                 ),
             )
             ds_0, ds_1 = cute.arch.mul_packed_f32x2(
@@ -2782,8 +2788,10 @@ def _compute_and_store_pd(
         ds_bf16.store(ds_fp32.load().to(owner.element_dtype))
         for fragment_value in cutlass.range_constexpr(4):
             value_index = fragment_index * 4 + fragment_value
-            r_p[value_index] = p_bf16[fragment_value]
-            r_dsq[value_index] = ds_bf16[fragment_value]
+            coordinate = score_coordinates[value_index]
+            local_n = Int32(cute.get(coordinate, mode=[1]))
+            r_p[local_n] = p_bf16[fragment_value]
+            r_dsq[local_n] = ds_bf16[fragment_value]
 
 
 @cute.jit
@@ -3390,6 +3398,7 @@ def _run_math_role(
                 self,
                 r_score,
                 r_dp,
+                score_quad_coordinates,
                 softmax_stats,
                 valid_lo,
                 valid_hi,
@@ -3405,6 +3414,7 @@ def _run_math_role(
                 self,
                 r_score,
                 r_dp,
+                score_quad_coordinates,
                 softmax_stats,
                 valid_lo,
                 valid_hi,
