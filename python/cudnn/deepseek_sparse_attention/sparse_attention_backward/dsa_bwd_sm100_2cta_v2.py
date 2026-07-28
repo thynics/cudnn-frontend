@@ -11549,12 +11549,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 p_blocks[0][None, None, None, 0],
                 cute.make_layout(
                     (self.N_TILE_CTA, self.H_TILE_CTA),
+                    stride=(self.H_TILE_CTA, 1),
                 ),
             ),
             cute.composition(
                 p_blocks[1][None, None, None, 0],
                 cute.make_layout(
                     (self.N_TILE_CTA, self.H_TILE_CTA),
+                    stride=(self.H_TILE_CTA, 1),
                 ),
             ),
         )
@@ -11562,6 +11564,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             p_xchg[None, None, None, 0],
             cute.make_layout(
                 (self.N_TILE_CTA, self.H_TILE_CTA),
+                stride=(self.H_TILE_CTA, 1),
             ),
         )
         ds_block_coords = (
@@ -11569,12 +11572,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 ds_blocks[0][None, None, None, 0],
                 cute.make_layout(
                     (self.N_TILE_CTA, self.H_TILE_CTA),
+                    stride=(self.H_TILE_CTA, 1),
                 ),
             ),
             cute.composition(
                 ds_blocks[1][None, None, None, 0],
                 cute.make_layout(
                     (self.N_TILE_CTA, self.H_TILE_CTA),
+                    stride=(self.H_TILE_CTA, 1),
                 ),
             ),
         )
@@ -11582,6 +11587,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ds_xchg[None, None, None, 0],
             cute.make_layout(
                 (self.N_TILE_CTA, self.H_TILE_CTA),
+                stride=(self.H_TILE_CTA, 1),
             ),
         )
         softmax_stats = storage.stats.get_tensor(
