@@ -10947,6 +10947,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # QT/dOT TMA atoms to [D128, H64] quadrant slabs.
     DKV_MMA_TILER = (256, 64, 64)
     H_PASSES = 2
+    PDS_BLOCK_ELEMENTS = 2_048
+    PDS_BLOCK_BYTES = 4_096
 
     # 64-column-aligned TMEM map (the layout the v1 CG2 T2R code ran with).
     TMEM_S_OFFSET = 0
@@ -11108,6 +11110,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 (self.N_TILE, self.D_TILE_CTA),
                 stride=(self.D_TILE_CTA, 1),
             ),
+        )
+
+    @cute.jit
+    def _dkv_partition_coord_v2(
+        self,
+        local_n: Int32,
+        local_h: Int32,
+    ):
+        """Map a logical N32xH64 value into the exact CG2-B stage layout."""
+
+        return (
+            (local_n, local_h % Int32(16)),
+            Int32(0),
+            local_h // Int32(16),
         )
 
     @cute.jit
@@ -11410,6 +11426,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         rank = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
+        block_coord_vmnk = cluster_layout_vmnk.get_flat_coord(rank)
         peer_rank = Int32(1) - rank
         token_idx = physical_x // self.CLUSTER_SHAPE_MNK[0]
         is_leader_cta = rank == Int32(0)
@@ -11543,46 +11560,44 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             score_store_domain,
             swizzle=score_store_layout.inner,
         )
-        # Coordinate views of the 4 KiB blocks for scalar publication.
-        p_block_coords = (
-            cute.composition(
-                p_blocks[0][None, None, None, 0],
-                cute.make_layout(
-                    (self.N_TILE_CTA, self.H_TILE_CTA),
-                ),
-            ),
-            cute.composition(
-                p_blocks[1][None, None, None, 0],
-                cute.make_layout(
-                    (self.N_TILE_CTA, self.H_TILE_CTA),
-                ),
-            ),
+        # Preserve the exact nested/swizzled K64 partition-B byte image.
+        # A raw 4 KiB DSM copy is then layout-preserving because every block
+        # has the same type and alignment at source and destination.
+        p_block_stages = (
+            p_blocks[0][None, None, None, 0],
+            p_blocks[1][None, None, None, 0],
         )
-        p_xchg_coords = cute.composition(
-            p_xchg[None, None, None, 0],
-            cute.make_layout(
-                (self.N_TILE_CTA, self.H_TILE_CTA),
-            ),
+        ds_block_stages = (
+            ds_blocks[0][None, None, None, 0],
+            ds_blocks[1][None, None, None, 0],
         )
-        ds_block_coords = (
-            cute.composition(
-                ds_blocks[0][None, None, None, 0],
-                cute.make_layout(
-                    (self.N_TILE_CTA, self.H_TILE_CTA),
-                ),
-            ),
-            cute.composition(
-                ds_blocks[1][None, None, None, 0],
-                cute.make_layout(
-                    (self.N_TILE_CTA, self.H_TILE_CTA),
-                ),
-            ),
+        p_xchg_stage = p_xchg[None, None, None, 0]
+        ds_xchg_stage = ds_xchg[None, None, None, 0]
+        assert (
+            cute.size(p_block_stages[0], mode=[0, 0])
+            == self.N_TILE_CTA
         )
-        ds_xchg_coords = cute.composition(
-            ds_xchg[None, None, None, 0],
-            cute.make_layout(
-                (self.N_TILE_CTA, self.H_TILE_CTA),
-            ),
+        assert cute.size(p_block_stages[0], mode=[0, 1]) == 16
+        assert cute.size(p_block_stages[0], mode=[1]) == 1
+        assert cute.size(p_block_stages[0], mode=[2]) == 4
+        assert cute.size(p_block_stages[0]) == self.PDS_BLOCK_ELEMENTS
+        p_block_raw_ptrs = (
+            storage.p_block_0.data_ptr(),
+            storage.p_block_1.data_ptr(),
+        )
+        ds_block_raw_ptrs = (
+            storage.ds_block_0.data_ptr(),
+            storage.ds_block_1.data_ptr(),
+        )
+        flat_pds_block_layout = cute.make_layout(
+            (self.PDS_BLOCK_ELEMENTS,),
+            stride=(1,),
+        )
+        p_xchg_raw = storage.p_xchg.get_tensor(
+            flat_pds_block_layout
+        )
+        ds_xchg_raw = storage.ds_xchg.get_tensor(
+            flat_pds_block_layout
         )
         softmax_stats = storage.stats.get_tensor(
             cute.make_layout(
@@ -11692,31 +11707,37 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         rank_g_qt = rank_dkv_mma.partition_A(g_qt)
         rank_g_dot = rank_dkv_mma.partition_A(g_dot)
+        a_cta_layout = cute.make_layout(
+            cute.slice_(
+                cluster_layout_vmnk,
+                (0, 0, None, 0),
+            ).shape
+        )
         t_qt_smem_a, t_qt_gmem = cpasync.tma_partition(
             tma_atom_qt,
-            0,
-            cute.make_layout(1),
+            block_coord_vmnk[2],
+            a_cta_layout,
             cute.group_modes(round_quad[0], 0, 3),
             cute.group_modes(rank_g_qt, 0, 3),
         )
         t_qt_smem_b, _ = cpasync.tma_partition(
             tma_atom_qt,
-            0,
-            cute.make_layout(1),
+            block_coord_vmnk[2],
+            a_cta_layout,
             cute.group_modes(round_quad[1], 0, 3),
             cute.group_modes(rank_g_qt, 0, 3),
         )
         t_dot_smem_a, t_dot_gmem = cpasync.tma_partition(
             tma_atom_dot,
-            0,
-            cute.make_layout(1),
+            block_coord_vmnk[2],
+            a_cta_layout,
             cute.group_modes(round_quad[0], 0, 3),
             cute.group_modes(rank_g_dot, 0, 3),
         )
         t_dot_smem_b, _ = cpasync.tma_partition(
             tma_atom_dot,
-            0,
-            cute.make_layout(1),
+            block_coord_vmnk[2],
+            a_cta_layout,
             cute.group_modes(round_quad[1], 0, 3),
             cute.group_modes(rank_g_dot, 0, 3),
         )
@@ -12061,6 +12082,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 score_coordinates.shape,
                 self.element_dtype,
             )
+            landing_phase = Int32(0)
 
             for loop_iter in cutlass.range(tile_count):
                 pipe_s_done.consumer_wait(s_state)
@@ -12129,40 +12151,30 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     h_in_half = g_h % Int32(self.H_TILE_CTA)
                     n_in_half = g_n % Int32(self.N_TILE_CTA)
                     n_half = g_n // Int32(self.N_TILE_CTA)
+                    dkv_partition_coord = (
+                        self._dkv_partition_coord_v2(
+                            n_in_half,
+                            h_in_half,
+                        )
+                    )
                     if n_half == rank:
                         if rank == Int32(0):
-                            _store_shared_bf16_at_v2(
-                                p_block_coords[0],
-                                (n_in_half, h_in_half),
-                                r_p[local_n],
-                            )
-                            _store_shared_bf16_at_v2(
-                                ds_block_coords[0],
-                                (n_in_half, h_in_half),
-                                r_ds[local_n],
-                            )
+                            p_block_stages[0][
+                                dkv_partition_coord
+                            ] = r_p[local_n]
+                            ds_block_stages[0][
+                                dkv_partition_coord
+                            ] = r_ds[local_n]
                         else:
-                            _store_shared_bf16_at_v2(
-                                p_block_coords[1],
-                                (n_in_half, h_in_half),
-                                r_p[local_n],
-                            )
-                            _store_shared_bf16_at_v2(
-                                ds_block_coords[1],
-                                (n_in_half, h_in_half),
-                                r_ds[local_n],
-                            )
+                            p_block_stages[1][
+                                dkv_partition_coord
+                            ] = r_p[local_n]
+                            ds_block_stages[1][
+                                dkv_partition_coord
+                            ] = r_ds[local_n]
                     else:
-                        _store_shared_bf16_at_v2(
-                            p_xchg_coords,
-                            (n_in_half, h_in_half),
-                            r_p[local_n],
-                        )
-                        _store_shared_bf16_at_v2(
-                            ds_xchg_coords,
-                            (n_in_half, h_in_half),
-                            r_ds[local_n],
-                        )
+                        p_xchg_stage[dkv_partition_coord] = r_p[local_n]
+                        ds_xchg_stage[dkv_partition_coord] = r_ds[local_n]
 
                 cute.arch.fence_view_async_shared()
                 self.math_barrier.arrive_and_wait()
@@ -12172,48 +12184,62 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # block field for my head half (same struct offset).
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         landing_mbars,
-                        4096,
+                        self.PDS_BLOCK_BYTES,
                         peer_cta_rank_in_cluster=peer_rank,
                     )
                     if rank == Int32(0):
                         _cpasync_bulk_s2cluster(
-                            p_xchg.iterator,
-                            p_blocks[0].iterator,
+                            p_xchg_raw.iterator,
+                            p_block_raw_ptrs[0],
                             landing_mbars,
-                            4096,
+                            self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
                     else:
                         _cpasync_bulk_s2cluster(
-                            p_xchg.iterator,
-                            p_blocks[1].iterator,
+                            p_xchg_raw.iterator,
+                            p_block_raw_ptrs[1],
                             landing_mbars,
-                            4096,
+                            self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         landing_mbars + 1,
-                        4096,
+                        self.PDS_BLOCK_BYTES,
                         peer_cta_rank_in_cluster=peer_rank,
                     )
                     if rank == Int32(0):
                         _cpasync_bulk_s2cluster(
-                            ds_xchg.iterator,
-                            ds_blocks[0].iterator,
+                            ds_xchg_raw.iterator,
+                            ds_block_raw_ptrs[0],
                             landing_mbars + 1,
-                            4096,
+                            self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
                     else:
                         _cpasync_bulk_s2cluster(
-                            ds_xchg.iterator,
-                            ds_blocks[1].iterator,
+                            ds_xchg_raw.iterator,
+                            ds_block_raw_ptrs[1],
                             landing_mbars + 1,
-                            4096,
+                            self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
+
+                # Do not publish a P/dS generation until both peer payloads
+                # have landed in their final CG2-B byte layout.
+                if mtx == Int32(0):
+                    _mbarrier_wait_acquire_cluster(
+                        landing_mbars,
+                        landing_phase,
+                    )
+                    _mbarrier_wait_acquire_cluster(
+                        landing_mbars + 1,
+                        landing_phase,
+                    )
+                self.math_barrier.arrive_and_wait()
                 pipe_pds.producer_commit(pds_state)
                 pds_state.advance()
+                landing_phase = Int32(1) - landing_phase
             if tile_count > Int32(0):
                 pipe_pds.producer_tail(pds_state)
 
