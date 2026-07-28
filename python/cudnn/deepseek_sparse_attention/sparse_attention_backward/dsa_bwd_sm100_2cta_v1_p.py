@@ -8169,6 +8169,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
     assert MATH_THREADS_PER_CTA == MATH_WARP_COUNT * 32
     KV_LOAD_THREAD_BEGIN = 128
     KV_LOAD_THREADS = 128
+    # A1-input CP0: split W4-W5/W6-W7 across live macro lanes. The current
+    # patch-based trace contract still requires both legacy rendezvous sites.
     KV_LOAD_THREADS_PER_LANE = KV_LOAD_THREADS // 2
     KV_LOAD_GROUPS_PER_LANE = (
         KV_LOAD_THREADS_PER_LANE
@@ -10204,12 +10206,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                 # V1_SPAN_LOAD_STATS_END
                 stationary_loaded = Int32(1)
 
-            # A1-input CP0: when both macro lanes are live, W4-W5 and W6-W7
-            # own disjoint K_N images and commit/wait their warp-local
-            # cp.async groups before the first CTA/cluster publication.
-            # Keep the second publication point as a trace-compatible,
-            # behavior-neutral rendezvous until source-native role tracing
-            # replaces the current patch-based instrumentation.
             # V1_SPAN_LOAD_K_BEGIN
             if active_0:
                 if (
