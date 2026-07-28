@@ -10931,6 +10931,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     MATH_WARPS = 4
     REDUCE_WARP_BEGIN = 8
     REDUCE_WARPS = 8
+    REDUCE_PIPELINE_THREADS = 128
     MMA_WARP = 16
     LOAD_WARP = 17
     RELAY_WARP = 18
@@ -11549,14 +11550,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 p_blocks[0][None, None, None, 0],
                 cute.make_layout(
                     (self.N_TILE_CTA, self.H_TILE_CTA),
-                    stride=(self.H_TILE_CTA, 1),
                 ),
             ),
             cute.composition(
                 p_blocks[1][None, None, None, 0],
                 cute.make_layout(
                     (self.N_TILE_CTA, self.H_TILE_CTA),
-                    stride=(self.H_TILE_CTA, 1),
                 ),
             ),
         )
@@ -11564,7 +11563,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             p_xchg[None, None, None, 0],
             cute.make_layout(
                 (self.N_TILE_CTA, self.H_TILE_CTA),
-                stride=(self.H_TILE_CTA, 1),
             ),
         )
         ds_block_coords = (
@@ -11572,14 +11570,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 ds_blocks[0][None, None, None, 0],
                 cute.make_layout(
                     (self.N_TILE_CTA, self.H_TILE_CTA),
-                    stride=(self.H_TILE_CTA, 1),
                 ),
             ),
             cute.composition(
                 ds_blocks[1][None, None, None, 0],
                 cute.make_layout(
                     (self.N_TILE_CTA, self.H_TILE_CTA),
-                    stride=(self.H_TILE_CTA, 1),
                 ),
             ),
         )
@@ -11587,7 +11583,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ds_xchg[None, None, None, 0],
             cute.make_layout(
                 (self.N_TILE_CTA, self.H_TILE_CTA),
-                stride=(self.H_TILE_CTA, 1),
             ),
         )
         softmax_stats = storage.stats.get_tensor(
@@ -11791,7 +11786,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         reduce_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            atom_thr_size * self.REDUCE_THREADS,
+            atom_thr_size * self.REDUCE_PIPELINE_THREADS,
         )
         load_elect_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
@@ -12270,30 +12265,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx < Int32(self.MMA_WARP):
             # --- reduce: drain both dKV slots per tile, rank-owned.
             rtx = tidx - Int32(self.REDUCE_THREAD_BEGIN)
-            dkv_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer,
-                self.MMA_DONE_STAGES,
-            )
-            for loop_iter in cutlass.range(tile_count):
-                tile_index = tile_count - Int32(1) - loop_iter
-                for round_index in cutlass.range_constexpr(
-                    self.D_ROUNDS
-                ):
-                    dkv_state = self._drain_dkv_v2(
-                        t_dkv[round_index],
-                        dkv_tmem_load,
-                        rank_dkv_coordinates,
-                        mdKV_acc,
-                        mTopkIdxs,
-                        tile_index,
-                        topk,
-                        round_index,
-                        token_idx,
-                        batch_idx,
-                        rtx,
-                        pipe_dkv_done,
-                        dkv_state,
-                    )
+            if rtx < Int32(self.REDUCE_PIPELINE_THREADS):
+                dkv_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer,
+                    self.MMA_DONE_STAGES,
+                )
+                for loop_iter in cutlass.range(tile_count):
+                    tile_index = tile_count - Int32(1) - loop_iter
+                    for round_index in cutlass.range_constexpr(
+                        self.D_ROUNDS
+                    ):
+                        dkv_state = self._atomic_dkv_from_tmem(
+                            t_dkv[round_index],
+                            dkv_tmem_load,
+                            rank_dkv_coordinates,
+                            mdKV_acc,
+                            mTopkIdxs,
+                            round_index,
+                            tile_index,
+                            topk,
+                            token_idx,
+                            batch_idx,
+                            rtx,
+                            pipe_dkv_done,
+                            dkv_state,
+                        )
 
         elif warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
