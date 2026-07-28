@@ -8457,50 +8457,56 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         logical_tile: Int32,
         issue_seq: Int32,
     ) -> None:
-        """Decode one context with a single writer and no collective.
+        """Decode one context with one warp and no CTA collective.
 
         The logical-tile word is the publication tag and is written last.
-        The caller must publish the stores with an existing CTA/cluster
-        rendezvous before any warp tests the tag.
+        Every lane in the calling warp must participate. The caller must
+        publish the stores with an existing CTA/cluster rendezvous before any
+        warp tests the tag.
         """
 
-        valid_lo = Int32(0)
-        valid_hi = Int32(0)
-        context[self.CTX_ISSUE_SEQ_WORD] = issue_seq
-        for logical_n in cutlass.range_constexpr(self.N_TILE):
-            topk_slot = (
-                logical_tile * Int32(self.N_TILE)
-                + Int32(logical_n)
-            )
-            kv_index = Int32(-1)
-            if topk_slot < topk:
-                kv_index = mTopkIdxs[
-                    topk_slot,
-                    (token_idx, batch_idx),
-                ]
-            context[
-                self.CTX_KV_BASE_WORD + logical_n
-            ] = kv_index
-            if kv_index >= Int32(0):
-                if cutlass.const_expr(logical_n < 32):
-                    valid_lo = (
-                        valid_lo
-                        | (
-                            Int32(1)
-                            << Int32(logical_n)
-                        )
-                    )
-                else:
-                    valid_hi = (
-                        valid_hi
-                        | (
-                            Int32(1)
-                            << Int32(logical_n - 32)
-                        )
-                    )
-        context[self.CTX_VALID_LO_WORD] = valid_lo
-        context[self.CTX_VALID_HI_WORD] = valid_hi
-        context[self.CTX_LOGICAL_TILE_WORD] = logical_tile
+        lane = cute.arch.lane_idx()
+        topk_slot_lo = (
+            logical_tile * Int32(self.N_TILE) + lane
+        )
+        kv_index_lo = Int32(-1)
+        if topk_slot_lo < topk:
+            kv_index_lo = mTopkIdxs[
+                topk_slot_lo,
+                (token_idx, batch_idx),
+            ]
+        context[
+            self.CTX_KV_BASE_WORD + lane
+        ] = kv_index_lo
+        valid_lo = cute.arch.vote_ballot_sync(
+            kv_index_lo >= Int32(0)
+        )
+
+        logical_n_hi = lane + Int32(32)
+        topk_slot_hi = (
+            logical_tile * Int32(self.N_TILE)
+            + logical_n_hi
+        )
+        kv_index_hi = Int32(-1)
+        if topk_slot_hi < topk:
+            kv_index_hi = mTopkIdxs[
+                topk_slot_hi,
+                (token_idx, batch_idx),
+            ]
+        context[
+            self.CTX_KV_BASE_WORD + logical_n_hi
+        ] = kv_index_hi
+        valid_hi = cute.arch.vote_ballot_sync(
+            kv_index_hi >= Int32(0)
+        )
+
+        if lane == Int32(0):
+            context[self.CTX_ISSUE_SEQ_WORD] = issue_seq
+            context[self.CTX_VALID_LO_WORD] = valid_lo
+            context[self.CTX_VALID_HI_WORD] = valid_hi
+            context[self.CTX_LOGICAL_TILE_WORD] = logical_tile
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
 
     @cute.jit
     def _prefetch_next_macro_ctx_v1(
@@ -10468,7 +10474,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         )
                     )
                 # V1_SPAN_SDP_ISSUE_END
-                if tidx == Int32(self.KV_LOAD_THREAD_BEGIN):
+                if warp_idx == Int32(self.MATH_WARP_COUNT):
                     self._prefetch_next_macro_ctx_v1(
                         mTopkIdxs,
                         contexts,
@@ -10525,8 +10531,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                 # V1_SPAN_SDP_ISSUE_END
                 if (
                     not active_0
-                    and tidx
-                    == Int32(self.KV_LOAD_THREAD_BEGIN)
+                    and warp_idx
+                    == Int32(self.MATH_WARP_COUNT)
                 ):
                     self._prefetch_next_macro_ctx_v1(
                         mTopkIdxs,
