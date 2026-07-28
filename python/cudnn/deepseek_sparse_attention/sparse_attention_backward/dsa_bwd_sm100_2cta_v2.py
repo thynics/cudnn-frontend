@@ -13251,6 +13251,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         self.reduce_sync_barrier.arrive_and_wait()
 
+    # The rotated row visits above were useful while studying pairwise CTA
+    # contention, but they serialize the production CG1 reducer on B200.
+    # Keep the experiment in the file and bind the active candidate back to
+    # the canonical leaf stores as the optimization baseline.
+    reduce_dKV_from_reg = (
+        FlashAttentionDSABackwardSm100.reduce_dKV_from_reg
+    )
+    reduce_dKV_64_from_reg = (
+        FlashAttentionDSABackwardSm100.reduce_dKV_64_from_reg
+    )
+    store_dKV = FlashAttentionDSABackwardSm100.store_dKV
+    store_dKV_64 = FlashAttentionDSABackwardSm100.store_dKV_64
+
 
 # Workspace-only host alias used by the harness integration patch.  The
 # isolated B200 harness imports this module under the canonical filename and
