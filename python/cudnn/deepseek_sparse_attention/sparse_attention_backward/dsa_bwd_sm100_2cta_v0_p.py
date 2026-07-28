@@ -3682,7 +3682,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     STATS_WORDS = (
         SOFTMAX_SUM_ODO_STATS_WORD + SOFTMAX_STATS_HEADS
     )
-    EXPECTED_SHARED_STORAGE_BYTES = 208_384
+    # The 512-byte loader ring pushes the 1024-byte-aligned struct from
+    # 203 KiB to the next whole-KiB boundary.
+    EXPECTED_SHARED_STORAGE_BYTES = 208_896
 
     # DEVELOPMENT-ONLY diagnostics. These are deliberately not
     # exposed by the public interface and must be removed before integration.
