@@ -142,7 +142,7 @@ class FlashAttentionDSABackwardSm100:
 
         self.num_regs_load_KV = 40
         self.num_regs_compute = 128
-        self.num_regs_reduce = 128
+        self.num_regs_reduce = 144
         self.num_regs_mma = 40
         self.num_regs_empty = 40
         self.num_regs_load = 40
