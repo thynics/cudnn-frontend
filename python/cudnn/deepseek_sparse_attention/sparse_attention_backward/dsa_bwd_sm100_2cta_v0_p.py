@@ -556,7 +556,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             sdp_a_halves,
             (
                 ((None, None), None, (None, None)),
-                ((0, 0), 0, (0, 0)),
+                ((0, 0), 0, (0, 0), 0),
             ),
         )
         sdp_a_half_layout = cute.group_modes(
