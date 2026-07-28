@@ -11027,7 +11027,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             stationary_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            round_tma_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            round_completion_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -11430,7 +11430,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         stationary_ready_mbar = storage.stationary_ready_mbar.data_ptr()
         landing_mbars = storage.landing_mbars.data_ptr()
         relay_mbars = storage.relay_mbars.data_ptr()
-        round_tma_mbar = storage.round_tma_mbar.data_ptr()
+        round_completion_mbars = (
+            storage.round_completion_mbars.data_ptr()
+        )
 
         # ------------------------------------------------------------------
         # SMEM tensor views.
@@ -11874,7 +11876,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(landing_mbars + 1, 1)
             cute.arch.mbarrier_init(relay_mbars, 2)
             cute.arch.mbarrier_init(relay_mbars + 1, 2)
-            cute.arch.mbarrier_init(round_tma_mbar, 1)
+            cute.arch.mbarrier_init(
+                round_completion_mbars,
+                33,
+            )
+            cute.arch.mbarrier_init(
+                round_completion_mbars + 1,
+                33,
+            )
         cute.arch.fence_view_async_shared()
         self.cta_barrier.arrive_and_wait()
 
@@ -12614,13 +12623,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_dq_done.producer_tail(dq_done_prod)
 
         elif warp_idx == Int32(self.LOAD_WARP):
-            # --- load: stationary TMA once, then 10 round gens per tile.
+            # --- load: issue stationary and round fills.  W19 publishes
+            # each round stage only after its local async transaction retires.
             lane_idx = tidx % Int32(32)
-            round_prod = pipeline.make_pipeline_state(
+            round_issue_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.ROUND_STAGES,
             )
-            tma_phase = Int32(0)
             if tile_count > Int32(0):
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
@@ -12665,7 +12674,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     for round_index in cutlass.range_constexpr(
                         self.D_ROUNDS
                     ):
-                        pipe_round.producer_acquire(round_prod)
+                        pipe_round.producer_acquire(
+                            round_issue_state
+                        )
+                        completion_mbar = (
+                            round_completion_mbars
+                            + round_issue_state.index
+                        )
                         if cutlass.const_expr(round_index == 0):
                             self._fill_kdq_v2(
                                 mKV,
@@ -12700,13 +12715,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 kv_copy_atom,
                                 kv_thread_copy,
                             )
-                        cute.arch.cp_async_commit_group()
-                        cute.arch.cp_async_wait_group(0)
-                        cute.arch.fence_view_async_shared()
-                        cute.arch.sync_warp()
                         with cute.arch.elect_one():
-                            pipe_round.producer_commit(round_prod)
-                        round_prod.advance()
+                            cute.arch.mbarrier_arrive(
+                                completion_mbar
+                            )
+                        cute.arch.cp_async_mbarrier_arrive_noinc(
+                            completion_mbar
+                        )
+                        round_issue_state.advance()
 
                     # g2..g9: quadrant TMA fills, buf alternation matches
                     # the fixed generation order.
@@ -12718,11 +12734,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 self.H_PASSES
                             ):
                                 pipe_round.producer_acquire(
-                                    round_prod
+                                    round_issue_state
+                                )
+                                completion_mbar = (
+                                    round_completion_mbars
+                                    + round_issue_state.index
                                 )
                                 with cute.arch.elect_one():
                                     cute.arch.mbarrier_arrive_and_expect_tx(
-                                        round_tma_mbar,
+                                        completion_mbar,
                                         grad_a_stage_bytes,
                                     )
                                 if cutlass.const_expr(
@@ -12739,7 +12759,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 0,
                                             ],
                                             t_dot_smem_a[None, 0],
-                                            tma_bar_ptr=round_tma_mbar,
+                                            tma_bar_ptr=completion_mbar,
                                         )
                                     else:
                                         cute.copy(
@@ -12750,7 +12770,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 1,
                                             ],
                                             t_dot_smem_b[None, 0],
-                                            tma_bar_ptr=round_tma_mbar,
+                                            tma_bar_ptr=completion_mbar,
                                         )
                                 else:
                                     if cutlass.const_expr(
@@ -12764,7 +12784,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 0,
                                             ],
                                             t_qt_smem_a[None, 0],
-                                            tma_bar_ptr=round_tma_mbar,
+                                            tma_bar_ptr=completion_mbar,
                                         )
                                     else:
                                         cute.copy(
@@ -12775,19 +12795,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 1,
                                             ],
                                             t_qt_smem_b[None, 0],
-                                            tma_bar_ptr=round_tma_mbar,
+                                            tma_bar_ptr=completion_mbar,
                                         )
-                                cute.arch.mbarrier_wait(
-                                    round_tma_mbar,
-                                    tma_phase,
+                                cute.arch.mbarrier_arrive(
+                                    completion_mbar
                                 )
-                                tma_phase = Int32(1) - tma_phase
-                                with cute.arch.elect_one():
-                                    pipe_round.producer_commit(
-                                        round_prod
-                                    )
-                                round_prod.advance()
-                pipe_round.producer_tail(round_prod)
+                                round_issue_state.advance()
 
         elif warp_idx == Int32(self.RELAY_WARP):
             # --- relay: convert DSM landings into leader-visible arrives.
@@ -12811,6 +12824,37 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         Int32(0),
                     )
                     landing_phase = Int32(1) - landing_phase
+
+        elif warp_idx == Int32(self.IDLE_WARP):
+            # --- completion: separate transaction retirement from issue so
+            # the two round stages can carry two in-flight fills.
+            round_done_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer,
+                self.ROUND_STAGES,
+            )
+            round_commit_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer,
+                self.ROUND_STAGES,
+            )
+            total_round_gens = tile_count * Int32(
+                self.ROUND_GENS_PER_TILE
+            )
+            for _ in cutlass.range(total_round_gens):
+                cute.arch.mbarrier_wait(
+                    round_completion_mbars
+                    + round_done_state.index,
+                    round_done_state.phase,
+                )
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    pipe_round.producer_commit(
+                        round_commit_state
+                    )
+                round_done_state.advance()
+                round_commit_state.advance()
+            if tile_count > Int32(0):
+                pipe_round.producer_tail(round_commit_state)
 
         # ==================================================================
         # Common tail: full-cluster rendezvous, then TMEM release.
