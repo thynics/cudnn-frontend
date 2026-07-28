@@ -36,6 +36,10 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
 
+_V2_IKET_S_ISSUE_EVENT = "S_ISSUE(i)"
+_V2_IKET_DP_ISSUE_EVENT = "dP_ISSUE(i)"
+
+
 @dsl_user_op
 def _map_smem_to_cluster_rank(
     smem_ptr: cute.Pointer,
@@ -10903,6 +10907,82 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         }
         return SharedStorage
 
+    @cute.jit
+    def _issue_four_chunks_iket(
+        self,
+        tiled_mma: cute.TiledMma,
+        accumulator: cute.Tensor,
+        a_fragment: cute.Tensor,
+        b_fragment: cute.Tensor,
+        done_pipeline,
+        producer_state,
+        issue_seq: Int32,
+        is_dp: cutlass.Constexpr[bool],
+    ):
+        """Retain aggregate issue spans alongside the split IKET scopes."""
+
+        if cutlass.const_expr(is_dp):
+            issue_token = cute.experimental.iket.range_start(
+                _V2_IKET_DP_ISSUE_EVENT,
+                issue_seq,
+            )
+            acquire_token = cute.experimental.iket.range_start(
+                "dP_ACQUIRE(i)",
+                issue_seq,
+            )
+        else:
+            issue_token = cute.experimental.iket.range_start(
+                _V2_IKET_S_ISSUE_EVENT,
+                issue_seq,
+            )
+            acquire_token = cute.experimental.iket.range_start(
+                "S_ACQUIRE(i)",
+                issue_seq,
+            )
+        done_pipeline.producer_acquire(producer_state)
+        cute.experimental.iket.range_end(acquire_token, issue_seq)
+
+        if cutlass.const_expr(is_dp):
+            mma_issue_token = cute.experimental.iket.range_start(
+                "dP_MMA_ISSUE(i)",
+                issue_seq,
+            )
+        else:
+            mma_issue_token = cute.experimental.iket.range_start(
+                "S_MMA_ISSUE(i)",
+                issue_seq,
+            )
+        mma = tiled_mma.with_()
+        mma.set(tcgen05.Field.ACCUMULATE, False)
+        k_blocks_per_chunk = cute.size(a_fragment, mode=[2])
+        for flat_k_block in cutlass.range_constexpr(
+            self.K_CHUNKS * k_blocks_per_chunk
+        ):
+            chunk = flat_k_block // k_blocks_per_chunk
+            k_block = flat_k_block % k_blocks_per_chunk
+            cute.gemm(
+                mma,
+                accumulator,
+                a_fragment[None, None, k_block, chunk],
+                b_fragment[None, None, k_block, chunk],
+                accumulator,
+            )
+            mma.set(tcgen05.Field.ACCUMULATE, True)
+        cute.experimental.iket.range_end(mma_issue_token, issue_seq)
+
+        if cutlass.const_expr(not is_dp):
+            publish_token = cute.experimental.iket.range_start(
+                "S_PUBLISH(i)",
+                issue_seq,
+            )
+        cute.arch.fence_view_async_tmem_store()
+        done_pipeline.producer_commit(producer_state)
+        producer_state.advance()
+        if cutlass.const_expr(not is_dp):
+            cute.experimental.iket.range_end(publish_token, issue_seq)
+        cute.experimental.iket.range_end(issue_token, issue_seq)
+        return producer_state
+
 
 @cute.jit
 def _store_shared_bf16_at_v2(
@@ -13259,7 +13339,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # The mandatory trace subprocess sets DSA_DEV_IKET=1 before importing this
 # module; select the instrumented v1t1d CG2 path there to satisfy its fixed
 # H128 grid and span-schema contract.
-if os.environ.get("DSA_DEV_IKET", "0") == "1":
+if (
+    os.environ.get("DSA_DEV_IKET", "0") == "1"
+    and os.environ.get("DSA_DEV_IMPL") == "2cta"
+):
     _harness_candidate = FlashAttentionDSABackwardSm100TwoCTAV1A0
 else:
     _harness_candidate = FlashAttentionDSABackwardSm100TwoCTAV2
