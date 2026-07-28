@@ -34,6 +34,9 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.typing import BFloat16, Float32, Int32
 
+from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
+
+
 @dsl_user_op
 def _map_smem_to_cluster_rank(
     smem_ptr: cute.Pointer,
