@@ -2210,7 +2210,8 @@ class FlashAttentionDSABackwardSm100:
             rdKV1 = self.t2r_dKV(tdKVtdKV1)
             cute.arch.fence_view_async_tmem_load()
             self.t2r_dKV01_done_barrier.arrive_and_wait()
-            self.reduce_dKV_pair_from_reg(mdKV_acc, rdKV0, rdKV1, rTopkIdx, 0)
+            self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
+            self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
 
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
@@ -2238,7 +2239,8 @@ class FlashAttentionDSABackwardSm100:
                 rdKV3 = self.t2r_dKV(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV4_done_barrier.arrive_and_wait()
-                self.reduce_dKV_pair_from_reg(mdKV_acc, rdKV2, rdKV3, rTopkIdx, 2)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             else:
                 # T2R dKV2/dKV3 into registers, then signal the MMA warp that
                 # the TMEM columns are free for the next iteration's dKV0/dKV1
@@ -2250,7 +2252,8 @@ class FlashAttentionDSABackwardSm100:
                 rdKV3 = self.t2r_dKV(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV23_done_barrier.arrive_and_wait()
-                self.reduce_dKV_pair_from_reg(mdKV_acc, rdKV2, rdKV3, rTopkIdx, 2)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
 
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
@@ -2284,43 +2287,35 @@ class FlashAttentionDSABackwardSm100:
         return tTR_rdKV
 
     @cute.jit
-    def reduce_dKV_pair_from_reg(
+    def reduce_dKV_from_reg(
         self,
         dKV_acc: cute.Tensor,
-        tTR_rdKV0: cute.Tensor,
-        tTR_rdKV1: cute.Tensor,
+        tTR_rdKV: cute.Tensor,
         rTopkIdx: cute.Tensor,
-        first_sub_tile_idx: int,
+        sub_tile_idx: int,
     ):
-        """Reduce two adjacent dKV register tiles with shared addressing."""
+        """Reduce dKV from registers to global memory via atomic_add."""
         tidx, _, _ = cute.arch.thread_idx()
-        _, _, batch_idx = cute.arch.block_idx()
+        token_idx, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
-        dp_vec_idx = (tidx_in_wg % 128) // 4
+        dp_idx = tidx_in_wg % 128
 
         for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
+
             rdKV_frg = cute.make_rmem_tensor((4,), self.acc_dtype)
-            rdKV_frg[0] = tTR_rdKV0[coord_base]
-            rdKV_frg[1] = tTR_rdKV0[coord_base + 2]
-            rdKV_frg[2] = tTR_rdKV0[coord_base + 16]
-            rdKV_frg[3] = tTR_rdKV0[coord_base + 18]
+            rdKV_frg[0] = tTR_rdKV[coord_base]
+            rdKV_frg[1] = tTR_rdKV[coord_base + 2]
+            rdKV_frg[2] = tTR_rdKV[coord_base + 16]
+            rdKV_frg[3] = tTR_rdKV[coord_base + 18]
 
             topk_idx = rTopkIdx[i]
             if topk_idx >= 0:
                 dKV_row = dKV_acc[None, topk_idx, (0, batch_idx)]
-                dKV_tiles = cute.flat_divide(dKV_row, (128,))  # (128, 4)
-
-                tile_dKV_row = cute.flat_divide(dKV_tiles[None, first_sub_tile_idx], (4,))  # (4, 32)
-                cur_dKV_frg = tile_dKV_row[None, dp_vec_idx]
-                cute.arch.atomic_add(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load())
-
-                rdKV_frg[0] = tTR_rdKV1[coord_base]
-                rdKV_frg[1] = tTR_rdKV1[coord_base + 2]
-                rdKV_frg[2] = tTR_rdKV1[coord_base + 16]
-                rdKV_frg[3] = tTR_rdKV1[coord_base + 18]
-                tile_dKV_row = cute.flat_divide(dKV_tiles[None, first_sub_tile_idx + 1], (4,))  # (4, 32)
-                cur_dKV_frg = tile_dKV_row[None, dp_vec_idx]
+                tile_dKV_row = cute.flat_divide(dKV_row, (128,))  # (128, 4)
+                tile_dKV_row = tile_dKV_row[None, sub_tile_idx]
+                tile_dKV_row = cute.flat_divide(tile_dKV_row, (4,))  # (4, 32)
+                cur_dKV_frg = tile_dKV_row[None, dp_idx // 4]
                 cute.arch.atomic_add(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load())
 
         self.reduce_sync_barrier.arrive_and_wait()
