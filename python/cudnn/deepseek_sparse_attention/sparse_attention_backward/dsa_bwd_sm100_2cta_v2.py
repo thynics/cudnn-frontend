@@ -12712,9 +12712,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         self,
         source: cute.Tensor,
         destination: cute.Tensor,
+        topk_indices: cute.Tensor,
         count: Int32,
     ):
-        """Copy compact lengths while keeping every token on one tile."""
+        """Clamp empty rows and hide their synthetic first sparse entry."""
         block_idx, _, _ = cute.arch.block_idx()
         thread_idx, _, _ = cute.arch.thread_idx()
         index = block_idx * 256 + thread_idx
@@ -12722,7 +12723,27 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             value = source[index]
             if value == Int32(0):
                 value = Int32(1)
+                topk_indices[index, 0] = (
+                    -topk_indices[index, 0] - Int32(2)
+                )
             destination[index] = value
+
+    @cute.kernel
+    def _restore_empty_topk_indices_v2(
+        self,
+        lengths: cute.Tensor,
+        topk_indices: cute.Tensor,
+        count: Int32,
+    ):
+        """Undo the stream-ordered empty-row sentinel encoding."""
+        block_idx, _, _ = cute.arch.block_idx()
+        thread_idx, _, _ = cute.arch.thread_idx()
+        index = block_idx * 256 + thread_idx
+        if index < count:
+            if lengths[index] == Int32(0):
+                topk_indices[index, 0] = (
+                    -topk_indices[index, 0] - Int32(2)
+                )
 
     @cute.jit
     def __call__(
@@ -12751,6 +12772,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         del trace_buffer, trace_token_idx, trace_batch_idx
         if cutlass.const_expr(mTopkLength is not None):
+            raw_topk_lengths = mTopkLength
+            raw_topk_indices = mTopkIdxs
             length_count = mTopkLength.shape[0]
             length_scratch = cute.make_tensor(
                 cute.recast_ptr(mdKV.iterator, dtype=Int32),
@@ -12759,6 +12782,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self._copy_clamp_topk_lengths_v2(
                 mTopkLength,
                 length_scratch,
+                mTopkIdxs,
                 length_count,
             ).launch(
                 grid=[cute.ceil_div(length_count, 256), 1, 1],
@@ -12767,7 +12791,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             mTopkLength = length_scratch
 
-        return super().__call__(
+        super().__call__(
             problem_shape,
             mQ,
             mKV,
@@ -12785,6 +12809,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             softmax_scale,
             stream,
         )
+
+        if cutlass.const_expr(mTopkLength is not None):
+            self._restore_empty_topk_indices_v2(
+                raw_topk_lengths,
+                raw_topk_indices,
+                length_count,
+            ).launch(
+                grid=[cute.ceil_div(length_count, 256), 1, 1],
+                block=[256, 1, 1],
+                stream=stream,
+            )
 
     @cute.jit
     def _load_kv_rows(
