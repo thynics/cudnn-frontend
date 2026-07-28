@@ -10959,7 +10959,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     TMEM_DKV1_OFFSET = 448
 
     # Round-region generations per tile (fixed order, one producer/consumer):
-    # g0 kdq_r0(A) g1 kdq_r1(B) g2 dO_r0h0(A) g3 dO_r0h1(B) g4 Q_r0h0(A)
+    # g0 dO_r0h0(A) g1 dO_r0h1(B) g2 kdq_r0(A) g3 kdq_r1(B) g4 Q_r0h0(A)
     # g5 Q_r0h1(B) g6 dO_r1h0(A) g7 dO_r1h1(B) g8 Q_r1h0(A) g9 Q_r1h1(B)
     ROUND_GENS_PER_TILE = 10
     ROUND_STAGES = 2
@@ -12662,58 +12662,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_index = (
                         tile_count - Int32(1) - loop_iter
                     )
-                    # g0/g1: K_dQ r0 (buf A), r1 (buf B) via cp.async.
-                    for round_index in cutlass.range_constexpr(
-                        self.D_ROUNDS
-                    ):
-                        pipe_round.producer_acquire(
-                            round_issue_state
-                        )
-                        completion_mbar = (
-                            round_completion_mbars
-                            + round_issue_state.index
-                        )
-                        if cutlass.const_expr(round_index == 0):
-                            self._fill_kdq_v2(
-                                mKV,
-                                mTopkIdxs,
-                                self._kd_round_rows_v2(
-                                    round_kd[0]
-                                ),
-                                token_idx,
-                                batch_idx,
-                                tile_index,
-                                topk,
-                                0,
-                                rank,
-                                lane_idx,
-                                kv_copy_atom,
-                                kv_thread_copy,
-                            )
-                        else:
-                            self._fill_kdq_v2(
-                                mKV,
-                                mTopkIdxs,
-                                self._kd_round_rows_v2(
-                                    round_kd[1]
-                                ),
-                                token_idx,
-                                batch_idx,
-                                tile_index,
-                                topk,
-                                1,
-                                rank,
-                                lane_idx,
-                                kv_copy_atom,
-                                kv_thread_copy,
-                            )
-                        cute.arch.cp_async_mbarrier_arrive_noinc(
-                            completion_mbar
-                        )
-                        round_issue_state.advance()
-
-                    # g2..g9: quadrant TMA fills, buf alternation matches
-                    # the fixed generation order.
+                    # Issue round-0 dO before K_dQ so the leader can start
+                    # dV using P while math is still producing dS.
                     for grad_round in cutlass.range_constexpr(
                         self.D_ROUNDS
                     ):
@@ -12789,6 +12739,62 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     completion_mbar
                                 )
                                 round_issue_state.advance()
+
+                            if cutlass.const_expr(
+                                grad_round == 0
+                                and tensor_kind == 0
+                            ):
+                                # g2/g3: K_dQ r0 (buf A), r1 (buf B).
+                                for round_index in cutlass.range_constexpr(
+                                    self.D_ROUNDS
+                                ):
+                                    pipe_round.producer_acquire(
+                                        round_issue_state
+                                    )
+                                    completion_mbar = (
+                                        round_completion_mbars
+                                        + round_issue_state.index
+                                    )
+                                    if cutlass.const_expr(
+                                        round_index == 0
+                                    ):
+                                        self._fill_kdq_v2(
+                                            mKV,
+                                            mTopkIdxs,
+                                            self._kd_round_rows_v2(
+                                                round_kd[0]
+                                            ),
+                                            token_idx,
+                                            batch_idx,
+                                            tile_index,
+                                            topk,
+                                            0,
+                                            rank,
+                                            lane_idx,
+                                            kv_copy_atom,
+                                            kv_thread_copy,
+                                        )
+                                    else:
+                                        self._fill_kdq_v2(
+                                            mKV,
+                                            mTopkIdxs,
+                                            self._kd_round_rows_v2(
+                                                round_kd[1]
+                                            ),
+                                            token_idx,
+                                            batch_idx,
+                                            tile_index,
+                                            topk,
+                                            1,
+                                            rank,
+                                            lane_idx,
+                                            kv_copy_atom,
+                                            kv_thread_copy,
+                                        )
+                                    cute.arch.cp_async_mbarrier_arrive_noinc(
+                                        completion_mbar
+                                    )
+                                    round_issue_state.advance()
 
         elif warp_idx == Int32(self.RELAY_WARP):
             # --- relay: convert DSM landings into leader-visible arrives.
@@ -12918,36 +12924,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dkv_done_pipeline,
         dkv_producer_state: pipeline.PipelineState,
     ):
-        """Gradient block, first half: dQ rounds + round-0 dV/dK passes."""
+        """Gradient block, first half: round-0 dV, dQ, then round-0 dK."""
 
-        # dS is needed by dQ and dK.  P is waited independently so its
-        # single stage can be released as soon as the final dV pass issues.
-        ds_pipeline.consumer_wait(ds_consumer_state)
+        # P is ready before dS.  Consume round-0 dV first so math can finish
+        # dS and the load warp can fill K_dQ under useful UMMA work.
         p_pipeline.consumer_wait(p_consumer_state)
-
-        # dQ both rounds back-to-back; releases free the round buffers for
-        # the quadrant refills.
-        round_consumer_state = self._issue_dq_rounds_v2(
-            dq_tiled_mma,
-            t_dq_0,
-            t_dq_1,
-            dq_kd_fragment_a,
-            dq_kd_fragment_b,
-            dq_ds_fragment,
-            dq_accumulate,
-            round_pipeline,
-            round_consumer_state,
-        )
-
-        # Both CTAs' landing blocks confirmed (relay converts the DSM
-        # complete_tx into leader-visible arrives).
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
-        _mbarrier_wait_acquire_cluster(
-            relay_mbars + 1,
-            relay_phase,
-        )
 
-        # Round 0: dV(h0), dV(h1) overwrite+accumulate, then dK(h0), dK(h1).
+        # Round 0 dV(h0), dV(h1): overwrite then accumulate.
         dkv_done_pipeline.producer_acquire(dkv_producer_state)
         round_pipeline.consumer_wait(round_consumer_state)
         self._issue_dkv_pass_v2(
@@ -12969,6 +12953,27 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
+
+        # dQ needs only the locally published dS image.  Its two K_dQ
+        # generations now follow round-0 dO in the shared round ring.
+        ds_pipeline.consumer_wait(ds_consumer_state)
+        round_consumer_state = self._issue_dq_rounds_v2(
+            dq_tiled_mma,
+            t_dq_0,
+            t_dq_1,
+            dq_kd_fragment_a,
+            dq_kd_fragment_b,
+            dq_ds_fragment,
+            dq_accumulate,
+            round_pipeline,
+            round_consumer_state,
+        )
+
+        # dK additionally needs both peer dS landing blocks.
+        _mbarrier_wait_acquire_cluster(
+            relay_mbars + 1,
+            relay_phase,
+        )
         round_pipeline.consumer_wait(round_consumer_state)
         self._issue_dkv_pass_v2(
             dkv_tiled_mma,
