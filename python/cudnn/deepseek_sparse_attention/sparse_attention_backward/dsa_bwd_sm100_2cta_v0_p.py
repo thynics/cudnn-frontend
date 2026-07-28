@@ -3748,6 +3748,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         assert self.FIXED_METADATA_BYTES == 1_648
         assert self.CONTEXT_STAGES == 2
         assert self.REDUCER_STAGES == 2
+        assert self.D_ROUNDS == 2
         assert (
             self.DESCRIPTOR_EXECUTE_WORD
             < self.TRAVERSAL_DESCRIPTOR_WORDS
@@ -4934,7 +4935,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         return op_state, s_state, dp_state
 
     @cute.jit
-    def _mma_grad_round(
+    def _mma_grad_pre_q(
         self,
         round_index: cutlass.Constexpr[int],
         accumulate_dq: cutlass.Constexpr[bool],
@@ -4942,7 +4943,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         issue_seq: Int32,
         raw_slots: cute.Tensor,
         raw_p_dv: cute.Tensor,
-        raw_ds_dk: cute.Tensor,
         raw_ds_dq: cute.Tensor,
         dkv_a_layout: cute.ComposedLayout,
         dq_a_layout: cute.ComposedLayout,
@@ -4953,22 +4953,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         t_dkv_round: cute.Tensor,
         t_dq_round: cute.Tensor,
         op_pipeline,
-        op_state: pipeline.PipelineState,
+        op_wait_state: pipeline.PipelineState,
         p_dv_pipeline,
         p_wait_state: pipeline.PipelineState,
-        p_release_state: pipeline.PipelineState,
-        ds_dk_pipeline,
-        dsk_wait_state: pipeline.PipelineState,
-        dsk_release_state: pipeline.PipelineState,
         ds_dq_pipeline,
         dsq_wait_state: pipeline.PipelineState,
-        dsq_release_state: pipeline.PipelineState,
         do_empty_pipeline,
         do_state: pipeline.PipelineState,
-        q_full_pipeline,
-        q_state: pipeline.PipelineState,
         dkv_pipeline,
-        dkv_state: pipeline.PipelineState,
+        dkv_acquire_state: pipeline.PipelineState,
         dq_final_pipeline,
         dq_state: pipeline.PipelineState,
         rank: Int32,
@@ -4994,17 +4987,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 TRACE_GRAD_BEGIN,
                 round_index,
             )
-        op_pipeline.consumer_wait(op_state)
-        slot = op_state.index
+        op_pipeline.consumer_wait(op_wait_state)
+        slot = op_wait_state.index
+        op_wait_state.advance()
 
         pd_stage = issue_seq % Int32(self.PD_STAGES)
         bv_do = self._make_operand_slot_view(
-            raw_slots,
-            slot,
-            self.OP_MAIN_OFFSET_BYTES,
-            dkv_a_layout,
-        )
-        bq_q = self._make_operand_slot_view(
             raw_slots,
             slot,
             self.OP_MAIN_OFFSET_BYTES,
@@ -5022,12 +5010,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             self.PD_NESTED_ELEMENTS_PER_STAGE,
             dkv_b_layout,
         )
-        dsk_operand = self._make_pd_stage_view(
-            raw_ds_dk,
-            pd_stage,
-            self.PD_NESTED_ELEMENTS_PER_STAGE,
-            dkv_b_layout,
-        )
         dsq_operand = self._make_pd_stage_view(
             raw_ds_dq,
             pd_stage,
@@ -5035,12 +5017,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             dq_b_layout,
         )
         dv_a_fragment = dkv_tiled_mma.make_fragment_A(bv_do)
-        dk_a_fragment = dkv_tiled_mma.make_fragment_A(bq_q)
         dq_a_fragment = dq_tiled_mma.make_fragment_A(bq_k)
         p_fragment = dkv_tiled_mma.make_fragment_B(p_operand)
-        dsk_fragment = dkv_tiled_mma.make_fragment_B(
-            dsk_operand
-        )
         dsq_fragment = dq_tiled_mma.make_fragment_B(
             dsq_operand
         )
@@ -5048,7 +5026,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         if cutlass.const_expr(
             self.DIAGNOSTIC_AUX_STAGE >= 4
         ):
-            dkv_pipeline.producer_acquire(dkv_state)
+            dkv_pipeline.producer_acquire(dkv_acquire_state)
+            dkv_acquire_state.advance()
         if cutlass.const_expr(
             self.DIAGNOSTIC_AUX_STAGE >= 3
         ):
@@ -5122,9 +5101,69 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 dq_final_pipeline.producer_commit(dq_state)
                 dq_state.advance()
 
-        # dQ only consumes the side K operand and dS_q.  Issue it while W7 is
-        # replacing the main dO operand with Q, so the BQ TMA latency is not a
-        # hard dependency on the otherwise-independent dQ work.
+        return (
+            slot,
+            op_wait_state,
+            p_wait_state,
+            dsq_wait_state,
+            do_state,
+            dkv_acquire_state,
+            dq_state,
+        )
+
+    @cute.jit
+    def _mma_grad_post_q(
+        self,
+        round_index: cutlass.Constexpr[int],
+        issue_seq: Int32,
+        slot: Int32,
+        raw_slots: cute.Tensor,
+        raw_ds_dk: cute.Tensor,
+        dkv_a_layout: cute.ComposedLayout,
+        dkv_b_layout: cute.ComposedLayout,
+        dkv_tiled_mma: cute.TiledMma,
+        t_dkv_round: cute.Tensor,
+        op_pipeline,
+        op_release_state: pipeline.PipelineState,
+        p_dv_pipeline,
+        p_release_state: pipeline.PipelineState,
+        ds_dk_pipeline,
+        dsk_wait_state: pipeline.PipelineState,
+        dsk_release_state: pipeline.PipelineState,
+        ds_dq_pipeline,
+        dsq_release_state: pipeline.PipelineState,
+        q_full_pipeline,
+        q_state: pipeline.PipelineState,
+        dkv_pipeline,
+        dkv_commit_state: pipeline.PipelineState,
+        rank: Int32,
+        tidx: Int32,
+        token_idx: Int32,
+        batch_idx: Int32,
+        trace_buffer: Optional[cute.Tensor],
+        trace_token_idx: Int32,
+        trace_batch_idx: Int32,
+    ):
+        """Finish one gradient round after W7 has replaced dO with Q."""
+
+        pd_stage = issue_seq % Int32(self.PD_STAGES)
+        bq_q = self._make_operand_slot_view(
+            raw_slots,
+            slot,
+            self.OP_MAIN_OFFSET_BYTES,
+            dkv_a_layout,
+        )
+        dsk_operand = self._make_pd_stage_view(
+            raw_ds_dk,
+            pd_stage,
+            self.PD_NESTED_ELEMENTS_PER_STAGE,
+            dkv_b_layout,
+        )
+        dk_a_fragment = dkv_tiled_mma.make_fragment_A(bq_q)
+        dsk_fragment = dkv_tiled_mma.make_fragment_B(
+            dsk_operand
+        )
+
         if cutlass.const_expr(
             self.DIAGNOSTIC_AUX_STAGE >= 3
         ):
@@ -5159,11 +5198,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         if cutlass.const_expr(
             self.DIAGNOSTIC_AUX_STAGE >= 4
         ):
-            dkv_pipeline.producer_commit(dkv_state)
-            dkv_state.advance()
+            dkv_pipeline.producer_commit(dkv_commit_state)
+            dkv_commit_state.advance()
 
-        op_pipeline.consumer_release(op_state)
-        op_state.advance()
+        op_pipeline.consumer_release(op_release_state)
+        op_release_state.advance()
         if cutlass.const_expr(
             self.DIAGNOSTIC_AUX_STAGE >= 2
             and round_index == self.D_ROUNDS - 1
@@ -5189,7 +5228,239 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 round_index,
             )
         return (
-            op_state,
+            op_release_state,
+            p_release_state,
+            dsk_wait_state,
+            dsk_release_state,
+            dsq_release_state,
+            q_state,
+            dkv_commit_state,
+        )
+
+    @cute.jit
+    def _mma_grad_pair(
+        self,
+        accumulate_dq: cutlass.Constexpr[bool],
+        is_final: cutlass.Boolean,
+        issue_seq: Int32,
+        raw_slots: cute.Tensor,
+        raw_p_dv: cute.Tensor,
+        raw_ds_dk: cute.Tensor,
+        raw_ds_dq: cute.Tensor,
+        dkv_a_layout: cute.ComposedLayout,
+        dq_a_layout: cute.ComposedLayout,
+        dkv_b_layout: cute.ComposedLayout,
+        dq_b_layout: cute.ComposedLayout,
+        dkv_tiled_mma: cute.TiledMma,
+        dq_tiled_mma: cute.TiledMma,
+        t_dkv_round0: cute.Tensor,
+        t_dkv_round1: cute.Tensor,
+        t_dq_round0: cute.Tensor,
+        t_dq_round1: cute.Tensor,
+        op_pipeline,
+        op_state: pipeline.PipelineState,
+        p_dv_pipeline,
+        p_wait_state: pipeline.PipelineState,
+        p_release_state: pipeline.PipelineState,
+        ds_dk_pipeline,
+        dsk_wait_state: pipeline.PipelineState,
+        dsk_release_state: pipeline.PipelineState,
+        ds_dq_pipeline,
+        dsq_wait_state: pipeline.PipelineState,
+        dsq_release_state: pipeline.PipelineState,
+        do_empty_pipeline,
+        do_state: pipeline.PipelineState,
+        q_full_pipeline,
+        q_state: pipeline.PipelineState,
+        dkv_pipeline,
+        dkv_state: pipeline.PipelineState,
+        dq_final_pipeline,
+        dq_state: pipeline.PipelineState,
+        rank: Int32,
+        tidx: Int32,
+        token_idx: Int32,
+        batch_idx: Int32,
+        trace_buffer: Optional[cute.Tensor],
+        trace_token_idx: Int32,
+        trace_batch_idx: Int32,
+    ):
+        """Issue both dV+dQ halves before either Q-dependent dK half."""
+
+        op_wait_state = op_state.clone()
+        op_release_state = op_state.clone()
+        dkv_acquire_state = dkv_state.clone()
+        dkv_commit_state = dkv_state.clone()
+
+        (
+            slot0,
+            op_wait_state,
+            p_wait_state,
+            dsq_wait_state,
+            do_state,
+            dkv_acquire_state,
+            dq_state,
+        ) = self._mma_grad_pre_q(
+            0,
+            accumulate_dq,
+            is_final,
+            issue_seq,
+            raw_slots,
+            raw_p_dv,
+            raw_ds_dq,
+            dkv_a_layout,
+            dq_a_layout,
+            dkv_b_layout,
+            dq_b_layout,
+            dkv_tiled_mma,
+            dq_tiled_mma,
+            t_dkv_round0,
+            t_dq_round0,
+            op_pipeline,
+            op_wait_state,
+            p_dv_pipeline,
+            p_wait_state,
+            ds_dq_pipeline,
+            dsq_wait_state,
+            do_empty_pipeline,
+            do_state,
+            dkv_pipeline,
+            dkv_acquire_state,
+            dq_final_pipeline,
+            dq_state,
+            rank,
+            tidx,
+            token_idx,
+            batch_idx,
+            trace_buffer,
+            trace_token_idx,
+            trace_batch_idx,
+        )
+        (
+            slot1,
+            op_wait_state,
+            p_wait_state,
+            dsq_wait_state,
+            do_state,
+            dkv_acquire_state,
+            dq_state,
+        ) = self._mma_grad_pre_q(
+            1,
+            accumulate_dq,
+            is_final,
+            issue_seq,
+            raw_slots,
+            raw_p_dv,
+            raw_ds_dq,
+            dkv_a_layout,
+            dq_a_layout,
+            dkv_b_layout,
+            dq_b_layout,
+            dkv_tiled_mma,
+            dq_tiled_mma,
+            t_dkv_round1,
+            t_dq_round1,
+            op_pipeline,
+            op_wait_state,
+            p_dv_pipeline,
+            p_wait_state,
+            ds_dq_pipeline,
+            dsq_wait_state,
+            do_empty_pipeline,
+            do_state,
+            dkv_pipeline,
+            dkv_acquire_state,
+            dq_final_pipeline,
+            dq_state,
+            rank,
+            tidx,
+            token_idx,
+            batch_idx,
+            trace_buffer,
+            trace_token_idx,
+            trace_batch_idx,
+        )
+
+        (
+            op_release_state,
+            p_release_state,
+            dsk_wait_state,
+            dsk_release_state,
+            dsq_release_state,
+            q_state,
+            dkv_commit_state,
+        ) = self._mma_grad_post_q(
+            0,
+            issue_seq,
+            slot0,
+            raw_slots,
+            raw_ds_dk,
+            dkv_a_layout,
+            dkv_b_layout,
+            dkv_tiled_mma,
+            t_dkv_round0,
+            op_pipeline,
+            op_release_state,
+            p_dv_pipeline,
+            p_release_state,
+            ds_dk_pipeline,
+            dsk_wait_state,
+            dsk_release_state,
+            ds_dq_pipeline,
+            dsq_release_state,
+            q_full_pipeline,
+            q_state,
+            dkv_pipeline,
+            dkv_commit_state,
+            rank,
+            tidx,
+            token_idx,
+            batch_idx,
+            trace_buffer,
+            trace_token_idx,
+            trace_batch_idx,
+        )
+        (
+            op_release_state,
+            p_release_state,
+            dsk_wait_state,
+            dsk_release_state,
+            dsq_release_state,
+            q_state,
+            dkv_commit_state,
+        ) = self._mma_grad_post_q(
+            1,
+            issue_seq,
+            slot1,
+            raw_slots,
+            raw_ds_dk,
+            dkv_a_layout,
+            dkv_b_layout,
+            dkv_tiled_mma,
+            t_dkv_round1,
+            op_pipeline,
+            op_release_state,
+            p_dv_pipeline,
+            p_release_state,
+            ds_dk_pipeline,
+            dsk_wait_state,
+            dsk_release_state,
+            ds_dq_pipeline,
+            dsq_release_state,
+            q_full_pipeline,
+            q_state,
+            dkv_pipeline,
+            dkv_commit_state,
+            rank,
+            tidx,
+            token_idx,
+            batch_idx,
+            trace_buffer,
+            trace_token_idx,
+            trace_batch_idx,
+        )
+
+        return (
+            op_release_state,
             p_wait_state,
             p_release_state,
             dsk_wait_state,
@@ -5198,7 +5469,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             dsq_release_state,
             do_state,
             q_state,
-            dkv_state,
+            dkv_commit_state,
             dq_state,
         )
 
@@ -7495,65 +7766,63 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         )
                     )
                 first_is_final = not has_next
-                for round_index in cutlass.range_constexpr(
-                    self.D_ROUNDS
-                ):
-                    (
-                        op_state,
-                        p_wait_state,
-                        p_release_state,
-                        dsk_wait_state,
-                        dsk_release_state,
-                        dsq_wait_state,
-                        dsq_release_state,
-                        do_state,
-                        q_state,
-                        dkv_producer_state,
-                        dq_final_producer_state,
-                    ) = self._mma_grad_round(
-                        round_index,
-                        False,
-                        first_is_final,
-                        Int32(0),
-                        raw_slots,
-                        raw_p_dv,
-                        raw_ds_dk,
-                        raw_ds_dq,
-                        dkv_a_layout,
-                        dq_a_layout,
-                        dkv_b_layout,
-                        dq_b_layout,
-                        dkv_tiled_mma,
-                        dq_tiled_mma,
-                        t_dkv[round_index],
-                        t_dq[round_index],
-                        op_pipeline,
-                        op_state,
-                        p_dv_pipeline,
-                        p_wait_state,
-                        p_release_state,
-                        ds_dk_pipeline,
-                        dsk_wait_state,
-                        dsk_release_state,
-                        ds_dq_pipeline,
-                        dsq_wait_state,
-                        dsq_release_state,
-                        do_empty_pipeline,
-                        do_state,
-                        q_full_pipeline,
-                        q_state,
-                        dkv_pipeline,
-                        dkv_producer_state,
-                        dq_final_pipeline,
-                        dq_final_producer_state,
-                        rank,
-                        tidx,
-                        token_idx,
-                        batch_idx,
-                        trace_buffer,
-                        trace_token_idx,
-                        trace_batch_idx,
-                    )
+                (
+                    op_state,
+                    p_wait_state,
+                    p_release_state,
+                    dsk_wait_state,
+                    dsk_release_state,
+                    dsq_wait_state,
+                    dsq_release_state,
+                    do_state,
+                    q_state,
+                    dkv_producer_state,
+                    dq_final_producer_state,
+                ) = self._mma_grad_pair(
+                    False,
+                    first_is_final,
+                    Int32(0),
+                    raw_slots,
+                    raw_p_dv,
+                    raw_ds_dk,
+                    raw_ds_dq,
+                    dkv_a_layout,
+                    dq_a_layout,
+                    dkv_b_layout,
+                    dq_b_layout,
+                    dkv_tiled_mma,
+                    dq_tiled_mma,
+                    t_dkv[0],
+                    t_dkv[1],
+                    t_dq[0],
+                    t_dq[1],
+                    op_pipeline,
+                    op_state,
+                    p_dv_pipeline,
+                    p_wait_state,
+                    p_release_state,
+                    ds_dk_pipeline,
+                    dsk_wait_state,
+                    dsk_release_state,
+                    ds_dq_pipeline,
+                    dsq_wait_state,
+                    dsq_release_state,
+                    do_empty_pipeline,
+                    do_state,
+                    q_full_pipeline,
+                    q_state,
+                    dkv_pipeline,
+                    dkv_producer_state,
+                    dq_final_pipeline,
+                    dq_final_producer_state,
+                    rank,
+                    tidx,
+                    token_idx,
+                    batch_idx,
+                    trace_buffer,
+                    trace_token_idx,
+                    trace_batch_idx,
+                )
 
                 issue_seq = Int32(1)
                 active = has_next
@@ -7591,65 +7860,63 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             )
                         )
                     is_final = not has_next
-                    for round_index in cutlass.range_constexpr(
-                        self.D_ROUNDS
-                    ):
-                        (
-                            op_state,
-                            p_wait_state,
-                            p_release_state,
-                            dsk_wait_state,
-                            dsk_release_state,
-                            dsq_wait_state,
-                            dsq_release_state,
-                            do_state,
-                            q_state,
-                            dkv_producer_state,
-                            dq_final_producer_state,
-                        ) = self._mma_grad_round(
-                            round_index,
-                            True,
-                            is_final,
-                            issue_seq,
-                            raw_slots,
-                            raw_p_dv,
-                            raw_ds_dk,
-                            raw_ds_dq,
-                            dkv_a_layout,
-                            dq_a_layout,
-                            dkv_b_layout,
-                            dq_b_layout,
-                            dkv_tiled_mma,
-                            dq_tiled_mma,
-                            t_dkv[round_index],
-                            t_dq[round_index],
-                            op_pipeline,
-                            op_state,
-                            p_dv_pipeline,
-                            p_wait_state,
-                            p_release_state,
-                            ds_dk_pipeline,
-                            dsk_wait_state,
-                            dsk_release_state,
-                            ds_dq_pipeline,
-                            dsq_wait_state,
-                            dsq_release_state,
-                            do_empty_pipeline,
-                            do_state,
-                            q_full_pipeline,
-                            q_state,
-                            dkv_pipeline,
-                            dkv_producer_state,
-                            dq_final_pipeline,
-                            dq_final_producer_state,
-                            rank,
-                            tidx,
-                            token_idx,
-                            batch_idx,
-                            trace_buffer,
-                            trace_token_idx,
-                            trace_batch_idx,
-                        )
+                    (
+                        op_state,
+                        p_wait_state,
+                        p_release_state,
+                        dsk_wait_state,
+                        dsk_release_state,
+                        dsq_wait_state,
+                        dsq_release_state,
+                        do_state,
+                        q_state,
+                        dkv_producer_state,
+                        dq_final_producer_state,
+                    ) = self._mma_grad_pair(
+                        True,
+                        is_final,
+                        issue_seq,
+                        raw_slots,
+                        raw_p_dv,
+                        raw_ds_dk,
+                        raw_ds_dq,
+                        dkv_a_layout,
+                        dq_a_layout,
+                        dkv_b_layout,
+                        dq_b_layout,
+                        dkv_tiled_mma,
+                        dq_tiled_mma,
+                        t_dkv[0],
+                        t_dkv[1],
+                        t_dq[0],
+                        t_dq[1],
+                        op_pipeline,
+                        op_state,
+                        p_dv_pipeline,
+                        p_wait_state,
+                        p_release_state,
+                        ds_dk_pipeline,
+                        dsk_wait_state,
+                        dsk_release_state,
+                        ds_dq_pipeline,
+                        dsq_wait_state,
+                        dsq_release_state,
+                        do_empty_pipeline,
+                        do_state,
+                        q_full_pipeline,
+                        q_state,
+                        dkv_pipeline,
+                        dkv_producer_state,
+                        dq_final_pipeline,
+                        dq_final_producer_state,
+                        rank,
+                        tidx,
+                        token_idx,
+                        batch_idx,
+                        trace_buffer,
+                        trace_token_idx,
+                        trace_batch_idx,
+                    )
                     issue_seq += Int32(1)
                     active = has_next
 
