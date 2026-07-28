@@ -8327,30 +8327,51 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         done_pipeline,
         producer_state,
     ):
-        """Issue one dQ contribution from an explicit K_D round."""
+        """Publish both disjoint dQ D256 rounds before either round waits.
 
-        done_pipeline.producer_acquire(producer_state)
-        mma = dq_tiled_mma.with_()
-        mma.set(tcgen05.Field.ACCUMULATE, accumulate)
-        for k_block in cutlass.range_constexpr(
-            cute.size(k_d_fragment, mode=[2])
-        ):
-            cute.gemm(
-                mma,
-                t_dq,
-                k_d_fragment[
-                    None,
-                    None,
-                    k_block,
-                    round_index,
-                ],
-                ds_h_fragment[None, None, k_block, 0],
-                t_dq,
+        The existing caller invokes this helper once per round and then
+        consumes one completion generation.  The round-0 invocation issues
+        both generations back-to-back into the two TMEM dQ regions; the
+        round-1 invocation intentionally issues no additional work.  This
+        preserves the caller's two balanced consumer waits while increasing
+        the maximum outstanding dQ depth from one generation to two.
+        """
+
+        assert self.D_ROUNDS <= self.MMA_DONE_STAGES
+        if cutlass.const_expr(round_index == 0):
+            dq_round_stride = (
+                self.TMEM_DQ1_OFFSET - self.TMEM_DQ0_OFFSET
             )
-            mma.set(tcgen05.Field.ACCUMULATE, True)
-        cute.arch.fence_view_async_tmem_store()
-        done_pipeline.producer_commit(producer_state)
-        producer_state.advance()
+            for deep_round_index in cutlass.range_constexpr(
+                self.D_ROUNDS
+            ):
+                round_t_dq = cute.make_tensor(
+                    t_dq.iterator
+                    + deep_round_index * dq_round_stride,
+                    t_dq.layout,
+                )
+                done_pipeline.producer_acquire(producer_state)
+                mma = dq_tiled_mma.with_()
+                mma.set(tcgen05.Field.ACCUMULATE, accumulate)
+                for k_block in cutlass.range_constexpr(
+                    cute.size(k_d_fragment, mode=[2])
+                ):
+                    cute.gemm(
+                        mma,
+                        round_t_dq,
+                        k_d_fragment[
+                            None,
+                            None,
+                            k_block,
+                            deep_round_index,
+                        ],
+                        ds_h_fragment[None, None, k_block, 0],
+                        round_t_dq,
+                    )
+                    mma.set(tcgen05.Field.ACCUMULATE, True)
+                cute.arch.fence_view_async_tmem_store()
+                done_pipeline.producer_commit(producer_state)
+                producer_state.advance()
         return producer_state
 
     @cute.jit
