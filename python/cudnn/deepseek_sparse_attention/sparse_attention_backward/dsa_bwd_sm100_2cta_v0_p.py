@@ -3575,7 +3575,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             sub_index,
         )
 
-    THREADS_PER_CTA = 672
+    THREADS_PER_CTA = 640
 
     GATHER_WARPS = (0, 1, 2, 3)
     LOAD_COORDINATOR_WARP = 4
@@ -3585,7 +3585,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     MATH_WARPS = (8, 9, 10, 11)
     REDUCE_ROUND0_WARPS = (12, 13, 14, 15)
     REDUCE_ROUND1_WARPS = (16, 17, 18, 19)
-    BQ_WARP = 20
     REDUCE_THREADS_PER_ROUND = 128
 
     LOAD_START_BARRIER_ID = 2
@@ -4700,7 +4699,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     ) -> None:
         """Service one already-admitted BV refill without taking a whole slot."""
 
-        if tidx == Int32(self.BQ_WARP * 32):
+        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
                 trace_buffer,
                 token_idx,
@@ -4717,7 +4716,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             do_empty_pipeline.consumer_wait(do_state, do_ready)
             q_full_pipeline.producer_acquire(q_state)
         cute.arch.sync_warp()
-        if tidx == Int32(self.BQ_WARP * 32):
+        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
                 trace_buffer,
                 token_idx,
@@ -4782,7 +4781,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         with cute.arch.elect_one():
             q_full_pipeline.producer_commit(q_state)
             do_empty_pipeline.consumer_release(do_state)
-        if tidx == Int32(self.BQ_WARP * 32):
+        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
                 trace_buffer,
                 token_idx,
@@ -6733,18 +6732,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             for stage in cutlass.range_constexpr(
                 self.CONTEXT_STAGES
             ):
-                if cutlass.const_expr(
-                    self.DIAGNOSTIC_AUX_STAGE >= 3
-                ):
-                    cute.arch.mbarrier_init(
-                        ctx_reader_done_mbars_ptr + stage,
-                        3,
-                    )
-                else:
-                    cute.arch.mbarrier_init(
-                        ctx_reader_done_mbars_ptr + stage,
-                        2,
-                    )
+                cute.arch.mbarrier_init(
+                    ctx_reader_done_mbars_ptr + stage,
+                    2,
+                )
             self._init_pair_mbar_range(
                 descriptor_consensus_mbars_ptr,
                 self.REDUCER_STAGES,
@@ -7364,8 +7355,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         peer_rank,
                     )
 
-        # W7 owns descriptor production only.  It can wait for IssuedCtx
-        # credit without delaying the independent BQ producer below.
+        # W7 multiplexes descriptor production and the older BV's Q refill.
+        # A pending executable descriptor never blocks on IssuedCtx credit:
+        # while its target slot is live, dO-empty is polled and serviced
+        # first.  Traversal completion publishes sticky done independently
+        # of both metadata-ring and BQ credit.
         if (
             cutlass.const_expr(
                 self.DIAGNOSTIC_AUX_STAGE >= 3
@@ -7376,214 +7370,44 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             committed_count = Int32(0)
             pending_descriptor = cutlass.Boolean(False)
             done_published = cutlass.Boolean(False)
-            while not done_published:
-                if pending_descriptor:
-                    slot = (
-                        committed_count
-                        % Int32(self.CONTEXT_STAGES)
-                    )
-                    epoch = (
-                        committed_count
-                        // Int32(self.CONTEXT_STAGES)
-                    ) & Int32(1)
-                    self._wait_pair(
-                        issued_ctx_mbars_ptr
-                        + self.ISSUED_EMPTY_MBAR_BASE
-                        + slot,
-                        epoch ^ Int32(1),
-                    )
-                    self._publish_issued_context(
-                        committed_count,
-                        traversal_descriptor,
-                        issued_ctx_ring,
-                        issued_ctx_mbars_ptr,
-                        peer_rank,
-                    )
-                    if tidx == Int32(
-                        self.DESCRIPTOR_WARP * 32
-                    ):
-                        self._record_trace(
-                            trace_buffer,
-                            token_idx,
-                            batch_idx,
-                            trace_token_idx,
-                            trace_batch_idx,
-                            rank,
-                            TRACE_ROLE_DESC_BQ,
-                            committed_count,
-                            TRACE_CTX_COMMIT,
-                        )
-                    committed_count += Int32(1)
-                    pending_descriptor = cutlass.Boolean(False)
-                else:
-                    if traversal_seq < traversal_tile_count:
-                        logical_tile = (
-                            traversal_tile_count
-                            - Int32(1)
-                            - traversal_seq
-                        )
-                        descriptor_slot = (
-                            traversal_seq
-                            % Int32(self.CONTEXT_STAGES)
-                        )
-                        descriptor_phase = (
-                            traversal_seq
-                            // Int32(self.CONTEXT_STAGES)
-                        ) & Int32(1)
-                        if tidx == Int32(
-                            self.DESCRIPTOR_WARP * 32
-                        ):
-                            self._record_trace(
-                                trace_buffer,
-                                token_idx,
-                                batch_idx,
-                                trace_token_idx,
-                                trace_batch_idx,
-                                rank,
-                                TRACE_ROLE_DESC_BQ,
-                                traversal_seq,
-                                TRACE_DESC_BEGIN,
-                            )
-                        self._decode_traversal_descriptor(
-                            mTopkIdxs,
-                            traversal_descriptor,
-                            token_idx,
-                            batch_idx,
-                            topk,
-                            logical_tile,
-                        )
-                        if tidx == Int32(
-                            self.DESCRIPTOR_WARP * 32
-                        ):
-                            self._record_trace(
-                                trace_buffer,
-                                token_idx,
-                                batch_idx,
-                                trace_token_idx,
-                                trace_batch_idx,
-                                rank,
-                                TRACE_ROLE_DESC_BQ,
-                                traversal_seq,
-                                TRACE_DESC_END,
-                            )
-                        with cute.arch.elect_one():
-                            self._pair_arrive(
-                                descriptor_consensus_mbars_ptr
-                                + descriptor_slot,
-                                peer_rank,
-                            )
-                            self._wait_pair(
-                                descriptor_consensus_mbars_ptr
-                                + descriptor_slot,
-                                descriptor_phase,
-                            )
-                        cute.arch.sync_warp()
-                        cute.arch.fence_view_async_shared()
-                        pending_descriptor = (
-                            traversal_descriptor[
-                                self.DESCRIPTOR_EXECUTE_WORD
-                            ]
-                            != Int32(0)
-                        )
-                        traversal_seq += Int32(1)
-                    else:
-                        with cute.arch.elect_one():
-                            self._publish_issued_stream_done(
-                                token_idx,
-                                committed_count,
-                                issued_stream_state,
-                                issued_stream_done_ack_mbars_ptr,
-                                peer_rank,
-                            )
-                        self._record_trace(
-                            trace_buffer,
-                            token_idx,
-                            batch_idx,
-                            trace_token_idx,
-                            trace_batch_idx,
-                            rank,
-                            TRACE_ROLE_DESC_BQ,
-                            Int32(TRACE_ISSUE_SLOTS - 1),
-                            TRACE_STREAM_DONE,
-                        )
-                        cute.arch.sync_warp()
-                        done_published = cutlass.Boolean(True)
-
-            with cute.arch.elect_one():
-                self._wait_pair(
-                    issued_stream_done_ack_mbars_ptr
-                    + self.STREAM_DONE_ACK_MBAR,
-                    Int32(0),
-                )
-
-        # W20 independently refills Q after dV releases each BV main slot.
-        # It observes the successor context before choosing the BV ordinal:
-        # non-final iterations include four F ordinals before BV, while the
-        # final iteration does not.  Observing each context also contributes
-        # the third IssuedCtx reader arrival before any potentially blocking
-        # BQ work, preventing the two-stage ring from lapping this role.
-        if (
-            cutlass.const_expr(
-                self.DIAGNOSTIC_AUX_STAGE >= 3
-            )
-            and warp_idx == self.BQ_WARP
-        ):
             refill_count = Int32(0)
             whole_ordinal = Int32(self.K_CHUNKS)
-            issue_seq = Int32(0)
-            active = self._resolve_issued_context_or_done(
-                issue_seq,
-                issued_ctx_mbars_ptr,
-                issued_stream_state,
-                issued_stream_done_ack_mbars_ptr,
-            )
-            if active:
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(
-                        ctx_reader_done_mbars_ptr
-                        + (
-                            issue_seq
-                            % Int32(self.CONTEXT_STAGES)
-                        )
-                    )
-
-            while active:
-                has_next = self._resolve_issued_context_or_done(
-                    issue_seq + Int32(1),
-                    issued_ctx_mbars_ptr,
-                    issued_stream_state,
-                    issued_stream_done_ack_mbars_ptr,
+            engine_active = cutlass.Boolean(True)
+            while engine_active:
+                progressed = cutlass.Boolean(False)
+                refill_issue_seq = (
+                    refill_count // Int32(self.D_ROUNDS)
                 )
-                if has_next:
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(
-                            ctx_reader_done_mbars_ptr
-                            + (
-                                (issue_seq + Int32(1))
-                                % Int32(self.CONTEXT_STAGES)
-                            )
-                        )
-                    whole_ordinal += Int32(self.K_CHUNKS)
+                refill_round = (
+                    refill_count % Int32(self.D_ROUNDS)
+                )
+                refill_admitted = cutlass.Boolean(False)
+                refill_has_next = cutlass.Boolean(False)
+                if refill_issue_seq < committed_count:
+                    if (
+                        refill_issue_seq + Int32(1)
+                        < committed_count
+                    ):
+                        refill_admitted = cutlass.Boolean(True)
+                        refill_has_next = cutlass.Boolean(True)
+                    else:
+                        if done_published:
+                            refill_admitted = cutlass.Boolean(True)
 
-                for refill_round in cutlass.range_constexpr(
-                    self.D_ROUNDS
-                ):
+                if refill_admitted:
                     do_phase = (
-                        refill_count
-                        // Int32(self.ROUND_STAGES)
+                        refill_count // Int32(self.ROUND_STAGES)
                     ) & Int32(1)
                     do_state = pipeline.PipelineState(
                         self.ROUND_STAGES,
                         refill_count,
-                        refill_count
-                        % Int32(self.ROUND_STAGES),
+                        refill_count % Int32(self.ROUND_STAGES),
                         do_phase,
                     )
                     q_state = pipeline.PipelineState(
                         self.ROUND_STAGES,
                         refill_count,
-                        refill_count
-                        % Int32(self.ROUND_STAGES),
+                        refill_count % Int32(self.ROUND_STAGES),
                         Int32(1) ^ do_phase,
                     )
                     do_ready = (
@@ -7591,55 +7415,241 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             do_state
                         )
                     )
-                    self._refill_bq_task(
-                        refill_round,
-                        whole_ordinal
-                        % Int32(self.OP_STAGES),
-                        raw_slots,
-                        dkv_a_layout,
-                        tma_atom_qt,
-                        rank_g_qt,
-                        block_coord_vmnk,
-                        a_cta_layout,
-                        grad_q_source_mbars_ptr,
-                        do_empty_pipeline,
-                        do_state,
-                        do_ready,
-                        q_full_pipeline,
-                        q_state,
-                        grad_a_stage_bytes,
-                        issue_seq,
-                        rank,
-                        tidx,
-                        token_idx,
-                        batch_idx,
-                        trace_buffer,
-                        trace_token_idx,
-                        trace_batch_idx,
-                    )
-                    whole_ordinal += Int32(1)
-                    refill_count += Int32(1)
+                    if do_ready:
+                        if refill_round == Int32(0):
+                            if refill_has_next:
+                                whole_ordinal += Int32(
+                                    self.K_CHUNKS
+                                )
+                            self._refill_bq_task(
+                                0,
+                                whole_ordinal
+                                % Int32(self.OP_STAGES),
+                                raw_slots,
+                                dkv_a_layout,
+                                tma_atom_qt,
+                                rank_g_qt,
+                                block_coord_vmnk,
+                                a_cta_layout,
+                                grad_q_source_mbars_ptr,
+                                do_empty_pipeline,
+                                do_state,
+                                do_ready,
+                                q_full_pipeline,
+                                q_state,
+                                grad_a_stage_bytes,
+                                refill_issue_seq,
+                                rank,
+                                tidx,
+                                token_idx,
+                                batch_idx,
+                                trace_buffer,
+                                trace_token_idx,
+                                trace_batch_idx,
+                            )
+                        else:
+                            self._refill_bq_task(
+                                1,
+                                whole_ordinal
+                                % Int32(self.OP_STAGES),
+                                raw_slots,
+                                dkv_a_layout,
+                                tma_atom_qt,
+                                rank_g_qt,
+                                block_coord_vmnk,
+                                a_cta_layout,
+                                grad_q_source_mbars_ptr,
+                                do_empty_pipeline,
+                                do_state,
+                                do_ready,
+                                q_full_pipeline,
+                                q_state,
+                                grad_a_stage_bytes,
+                                refill_issue_seq,
+                                rank,
+                                tidx,
+                                token_idx,
+                                batch_idx,
+                                trace_buffer,
+                                trace_token_idx,
+                                trace_batch_idx,
+                            )
+                        whole_ordinal += Int32(1)
+                        refill_count += Int32(1)
+                        progressed = cutlass.Boolean(True)
 
-                issue_seq += Int32(1)
-                active = has_next
+                if not progressed:
+                    if pending_descriptor:
+                        slot = (
+                            committed_count
+                            % Int32(self.CONTEXT_STAGES)
+                        )
+                        epoch = (
+                            committed_count
+                            // Int32(self.CONTEXT_STAGES)
+                        ) & Int32(1)
+                        empty_ready = _mbarrier_try_wait(
+                            issued_ctx_mbars_ptr
+                            + self.ISSUED_EMPTY_MBAR_BASE
+                            + slot,
+                            epoch ^ Int32(1),
+                        )
+                        if empty_ready:
+                            self._publish_issued_context(
+                                committed_count,
+                                traversal_descriptor,
+                                issued_ctx_ring,
+                                issued_ctx_mbars_ptr,
+                                peer_rank,
+                            )
+                            if tidx == Int32(
+                                self.DESCRIPTOR_WARP * 32
+                            ):
+                                self._record_trace(
+                                    trace_buffer,
+                                    token_idx,
+                                    batch_idx,
+                                    trace_token_idx,
+                                    trace_batch_idx,
+                                    rank,
+                                    TRACE_ROLE_DESC_BQ,
+                                    committed_count,
+                                    TRACE_CTX_COMMIT,
+                                )
+                            committed_count += Int32(1)
+                            pending_descriptor = (
+                                cutlass.Boolean(False)
+                            )
+                            progressed = cutlass.Boolean(True)
+                    else:
+                        if traversal_seq < traversal_tile_count:
+                            logical_tile = (
+                                traversal_tile_count
+                                - Int32(1)
+                                - traversal_seq
+                            )
+                            descriptor_slot = (
+                                traversal_seq
+                                % Int32(self.CONTEXT_STAGES)
+                            )
+                            descriptor_phase = (
+                                traversal_seq
+                                // Int32(self.CONTEXT_STAGES)
+                            ) & Int32(1)
+                            if tidx == Int32(
+                                self.DESCRIPTOR_WARP * 32
+                            ):
+                                self._record_trace(
+                                    trace_buffer,
+                                    token_idx,
+                                    batch_idx,
+                                    trace_token_idx,
+                                    trace_batch_idx,
+                                    rank,
+                                    TRACE_ROLE_DESC_BQ,
+                                    traversal_seq,
+                                    TRACE_DESC_BEGIN,
+                                )
+                            self._decode_traversal_descriptor(
+                                mTopkIdxs,
+                                traversal_descriptor,
+                                token_idx,
+                                batch_idx,
+                                topk,
+                                logical_tile,
+                            )
+                            if tidx == Int32(
+                                self.DESCRIPTOR_WARP * 32
+                            ):
+                                self._record_trace(
+                                    trace_buffer,
+                                    token_idx,
+                                    batch_idx,
+                                    trace_token_idx,
+                                    trace_batch_idx,
+                                    rank,
+                                    TRACE_ROLE_DESC_BQ,
+                                    traversal_seq,
+                                    TRACE_DESC_END,
+                                )
+                            with cute.arch.elect_one():
+                                self._pair_arrive(
+                                    descriptor_consensus_mbars_ptr
+                                    + descriptor_slot,
+                                    peer_rank,
+                                )
+                                self._wait_pair(
+                                    descriptor_consensus_mbars_ptr
+                                    + descriptor_slot,
+                                    descriptor_phase,
+                                )
+                            cute.arch.sync_warp()
+                            cute.arch.fence_view_async_shared()
+                            pending_descriptor = (
+                                traversal_descriptor[
+                                    self.DESCRIPTOR_EXECUTE_WORD
+                                ]
+                                != Int32(0)
+                            )
+                            traversal_seq += Int32(1)
+                            progressed = cutlass.Boolean(True)
+                        else:
+                            if not done_published:
+                                with cute.arch.elect_one():
+                                    self._publish_issued_stream_done(
+                                        token_idx,
+                                        committed_count,
+                                        issued_stream_state,
+                                    issued_stream_done_ack_mbars_ptr,
+                                    peer_rank,
+                                )
+                                self._record_trace(
+                                    trace_buffer,
+                                    token_idx,
+                                    batch_idx,
+                                    trace_token_idx,
+                                    trace_batch_idx,
+                                    rank,
+                                    TRACE_ROLE_DESC_BQ,
+                                    Int32(TRACE_ISSUE_SLOTS - 1),
+                                    TRACE_STREAM_DONE,
+                                )
+                                cute.arch.sync_warp()
+                                done_published = cutlass.Boolean(True)
+                                progressed = cutlass.Boolean(True)
 
-            if refill_count > Int32(0):
+                engine_active = cutlass.Boolean(True)
+                if done_published:
+                    if (
+                        refill_count
+                        == Int32(self.D_ROUNDS) * committed_count
+                    ):
+                        engine_active = cutlass.Boolean(False)
+
+            if committed_count > Int32(0):
                 with cute.arch.elect_one():
+                    q_count = Int32(self.D_ROUNDS) * committed_count
                     q_tail_state = pipeline.PipelineState(
                         self.ROUND_STAGES,
-                        refill_count,
-                        refill_count
-                        % Int32(self.ROUND_STAGES),
+                        q_count,
+                        q_count % Int32(self.ROUND_STAGES),
                         Int32(1)
                         ^ (
                             (
-                                refill_count
+                                q_count
                                 // Int32(self.ROUND_STAGES)
                             )
                             & Int32(1)
                         ),
                     )
                     q_full_pipeline.producer_tail(q_tail_state)
+
+            with cute.arch.elect_one():
+                self._wait_pair(
+                    issued_stream_done_ack_mbars_ptr
+                    + self.STREAM_DONE_ACK_MBAR,
+                    Int32(0),
+                )
 
         # The leader CTA's MMA warp is the only CG2 issue role.  Each F
         # ordinal performs real QK+dOV before releasing the whole slot.  Each
