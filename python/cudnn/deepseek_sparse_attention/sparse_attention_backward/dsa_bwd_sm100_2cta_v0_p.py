@@ -7370,6 +7370,43 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
 
                 active = cutlass.Boolean(True)
                 while active:
+                    # Retire the current tile's gradient operands before
+                    # admitting the successor score group.  This preserves
+                    # the single FIFO order while allowing GRAD(current) to
+                    # cover descriptor/F(next) latency instead of holding
+                    # both BV slots behind four successor F slots.
+                    for round_index in cutlass.range_constexpr(
+                        self.D_ROUNDS
+                    ):
+                        producer_state = self._load_bv_task(
+                            raw_slots,
+                            dkv_a_layout,
+                            dq_a_layout,
+                            tma_atom_dot,
+                            rank_g_dot,
+                            block_coord_vmnk,
+                            a_cta_layout,
+                            mKV,
+                            load_ctx_ring,
+                            batch_idx,
+                            issue_seq,
+                            round_index,
+                            rank,
+                            tidx,
+                            warp_idx,
+                            kv_copy_atom,
+                            kv_thread_copy,
+                            grad_do_source_mbars_ptr,
+                            grad_k_source_mbars_ptr,
+                            op_pipeline,
+                            producer_state,
+                            grad_a_stage_bytes,
+                            token_idx,
+                            trace_buffer,
+                            trace_token_idx,
+                            trace_batch_idx,
+                        )
+
                     next_seq = issue_seq + Int32(1)
                     has_next = self._resolve_issued_context_or_done(
                         next_seq,
@@ -7385,70 +7422,35 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             ctx_reader_done_mbars_ptr,
                             tidx,
                         )
-                    for local_task in cutlass.range_constexpr(
-                        self.K_CHUNKS + self.D_ROUNDS
+                    for chunk in cutlass.range_constexpr(
+                        self.K_CHUNKS
                     ):
-                        if cutlass.const_expr(
-                            local_task < self.K_CHUNKS
-                        ):
-                            if has_next:
-                                producer_state = self._load_f_task(
-                                    raw_slots,
-                                    score_a_layout,
-                                    score_b_layout,
-                                    tma_atom_q,
-                                    tma_atom_do,
-                                    rank_g_q,
-                                    rank_g_do,
-                                    block_coord_vmnk,
-                                    a_cta_layout,
-                                    mKV,
-                                    load_ctx_ring,
-                                    batch_idx,
-                                    next_seq,
-                                    local_task,
-                                    rank,
-                                    tidx,
-                                    warp_idx,
-                                    kv_copy_atom,
-                                    kv_thread_copy,
-                                    score_q_source_mbars_ptr,
-                                    score_do_source_mbars_ptr,
-                                    op_pipeline,
-                                    producer_state,
-                                    score_a_stage_bytes,
-                                    token_idx,
-                                    trace_buffer,
-                                    trace_token_idx,
-                                    trace_batch_idx,
-                                )
-                        else:
-                            round_index = (
-                                local_task - self.K_CHUNKS
-                            )
-                            producer_state = self._load_bv_task(
+                        if has_next:
+                            producer_state = self._load_f_task(
                                 raw_slots,
-                                dkv_a_layout,
-                                dq_a_layout,
-                                tma_atom_dot,
-                                rank_g_dot,
+                                score_a_layout,
+                                score_b_layout,
+                                tma_atom_q,
+                                tma_atom_do,
+                                rank_g_q,
+                                rank_g_do,
                                 block_coord_vmnk,
                                 a_cta_layout,
                                 mKV,
                                 load_ctx_ring,
                                 batch_idx,
-                                issue_seq,
-                                round_index,
+                                next_seq,
+                                chunk,
                                 rank,
                                 tidx,
                                 warp_idx,
                                 kv_copy_atom,
                                 kv_thread_copy,
-                                grad_do_source_mbars_ptr,
-                                grad_k_source_mbars_ptr,
+                                score_q_source_mbars_ptr,
+                                score_do_source_mbars_ptr,
                                 op_pipeline,
                                 producer_state,
-                                grad_a_stage_bytes,
+                                score_a_stage_bytes,
                                 token_idx,
                                 trace_buffer,
                                 trace_token_idx,
@@ -7547,10 +7549,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         )
                     )
                     if do_ready:
-                        if refill_has_next:
-                            whole_ordinal += Int32(
-                                self.K_CHUNKS
-                            )
                         self._refill_bq_pair(
                             whole_ordinal
                             % Int32(self.OP_STAGES),
@@ -7578,6 +7576,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         whole_ordinal += Int32(
                             self.D_ROUNDS
                         )
+                        if refill_has_next:
+                            whole_ordinal += Int32(
+                                self.K_CHUNKS
+                            )
                         refill_count += Int32(
                             self.D_ROUNDS
                         )
@@ -7844,32 +7846,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                     issued_stream_state,
                     issued_stream_done_ack_mbars_ptr,
                 )
-                if has_next:
-                    op_state, s_state, dp_state = (
-                        self._mma_sdp_tile(
-                            raw_slots,
-                            score_a_layout,
-                            score_b_layout,
-                            score_tiled_mma,
-                            dp_tiled_mma,
-                            t_score,
-                            t_dp,
-                            op_pipeline,
-                            op_state,
-                            s_pipeline,
-                            s_state,
-                            dp_pipeline,
-                            dp_state,
-                            Int32(1),
-                            rank,
-                            tidx,
-                            token_idx,
-                            batch_idx,
-                            trace_buffer,
-                            trace_token_idx,
-                            trace_batch_idx,
-                        )
-                    )
                 first_is_final = not has_next
                 (
                     op_state,
@@ -7928,6 +7904,32 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                     trace_token_idx,
                     trace_batch_idx,
                 )
+                if has_next:
+                    op_state, s_state, dp_state = (
+                        self._mma_sdp_tile(
+                            raw_slots,
+                            score_a_layout,
+                            score_b_layout,
+                            score_tiled_mma,
+                            dp_tiled_mma,
+                            t_score,
+                            t_dp,
+                            op_pipeline,
+                            op_state,
+                            s_pipeline,
+                            s_state,
+                            dp_pipeline,
+                            dp_state,
+                            Int32(1),
+                            rank,
+                            tidx,
+                            token_idx,
+                            batch_idx,
+                            trace_buffer,
+                            trace_token_idx,
+                            trace_batch_idx,
+                        )
+                    )
 
                 issue_seq = Int32(1)
                 active = has_next
@@ -7938,32 +7940,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         issued_stream_state,
                         issued_stream_done_ack_mbars_ptr,
                     )
-                    if has_next:
-                        op_state, s_state, dp_state = (
-                            self._mma_sdp_tile(
-                                raw_slots,
-                                score_a_layout,
-                                score_b_layout,
-                                score_tiled_mma,
-                                dp_tiled_mma,
-                                t_score,
-                                t_dp,
-                                op_pipeline,
-                                op_state,
-                                s_pipeline,
-                                s_state,
-                                dp_pipeline,
-                                dp_state,
-                                issue_seq + Int32(1),
-                                rank,
-                                tidx,
-                                token_idx,
-                                batch_idx,
-                                trace_buffer,
-                                trace_token_idx,
-                                trace_batch_idx,
-                            )
-                        )
                     is_final = not has_next
                     (
                         op_state,
@@ -8022,6 +7998,32 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         trace_token_idx,
                         trace_batch_idx,
                     )
+                    if has_next:
+                        op_state, s_state, dp_state = (
+                            self._mma_sdp_tile(
+                                raw_slots,
+                                score_a_layout,
+                                score_b_layout,
+                                score_tiled_mma,
+                                dp_tiled_mma,
+                                t_score,
+                                t_dp,
+                                op_pipeline,
+                                op_state,
+                                s_pipeline,
+                                s_state,
+                                dp_pipeline,
+                                dp_state,
+                                issue_seq + Int32(1),
+                                rank,
+                                tidx,
+                                token_idx,
+                                batch_idx,
+                                trace_buffer,
+                                trace_token_idx,
+                                trace_batch_idx,
+                            )
+                        )
                     issue_seq += Int32(1)
                     active = has_next
 
