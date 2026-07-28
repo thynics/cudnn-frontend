@@ -12039,7 +12039,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             if warp_idx == Int32(self.MATH_WARP_BEGIN):
                 load_stats_token = cute.experimental.iket.range_start(
                     "LOAD_STATS",
-                    rank,
+                    Int32(0),
                 )
                 if tile_count > Int32(0):
                     cute.copy(
@@ -12057,7 +12057,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.arch.fence_view_async_shared()
                 cute.experimental.iket.range_end(
                     load_stats_token,
-                    rank,
+                    Int32(0),
                 )
             self.math_barrier.arrive_and_wait()
 
@@ -12631,7 +12631,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             if tile_count > Int32(0):
                 load_qdo_token = cute.experimental.iket.range_start(
                     "LOAD_QDO",
-                    rank,
+                    Int32(0),
                 )
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
@@ -12656,7 +12656,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
                 cute.experimental.iket.range_end(
                     load_qdo_token,
-                    rank,
+                    Int32(0),
                 )
                 cute.arch.mbarrier_wait(
                     stationary_tma_mbars,
