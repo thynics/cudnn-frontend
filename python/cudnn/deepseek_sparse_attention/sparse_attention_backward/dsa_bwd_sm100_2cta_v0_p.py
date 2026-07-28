@@ -2,8 +2,7 @@
 
 This module materializes the v0 execution contract for BF16 GQA128/D512:
 
-* one static two-stage, 48-KiB-per-stage operand FIFO;
-* one resident 64-KiB Q image shared by every sparse tile;
+* one static three-stage, 48-KiB-per-stage operand FIFO;
 * persistent lifecycle roles and all planned full/empty pipelines;
 * two-stage P/dS storage retained through both D256 gradient rounds; and
 * true CG2 completion-driven operand and TMEM recycling.
@@ -143,63 +142,6 @@ def _cpasync_bulk_s2cluster(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
-
-
-@dsl_user_op
-def _mbarrier_wait_acquire_cluster_v0_p(
-    barrier: cute.Pointer,
-    phase: Int32,
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    """Wait for a peer DSM transaction with cluster-scope acquire."""
-
-    barrier_i32 = barrier.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [barrier_i32, phase.ir_value(loc=loc, ip=ip)],
-        (
-            "{\n\t"
-            ".reg .pred p;\n\t"
-            "V0_P_CLUSTER_WAIT_LOOP:\n\t"
-            "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
-            "p, [$0], $1, 10000000;\n\t"
-            "@!p bra V0_P_CLUSTER_WAIT_LOOP;\n\t"
-            "}"
-        ),
-        "r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@cute.jit
-def _load_shared_u32_at_v0_p(
-    tensor: cute.Tensor,
-    coordinate,
-) -> cutlass.Uint32:
-    pointer = cute.recast_ptr(
-        tensor.iterator + tensor.layout(coordinate),
-        dtype=cutlass.Uint32,
-    )
-    packed = cute.make_tensor(pointer, cute.make_layout((1,)))
-    return packed[0]
-
-
-@cute.jit
-def _store_shared_u32_at_v0_p(
-    tensor: cute.Tensor,
-    coordinate,
-    value: cutlass.Uint32,
-) -> None:
-    pointer = cute.recast_ptr(
-        tensor.iterator + tensor.layout(coordinate),
-        dtype=cutlass.Uint32,
-    )
-    packed = cute.make_tensor(pointer, cute.make_layout((1,)))
-    packed[0] = value
 
 
 class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
@@ -3598,7 +3540,7 @@ def _run_math_role(
 class FlashAttentionDSABackwardSm100TwoCTAV0(
     FlashAttentionDSABackwardSm100TwoCTA
 ):
-    """Resident-Q two-CTA lifecycle for GQA128/D512."""
+    """Three-stage two-CTA lifecycle for GQA128/D512."""
 
     # Bind the math and exchange roles as class methods. Dynamic CuTe loops
     # may capture the kernel's implicit constexpr ``self`` but cannot flatten
@@ -3653,7 +3595,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     REDUCE_ROUND1_METADATA_BARRIER_ID = 7
     LOAD_PARTICIPANTS = 5 * 32
 
-    OP_STAGES = 2
+    OP_STAGES = 3
     PD_STAGES = 2
     CONTEXT_STAGES = 2
     REDUCER_STAGES = 2
@@ -3740,9 +3682,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     STATS_WORDS = (
         SOFTMAX_SUM_ODO_STATS_WORD + SOFTMAX_STATS_HEADS
     )
-    # Two 48-KiB operand stages plus a resident 64-KiB Q image keep the
-    # complete aligned control/data plane below the 227-KiB launch limit.
-    EXPECTED_SHARED_STORAGE_BYTES = 225_280
+    # The 512-byte loader ring pushes the 1024-byte-aligned struct from
+    # 203 KiB to the next whole-KiB boundary.
+    EXPECTED_SHARED_STORAGE_BYTES = 208_896
 
     # DEVELOPMENT-ONLY diagnostics. These are deliberately not
     # exposed by the public interface and must be removed before integration.
@@ -3798,9 +3740,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
 
         assert self.OP_MAIN_ELEMENTS_PER_STAGE == 16_384
         assert self.OP_SIDE_ELEMENTS_PER_STAGE == 8_192
-        assert self.OP_PAYLOAD_BYTES == 96 * 1024
+        assert self.OP_PAYLOAD_BYTES == 144 * 1024
         assert self.PD_PAYLOAD_BYTES == 56 * 1024
-        assert self.MAIN_PAYLOAD_BYTES == 152 * 1024
+        assert self.MAIN_PAYLOAD_BYTES == 200 * 1024
         assert self.ISSUED_CTX_RING_BYTES == 544
         assert self.REDUCER_CTX_RING_BYTES == 576
         assert self.FIXED_METADATA_BYTES == 1_648
@@ -4362,250 +4304,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         return has_tile
 
     @cute.jit
-    def _score_chunk_rows_v0_p(
-        self,
-        tensor: cute.Tensor,
-        chunk: cutlass.Constexpr[int],
-    ) -> cute.Tensor:
-        return cute.composition(
-            tensor[None, None, None, chunk],
-            cute.make_layout(
-                (self.H_TILE_CTA, self.K_CHUNK),
-            ),
-        )
-
-    @cute.jit
-    def _grad_a_rows_v0_p(
-        self,
-        tensor: cute.Tensor,
-    ) -> cute.Tensor:
-        return cute.composition(
-            tensor,
-            cute.make_layout(
-                (self.D_TILE_CTA, self.H_TILE_CLUSTER),
-            ),
-        )
-
-    @cute.jit
-    def _load_resident_q_once(
-        self,
-        resident_q: cute.Tensor,
-        tma_atom_q: cute.CopyAtom,
-        rank_g_q: cute.Tensor,
-        block_coord_vmnk,
-        a_cta_layout: cute.Layout,
-        completion_mbar: cute.Pointer,
-        score_a_stage_bytes: cutlass.Constexpr[int],
-        warp_idx: Int32,
-    ) -> None:
-        """Load the CTA-owned H64 x D512 Q image exactly once."""
-
-        if warp_idx == self.LOAD_COORDINATOR_WARP:
-            t_q_smem, t_q_gmem = cpasync.tma_partition(
-                tma_atom_q,
-                block_coord_vmnk[2],
-                a_cta_layout,
-                cute.group_modes(resident_q, 0, 3),
-                cute.group_modes(rank_g_q, 0, 3),
-            )
-            t_q_gmem = t_q_gmem[None, 0, None]
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    completion_mbar,
-                    score_a_stage_bytes * self.K_CHUNKS,
-                )
-            for chunk in cutlass.range_constexpr(self.K_CHUNKS):
-                cute.copy(
-                    tma_atom_q,
-                    t_q_gmem[None, chunk],
-                    t_q_smem[None, chunk],
-                    tma_bar_ptr=completion_mbar,
-                )
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_wait(
-                    completion_mbar,
-                    Int32(0),
-                )
-
-        self.load_done_barrier.arrive_and_wait()
-        cute.arch.fence_view_async_shared()
-
-    @cute.jit
-    def _issue_resident_q_peer_bulk(
-        self,
-        source_rows: cute.Tensor,
-        destination_rows: cute.Tensor,
-        destination_full: cute.Pointer,
-        rank: Int32,
-        peer_rank: Int32,
-    ) -> None:
-        """Send the two peer-owned H64 x D64 Q quadrants."""
-
-        cute.arch.mbarrier_arrive_and_expect_tx(
-            destination_full,
-            16 * 1024,
-            peer_cta_rank_in_cluster=peer_rank,
-        )
-        for block in cutlass.range_constexpr(2):
-            source_coordinate = (
-                Int32(0),
-                Int32(block * 64),
-            )
-            destination_coordinate = (
-                Int32(block * 64),
-                rank * Int32(self.H_TILE_CTA),
-            )
-            _cpasync_bulk_s2cluster(
-                source_rows.iterator
-                + source_rows.layout(source_coordinate),
-                destination_rows.iterator
-                + destination_rows.layout(
-                    destination_coordinate
-                ),
-                destination_full,
-                8 * 1024,
-                peer_rank,
-            )
-
-    @cute.jit
-    def _route_resident_q_round(
-        self,
-        round_index: cutlass.Constexpr[int],
-        issue_seq: Int32,
-        resident_q: cute.Tensor,
-        destination_q: cute.Tensor,
-        destination_full: cute.Pointer,
-        rank: Int32,
-        peer_rank: Int32,
-    ) -> None:
-        """Materialize one D-owned Q round from immutable H-owned Q."""
-
-        # The preceding dO-empty wait is produced by the sole CG2 consumer,
-        # so both rank-local BV destinations are already dead before either
-        # W7 can enter this route.  Keep the CTA schedulers independent here:
-        # an extra pair rendezvous can form a cycle with descriptor credit.
-        source_rows_0 = self._score_chunk_rows_v0_p(
-            resident_q,
-            0,
-        )
-        source_rows_1 = self._score_chunk_rows_v0_p(
-            resident_q,
-            1,
-        )
-        source_rows_2 = self._score_chunk_rows_v0_p(
-            resident_q,
-            2,
-        )
-        source_rows_3 = self._score_chunk_rows_v0_p(
-            resident_q,
-            3,
-        )
-        destination_rows = self._grad_a_rows_v0_p(
-            destination_q
-        )
-        lane = cute.arch.lane_idx()
-        local_h_lane = lane // Int32(16)
-        local_d = (lane % Int32(16)) * Int32(8)
-        for vector_iteration in cutlass.range(32, unroll=1):
-            local_h = (
-                local_h_lane + vector_iteration * Int32(2)
-            )
-            global_h = (
-                rank * Int32(self.H_TILE_CTA) + local_h
-            )
-            packed = cute.make_rmem_tensor(
-                (4,),
-                cutlass.Uint32,
-            )
-            for word in cutlass.range_constexpr(4):
-                source_coordinate = (
-                    local_h,
-                    local_d + Int32(2 * word),
-                )
-                if cutlass.const_expr(round_index == 0):
-                    if rank == Int32(0):
-                        packed[word] = _load_shared_u32_at_v0_p(
-                            source_rows_0,
-                            source_coordinate,
-                        )
-                    else:
-                        packed[word] = _load_shared_u32_at_v0_p(
-                            source_rows_1,
-                            source_coordinate,
-                        )
-                else:
-                    if rank == Int32(0):
-                        packed[word] = _load_shared_u32_at_v0_p(
-                            source_rows_2,
-                            source_coordinate,
-                        )
-                    else:
-                        packed[word] = _load_shared_u32_at_v0_p(
-                            source_rows_3,
-                            source_coordinate,
-                        )
-            for word in cutlass.range_constexpr(4):
-                _store_shared_u32_at_v0_p(
-                    destination_rows,
-                    (
-                        local_d + Int32(2 * word),
-                        global_h,
-                    ),
-                    packed[word],
-                )
-
-        if lane == Int32(0):
-            if cutlass.const_expr(round_index == 0):
-                if peer_rank == Int32(0):
-                    self._issue_resident_q_peer_bulk(
-                        source_rows_0,
-                        destination_rows,
-                        destination_full,
-                        rank,
-                        peer_rank,
-                    )
-                else:
-                    self._issue_resident_q_peer_bulk(
-                        source_rows_1,
-                        destination_rows,
-                        destination_full,
-                        rank,
-                        peer_rank,
-                    )
-            else:
-                if peer_rank == Int32(0):
-                    self._issue_resident_q_peer_bulk(
-                        source_rows_2,
-                        destination_rows,
-                        destination_full,
-                        rank,
-                        peer_rank,
-                    )
-                else:
-                    self._issue_resident_q_peer_bulk(
-                        source_rows_3,
-                        destination_rows,
-                        destination_full,
-                        rank,
-                        peer_rank,
-                    )
-
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            _mbarrier_wait_acquire_cluster_v0_p(
-                destination_full,
-                issue_seq & Int32(1),
-            )
-        cute.arch.sync_warp()
-        cute.arch.fence_view_async_shared()
-
-    @cute.jit
     def _load_f_task(
         self,
         raw_slots: cute.Tensor,
         score_a_layout: cute.ComposedLayout,
         score_b_layout: cute.ComposedLayout,
+        tma_atom_q: cute.CopyAtom,
         tma_atom_do: cute.CopyAtom,
+        rank_g_q: cute.Tensor,
         rank_g_do: cute.Tensor,
         block_coord_vmnk,
         a_cta_layout: cute.Layout,
@@ -4619,6 +4325,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         warp_idx: Int32,
         copy_atom: cute.CopyAtom,
         thread_copy: cute.TiledCopy,
+        score_q_source_mbars: cute.Pointer,
         score_do_source_mbars: cute.Pointer,
         op_pipeline,
         producer_state: pipeline.PipelineState,
@@ -4661,12 +4368,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         if warp_idx == self.LOAD_COORDINATOR_WARP:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_init(
+                    score_q_source_mbars + slot,
+                    1,
+                )
+                cute.arch.mbarrier_init(
                     score_do_source_mbars + slot,
                     1,
                 )
                 op_pipeline.producer_acquire(producer_state)
 
         self.load_start_barrier.arrive_and_wait()
+        f_q = self._make_operand_slot_view(
+            raw_slots,
+            slot,
+            self.OP_MAIN_OFFSET_BYTES,
+            score_a_layout,
+        )
         f_do = self._make_operand_slot_view(
             raw_slots,
             slot,
@@ -4681,6 +4398,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         )
 
         if warp_idx == self.LOAD_COORDINATOR_WARP:
+            t_q_smem, t_q_gmem = cpasync.tma_partition(
+                tma_atom_q,
+                block_coord_vmnk[2],
+                a_cta_layout,
+                cute.group_modes(f_q, 0, 3),
+                cute.group_modes(rank_g_q, 0, 3),
+            )
             t_do_smem, t_do_gmem = cpasync.tma_partition(
                 tma_atom_do,
                 block_coord_vmnk[2],
@@ -4688,12 +4412,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 cute.group_modes(f_do, 0, 3),
                 cute.group_modes(rank_g_do, 0, 3),
             )
+            t_q_gmem = t_q_gmem[None, 0, None]
             t_do_gmem = t_do_gmem[None, 0, None]
             with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    score_q_source_mbars + slot,
+                    score_a_stage_bytes,
+                )
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     score_do_source_mbars + slot,
                     score_a_stage_bytes,
                 )
+            cute.copy(
+                tma_atom_q,
+                t_q_gmem[None, chunk],
+                t_q_smem[None],
+                tma_bar_ptr=score_q_source_mbars + slot,
+            )
             cute.copy(
                 tma_atom_do,
                 t_do_gmem[None, chunk],
@@ -4720,6 +4455,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
 
         if warp_idx == self.LOAD_COORDINATOR_WARP:
             with cute.arch.elect_one():
+                cute.arch.mbarrier_wait(
+                    score_q_source_mbars + slot,
+                    Int32(0),
+                )
                 cute.arch.mbarrier_wait(
                     score_do_source_mbars + slot,
                     Int32(0),
@@ -4932,10 +4671,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         return producer_state
 
     @cute.jit
-    def _refill_bq_pair(
+    def _refill_bq_task(
         self,
-        first_bv_slot: Int32,
-        refill_count: Int32,
+        round_index: cutlass.Constexpr[int],
+        bv_slot: Int32,
         raw_slots: cute.Tensor,
         dkv_a_layout: cute.ComposedLayout,
         tma_atom_qt: cute.CopyAtom,
@@ -4944,8 +4683,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         a_cta_layout: cute.Layout,
         grad_q_source_mbars: cute.Pointer,
         do_empty_pipeline,
-        first_do_ready: cutlass.Boolean,
+        do_state: pipeline.PipelineState,
+        do_ready: cutlass.Boolean,
         q_full_pipeline,
+        q_state: pipeline.PipelineState,
         grad_a_stage_bytes: cutlass.Constexpr[int],
         issue_seq: Int32,
         rank: Int32,
@@ -4956,42 +4697,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         trace_token_idx: Int32,
         trace_batch_idx: Int32,
     ) -> None:
-        """Launch both Q refills before completing either TMA transaction."""
-
-        first_do_phase = (
-            refill_count // Int32(self.ROUND_STAGES)
-        ) & Int32(1)
-        first_do_state = pipeline.PipelineState(
-            self.ROUND_STAGES,
-            refill_count,
-            refill_count % Int32(self.ROUND_STAGES),
-            first_do_phase,
-        )
-        first_q_state = pipeline.PipelineState(
-            self.ROUND_STAGES,
-            refill_count,
-            refill_count % Int32(self.ROUND_STAGES),
-            Int32(1) ^ first_do_phase,
-        )
-        second_refill_count = refill_count + Int32(1)
-        second_do_phase = (
-            second_refill_count // Int32(self.ROUND_STAGES)
-        ) & Int32(1)
-        second_do_state = pipeline.PipelineState(
-            self.ROUND_STAGES,
-            second_refill_count,
-            second_refill_count % Int32(self.ROUND_STAGES),
-            second_do_phase,
-        )
-        second_q_state = pipeline.PipelineState(
-            self.ROUND_STAGES,
-            second_refill_count,
-            second_refill_count % Int32(self.ROUND_STAGES),
-            Int32(1) ^ second_do_phase,
-        )
-        second_bv_slot = (
-            first_bv_slot + Int32(1)
-        ) % Int32(self.OP_STAGES)
+        """Service one already-admitted BV refill without taking a whole slot."""
 
         if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
@@ -5004,14 +4710,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 TRACE_ROLE_DESC_BQ,
                 issue_seq,
                 TRACE_BQ_WAIT_BEGIN,
-                0,
+                round_index,
             )
         with cute.arch.elect_one():
-            do_empty_pipeline.consumer_wait(
-                first_do_state,
-                first_do_ready,
-            )
-            q_full_pipeline.producer_acquire(first_q_state)
+            do_empty_pipeline.consumer_wait(do_state, do_ready)
+            q_full_pipeline.producer_acquire(q_state)
         cute.arch.sync_warp()
         if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
@@ -5024,7 +4727,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 TRACE_ROLE_DESC_BQ,
                 issue_seq,
                 TRACE_BQ_WAIT_END,
-                0,
+                round_index,
             )
             self._record_trace(
                 trace_buffer,
@@ -5036,128 +4739,48 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 TRACE_ROLE_DESC_BQ,
                 issue_seq,
                 TRACE_BQ_LOAD_BEGIN,
-                0,
+                round_index,
             )
 
-        first_bq_q = self._make_operand_slot_view(
+        bq_q = self._make_operand_slot_view(
             raw_slots,
-            first_bv_slot,
+            bv_slot,
             self.OP_MAIN_OFFSET_BYTES,
             dkv_a_layout,
         )
-        first_t_qt_smem, t_qt_gmem = cpasync.tma_partition(
+        t_qt_smem, t_qt_gmem = cpasync.tma_partition(
             tma_atom_qt,
             block_coord_vmnk[2],
             a_cta_layout,
-            cute.group_modes(first_bq_q, 0, 3),
+            cute.group_modes(bq_q, 0, 3),
             cute.group_modes(rank_g_qt, 0, 3),
         )
         t_qt_gmem = t_qt_gmem[None, None, 0]
         with cute.arch.elect_one():
             cute.arch.mbarrier_init(
-                grad_q_source_mbars + first_bv_slot,
+                grad_q_source_mbars + bv_slot,
                 1,
             )
             cute.arch.mbarrier_arrive_and_expect_tx(
-                grad_q_source_mbars + first_bv_slot,
+                grad_q_source_mbars + bv_slot,
                 grad_a_stage_bytes,
             )
         cute.copy(
             tma_atom_qt,
-            t_qt_gmem[None, 0],
-            first_t_qt_smem[None],
-            tma_bar_ptr=grad_q_source_mbars + first_bv_slot,
+            t_qt_gmem[None, round_index],
+            t_qt_smem[None],
+            tma_bar_ptr=grad_q_source_mbars + bv_slot,
         )
-
-        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
-            self._record_trace(
-                trace_buffer,
-                token_idx,
-                batch_idx,
-                trace_token_idx,
-                trace_batch_idx,
-                rank,
-                TRACE_ROLE_DESC_BQ,
-                issue_seq,
-                TRACE_BQ_WAIT_BEGIN,
-                1,
-            )
-        second_do_ready = do_empty_pipeline.consumer_try_wait(
-            second_do_state
-        )
-        with cute.arch.elect_one():
-            do_empty_pipeline.consumer_wait(
-                second_do_state,
-                second_do_ready,
-            )
-            q_full_pipeline.producer_acquire(second_q_state)
-        cute.arch.sync_warp()
-        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
-            self._record_trace(
-                trace_buffer,
-                token_idx,
-                batch_idx,
-                trace_token_idx,
-                trace_batch_idx,
-                rank,
-                TRACE_ROLE_DESC_BQ,
-                issue_seq,
-                TRACE_BQ_WAIT_END,
-                1,
-            )
-            self._record_trace(
-                trace_buffer,
-                token_idx,
-                batch_idx,
-                trace_token_idx,
-                trace_batch_idx,
-                rank,
-                TRACE_ROLE_DESC_BQ,
-                issue_seq,
-                TRACE_BQ_LOAD_BEGIN,
-                1,
-            )
-
-        second_bq_q = self._make_operand_slot_view(
-            raw_slots,
-            second_bv_slot,
-            self.OP_MAIN_OFFSET_BYTES,
-            dkv_a_layout,
-        )
-        second_t_qt_smem, second_t_qt_gmem = cpasync.tma_partition(
-            tma_atom_qt,
-            block_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(second_bq_q, 0, 3),
-            cute.group_modes(rank_g_qt, 0, 3),
-        )
-        second_t_qt_gmem = second_t_qt_gmem[None, None, 0]
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_init(
-                grad_q_source_mbars + second_bv_slot,
-                1,
-            )
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                grad_q_source_mbars + second_bv_slot,
-                grad_a_stage_bytes,
-            )
-        cute.copy(
-            tma_atom_qt,
-            second_t_qt_gmem[None, 1],
-            second_t_qt_smem[None],
-            tma_bar_ptr=grad_q_source_mbars + second_bv_slot,
-        )
-
         with cute.arch.elect_one():
             cute.arch.mbarrier_wait(
-                grad_q_source_mbars + first_bv_slot,
+                grad_q_source_mbars + bv_slot,
                 Int32(0),
             )
         cute.arch.sync_warp()
         cute.arch.fence_view_async_shared()
         with cute.arch.elect_one():
-            q_full_pipeline.producer_commit(first_q_state)
-            do_empty_pipeline.consumer_release(first_do_state)
+            q_full_pipeline.producer_commit(q_state)
+            do_empty_pipeline.consumer_release(do_state)
         if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
                 trace_buffer,
@@ -5169,38 +4792,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 TRACE_ROLE_DESC_BQ,
                 issue_seq,
                 TRACE_BQ_LOAD_END,
-                0,
-            )
-
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_wait(
-                grad_q_source_mbars + second_bv_slot,
-                Int32(0),
-            )
-        cute.arch.sync_warp()
-        cute.arch.fence_view_async_shared()
-        with cute.arch.elect_one():
-            q_full_pipeline.producer_commit(second_q_state)
-            do_empty_pipeline.consumer_release(second_do_state)
-        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
-            self._record_trace(
-                trace_buffer,
-                token_idx,
-                batch_idx,
-                trace_token_idx,
-                trace_batch_idx,
-                rank,
-                TRACE_ROLE_DESC_BQ,
-                issue_seq,
-                TRACE_BQ_LOAD_END,
-                1,
+                round_index,
             )
 
     @cute.jit
     def _mma_sdp_tile(
         self,
         raw_slots: cute.Tensor,
-        resident_q: cute.Tensor,
         score_a_layout: cute.ComposedLayout,
         score_b_layout: cute.ComposedLayout,
         score_tiled_mma: cute.TiledMma,
@@ -5242,12 +4840,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             s_pipeline.producer_acquire(s_state)
             dp_pipeline.producer_acquire(dp_state)
 
-        score_q_fragment = score_tiled_mma.make_fragment_A(
-            resident_q
-        )
         for _chunk in cutlass.range_constexpr(self.K_CHUNKS):
             op_pipeline.consumer_wait(op_state)
             slot = op_state.index
+            f_q = self._make_operand_slot_view(
+                raw_slots,
+                slot,
+                self.OP_MAIN_OFFSET_BYTES,
+                score_a_layout,
+            )
             f_do = self._make_operand_slot_view(
                 raw_slots,
                 slot,
@@ -5259,6 +4860,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 slot,
                 self.OP_SIDE_OFFSET_BYTES,
                 score_b_layout,
+            )
+            score_q_fragment = score_tiled_mma.make_fragment_A(
+                f_q
             )
             score_kv_fragment = score_tiled_mma.make_fragment_B(
                 f_kv
@@ -5277,12 +4881,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 cute.gemm(
                     score_mma,
                     t_score,
-                    score_q_fragment[
-                        None,
-                        None,
-                        k_block,
-                        _chunk,
-                    ],
+                    score_q_fragment[None, None, k_block],
                     score_kv_fragment[None, None, k_block],
                     t_score,
                 )
@@ -6437,34 +6036,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         dq_a_layout_staged,
         dq_b_layout_staged,
     ):
-        """Build the resident-Q payload and its typed pipeline barriers."""
+        """Build the v0 200-KiB payload and its typed pipeline barriers."""
 
         del default_storage
         assert cute.cosize(dkv_b_layout_staged) == self.PD_NESTED_ELEMENTS_PER_STAGE
         assert cute.cosize(dq_b_layout_staged) == self.PD_LOCAL_ELEMENTS_PER_STAGE
-        resident_q_elements = cute.cosize(score_a_layout_staged)
-        assert (
-            resident_q_elements
-            * self.element_dtype.width
-            // 8
-            == 64 * 1024
-        )
 
         @cute.struct
         class SharedStorage:
-            # The operand region remains raw so a constexpr F/BV branch can
-            # attach exactly one legal typed view.
+            # Fixed 200-KiB data plane.  The operand region remains raw so a
+            # constexpr F/BV branch can attach exactly one legal typed view.
             operand_slots: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Uint8,
                     self.OP_PAYLOAD_BYTES,
-                ],
-                1024,
-            ]
-            resident_q: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.element_dtype,
-                    resident_q_elements,
                 ],
                 1024,
             ]
@@ -6744,12 +6329,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     ):
         """Run the pipelined role graph with production operand loads.
 
-        Q is loaded once into a resident H-owned image. F and BV are filled
-        by four 128-bit gather warps plus a CTA-local TMA coordinator and are
-        published only after their 160-thread source join. BQ reloads both
-        transposed-Q rounds by paired TMA after dV makes their destinations
-        operand-safe. P/dS math/exchange and dKV reduction are numerical;
-        final dQ uses the drained operand-main TMA epilogue.
+        F and BV are filled by four 128-bit gather warps plus a CTA-local
+        TMA coordinator and are published only after their 160-thread source
+        join.  BQ refills the same BV main region after the group-aware dV
+        completion generation. P/dS math/exchange and dKV reduction are
+        numerical; final dQ uses the drained operand-main TMA epilogue.
         """
 
         physical_x, _, batch_idx = cute.arch.block_idx()
@@ -6868,10 +6452,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 (self.OP_BYTES_PER_STAGE, self.OP_STAGES),
                 stride=(1, self.OP_BYTES_PER_STAGE),
             )
-        )
-        resident_q = storage.resident_q.get_tensor(
-            score_a_layout_staged.outer,
-            swizzle=score_a_layout_staged.inner,
         )
         dq_epi_bytes = cute.size_in_bytes(
             self.element_dtype,
@@ -7187,7 +6767,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
 
         # Only the isolated lifecycle diagnostic needs a synthetic operand
         # payload.  The default path fully overwrites every live F/BV/BQ
-        # region and avoids a redundant 96-KiB CTA-wide clear.
+        # region and avoids a redundant 144-KiB CTA-wide clear.
         if cutlass.const_expr(self.DIAGNOSTIC_OPERAND_ONLY):
             for element in cutlass.range(
                 tidx,
@@ -7616,22 +7196,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                     ctx_reader_done_mbars_ptr,
                     tidx,
                 )
-                self._load_resident_q_once(
-                    resident_q,
-                    tma_atom_q,
-                    rank_g_q,
-                    block_coord_vmnk,
-                    a_cta_layout,
-                    score_q_source_mbars_ptr,
-                    score_a_stage_bytes,
-                    warp_idx,
-                )
                 for chunk in cutlass.range_constexpr(self.K_CHUNKS):
                     producer_state = self._load_f_task(
                         raw_slots,
                         score_a_layout,
                         score_b_layout,
+                        tma_atom_q,
                         tma_atom_do,
+                        rank_g_q,
                         rank_g_do,
                         block_coord_vmnk,
                         a_cta_layout,
@@ -7645,6 +7217,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         warp_idx,
                         kv_copy_atom,
                         kv_thread_copy,
+                        score_q_source_mbars_ptr,
                         score_do_source_mbars_ptr,
                         op_pipeline,
                         producer_state,
@@ -7672,68 +7245,75 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             ctx_reader_done_mbars_ptr,
                             tidx,
                         )
-                    for chunk in cutlass.range_constexpr(
-                        self.K_CHUNKS
+                    for local_task in cutlass.range_constexpr(
+                        self.K_CHUNKS + self.D_ROUNDS
                     ):
-                        if has_next:
-                            producer_state = self._load_f_task(
+                        if cutlass.const_expr(
+                            local_task < self.K_CHUNKS
+                        ):
+                            if has_next:
+                                producer_state = self._load_f_task(
+                                    raw_slots,
+                                    score_a_layout,
+                                    score_b_layout,
+                                    tma_atom_q,
+                                    tma_atom_do,
+                                    rank_g_q,
+                                    rank_g_do,
+                                    block_coord_vmnk,
+                                    a_cta_layout,
+                                    mKV,
+                                    load_ctx_ring,
+                                    batch_idx,
+                                    next_seq,
+                                    local_task,
+                                    rank,
+                                    tidx,
+                                    warp_idx,
+                                    kv_copy_atom,
+                                    kv_thread_copy,
+                                    score_q_source_mbars_ptr,
+                                    score_do_source_mbars_ptr,
+                                    op_pipeline,
+                                    producer_state,
+                                    score_a_stage_bytes,
+                                    token_idx,
+                                    trace_buffer,
+                                    trace_token_idx,
+                                    trace_batch_idx,
+                                )
+                        else:
+                            round_index = (
+                                local_task - self.K_CHUNKS
+                            )
+                            producer_state = self._load_bv_task(
                                 raw_slots,
-                                score_a_layout,
-                                score_b_layout,
-                                tma_atom_do,
-                                rank_g_do,
+                                dkv_a_layout,
+                                dq_a_layout,
+                                tma_atom_dot,
+                                rank_g_dot,
                                 block_coord_vmnk,
                                 a_cta_layout,
                                 mKV,
                                 load_ctx_ring,
                                 batch_idx,
-                                next_seq,
-                                chunk,
+                                issue_seq,
+                                round_index,
                                 rank,
                                 tidx,
                                 warp_idx,
                                 kv_copy_atom,
                                 kv_thread_copy,
-                                score_do_source_mbars_ptr,
+                                grad_do_source_mbars_ptr,
+                                grad_k_source_mbars_ptr,
                                 op_pipeline,
                                 producer_state,
-                                score_a_stage_bytes,
+                                grad_a_stage_bytes,
                                 token_idx,
                                 trace_buffer,
                                 trace_token_idx,
                                 trace_batch_idx,
                             )
-                    for round_index in cutlass.range_constexpr(
-                        self.D_ROUNDS
-                    ):
-                        producer_state = self._load_bv_task(
-                            raw_slots,
-                            dkv_a_layout,
-                            dq_a_layout,
-                            tma_atom_dot,
-                            rank_g_dot,
-                            block_coord_vmnk,
-                            a_cta_layout,
-                            mKV,
-                            load_ctx_ring,
-                            batch_idx,
-                            issue_seq,
-                            round_index,
-                            rank,
-                            tidx,
-                            warp_idx,
-                            kv_copy_atom,
-                            kv_thread_copy,
-                            grad_do_source_mbars_ptr,
-                            grad_k_source_mbars_ptr,
-                            op_pipeline,
-                            producer_state,
-                            grad_a_stage_bytes,
-                            token_idx,
-                            trace_buffer,
-                            trace_token_idx,
-                            trace_batch_idx,
-                        )
                     issue_seq += Int32(1)
                     active = has_next
 
@@ -7779,8 +7359,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         # A pending executable descriptor never blocks on IssuedCtx credit:
         # while its target slot is live, dO-empty is polled and serviced
         # first.  Traversal completion publishes sticky done independently
-        # of both metadata-ring and BQ credit. Descriptor consensus is also
-        # polled so a peer waiting on a Q bulk route cannot be stranded.
+        # of both metadata-ring and BQ credit.
         if (
             cutlass.const_expr(
                 self.DIAGNOSTIC_AUX_STAGE >= 3
@@ -7790,7 +7369,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             traversal_seq = Int32(0)
             committed_count = Int32(0)
             pending_descriptor = cutlass.Boolean(False)
-            consensus_pending = cutlass.Boolean(False)
             done_published = cutlass.Boolean(False)
             refill_count = Int32(0)
             whole_ordinal = Int32(self.K_CHUNKS)
@@ -7799,6 +7377,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 progressed = cutlass.Boolean(False)
                 refill_issue_seq = (
                     refill_count // Int32(self.D_ROUNDS)
+                )
+                refill_round = (
+                    refill_count % Int32(self.D_ROUNDS)
                 )
                 refill_admitted = cutlass.Boolean(False)
                 refill_has_next = cutlass.Boolean(False)
@@ -7823,64 +7404,186 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         refill_count % Int32(self.ROUND_STAGES),
                         do_phase,
                     )
+                    q_state = pipeline.PipelineState(
+                        self.ROUND_STAGES,
+                        refill_count,
+                        refill_count % Int32(self.ROUND_STAGES),
+                        Int32(1) ^ do_phase,
+                    )
                     do_ready = (
                         do_empty_pipeline.consumer_try_wait(
                             do_state
                         )
                     )
                     if do_ready:
-                        if refill_has_next:
-                            whole_ordinal += Int32(
-                                self.K_CHUNKS
+                        if refill_round == Int32(0):
+                            if refill_has_next:
+                                whole_ordinal += Int32(
+                                    self.K_CHUNKS
+                                )
+                            self._refill_bq_task(
+                                0,
+                                whole_ordinal
+                                % Int32(self.OP_STAGES),
+                                raw_slots,
+                                dkv_a_layout,
+                                tma_atom_qt,
+                                rank_g_qt,
+                                block_coord_vmnk,
+                                a_cta_layout,
+                                grad_q_source_mbars_ptr,
+                                do_empty_pipeline,
+                                do_state,
+                                do_ready,
+                                q_full_pipeline,
+                                q_state,
+                                grad_a_stage_bytes,
+                                refill_issue_seq,
+                                rank,
+                                tidx,
+                                token_idx,
+                                batch_idx,
+                                trace_buffer,
+                                trace_token_idx,
+                                trace_batch_idx,
                             )
-                        self._refill_bq_pair(
-                            whole_ordinal
-                            % Int32(self.OP_STAGES),
-                            refill_count,
-                            raw_slots,
-                            dkv_a_layout,
-                            tma_atom_qt,
-                            rank_g_qt,
-                            block_coord_vmnk,
-                            a_cta_layout,
-                            grad_q_source_mbars_ptr,
-                            do_empty_pipeline,
-                            do_ready,
-                            q_full_pipeline,
-                            grad_a_stage_bytes,
-                            refill_issue_seq,
-                            rank,
-                            tidx,
-                            token_idx,
-                            batch_idx,
-                            trace_buffer,
-                            trace_token_idx,
-                            trace_batch_idx,
-                        )
-                        whole_ordinal += Int32(
-                            self.D_ROUNDS
-                        )
-                        refill_count += Int32(
-                            self.D_ROUNDS
-                        )
+                        else:
+                            self._refill_bq_task(
+                                1,
+                                whole_ordinal
+                                % Int32(self.OP_STAGES),
+                                raw_slots,
+                                dkv_a_layout,
+                                tma_atom_qt,
+                                rank_g_qt,
+                                block_coord_vmnk,
+                                a_cta_layout,
+                                grad_q_source_mbars_ptr,
+                                do_empty_pipeline,
+                                do_state,
+                                do_ready,
+                                q_full_pipeline,
+                                q_state,
+                                grad_a_stage_bytes,
+                                refill_issue_seq,
+                                rank,
+                                tidx,
+                                token_idx,
+                                batch_idx,
+                                trace_buffer,
+                                trace_token_idx,
+                                trace_batch_idx,
+                            )
+                        whole_ordinal += Int32(1)
+                        refill_count += Int32(1)
                         progressed = cutlass.Boolean(True)
 
                 if not progressed:
-                    if consensus_pending:
-                        descriptor_slot = (
-                            traversal_seq
+                    if pending_descriptor:
+                        slot = (
+                            committed_count
                             % Int32(self.CONTEXT_STAGES)
                         )
-                        descriptor_phase = (
-                            traversal_seq
+                        epoch = (
+                            committed_count
                             // Int32(self.CONTEXT_STAGES)
                         ) & Int32(1)
-                        consensus_ready = _mbarrier_try_wait(
-                            descriptor_consensus_mbars_ptr
-                            + descriptor_slot,
-                            descriptor_phase,
+                        empty_ready = _mbarrier_try_wait(
+                            issued_ctx_mbars_ptr
+                            + self.ISSUED_EMPTY_MBAR_BASE
+                            + slot,
+                            epoch ^ Int32(1),
                         )
-                        if consensus_ready:
+                        if empty_ready:
+                            self._publish_issued_context(
+                                committed_count,
+                                traversal_descriptor,
+                                issued_ctx_ring,
+                                issued_ctx_mbars_ptr,
+                                peer_rank,
+                            )
+                            if tidx == Int32(
+                                self.DESCRIPTOR_WARP * 32
+                            ):
+                                self._record_trace(
+                                    trace_buffer,
+                                    token_idx,
+                                    batch_idx,
+                                    trace_token_idx,
+                                    trace_batch_idx,
+                                    rank,
+                                    TRACE_ROLE_DESC_BQ,
+                                    committed_count,
+                                    TRACE_CTX_COMMIT,
+                                )
+                            committed_count += Int32(1)
+                            pending_descriptor = (
+                                cutlass.Boolean(False)
+                            )
+                            progressed = cutlass.Boolean(True)
+                    else:
+                        if traversal_seq < traversal_tile_count:
+                            logical_tile = (
+                                traversal_tile_count
+                                - Int32(1)
+                                - traversal_seq
+                            )
+                            descriptor_slot = (
+                                traversal_seq
+                                % Int32(self.CONTEXT_STAGES)
+                            )
+                            descriptor_phase = (
+                                traversal_seq
+                                // Int32(self.CONTEXT_STAGES)
+                            ) & Int32(1)
+                            if tidx == Int32(
+                                self.DESCRIPTOR_WARP * 32
+                            ):
+                                self._record_trace(
+                                    trace_buffer,
+                                    token_idx,
+                                    batch_idx,
+                                    trace_token_idx,
+                                    trace_batch_idx,
+                                    rank,
+                                    TRACE_ROLE_DESC_BQ,
+                                    traversal_seq,
+                                    TRACE_DESC_BEGIN,
+                                )
+                            self._decode_traversal_descriptor(
+                                mTopkIdxs,
+                                traversal_descriptor,
+                                token_idx,
+                                batch_idx,
+                                topk,
+                                logical_tile,
+                            )
+                            if tidx == Int32(
+                                self.DESCRIPTOR_WARP * 32
+                            ):
+                                self._record_trace(
+                                    trace_buffer,
+                                    token_idx,
+                                    batch_idx,
+                                    trace_token_idx,
+                                    trace_batch_idx,
+                                    rank,
+                                    TRACE_ROLE_DESC_BQ,
+                                    traversal_seq,
+                                    TRACE_DESC_END,
+                                )
+                            with cute.arch.elect_one():
+                                self._pair_arrive(
+                                    descriptor_consensus_mbars_ptr
+                                    + descriptor_slot,
+                                    peer_rank,
+                                )
+                                self._wait_pair(
+                                    descriptor_consensus_mbars_ptr
+                                    + descriptor_slot,
+                                    descriptor_phase,
+                                )
+                            cute.arch.sync_warp()
                             cute.arch.fence_view_async_shared()
                             pending_descriptor = (
                                 traversal_descriptor[
@@ -7889,135 +7592,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                                 != Int32(0)
                             )
                             traversal_seq += Int32(1)
-                            consensus_pending = cutlass.Boolean(
-                                False
-                            )
                             progressed = cutlass.Boolean(True)
-                    else:
-                        if pending_descriptor:
-                            slot = (
-                                committed_count
-                                % Int32(self.CONTEXT_STAGES)
-                            )
-                            epoch = (
-                                committed_count
-                                // Int32(self.CONTEXT_STAGES)
-                            ) & Int32(1)
-                            empty_ready = _mbarrier_try_wait(
-                                issued_ctx_mbars_ptr
-                                + self.ISSUED_EMPTY_MBAR_BASE
-                                + slot,
-                                epoch ^ Int32(1),
-                            )
-                            if empty_ready:
-                                self._publish_issued_context(
-                                    committed_count,
-                                    traversal_descriptor,
-                                    issued_ctx_ring,
-                                    issued_ctx_mbars_ptr,
+                        else:
+                            if not done_published:
+                                with cute.arch.elect_one():
+                                    self._publish_issued_stream_done(
+                                        token_idx,
+                                        committed_count,
+                                        issued_stream_state,
+                                    issued_stream_done_ack_mbars_ptr,
                                     peer_rank,
                                 )
-                                if tidx == Int32(
-                                    self.DESCRIPTOR_WARP * 32
-                                ):
-                                    self._record_trace(
-                                        trace_buffer,
-                                        token_idx,
-                                        batch_idx,
-                                        trace_token_idx,
-                                        trace_batch_idx,
-                                        rank,
-                                        TRACE_ROLE_DESC_BQ,
-                                        committed_count,
-                                        TRACE_CTX_COMMIT,
-                                    )
-                                committed_count += Int32(1)
-                                pending_descriptor = (
-                                    cutlass.Boolean(False)
-                                )
-                                progressed = cutlass.Boolean(True)
-                        else:
-                            if traversal_seq < traversal_tile_count:
-                                logical_tile = (
-                                    traversal_tile_count
-                                    - Int32(1)
-                                    - traversal_seq
-                                )
-                                descriptor_slot = (
-                                    traversal_seq
-                                    % Int32(self.CONTEXT_STAGES)
-                                )
-                                if tidx == Int32(
-                                    self.DESCRIPTOR_WARP * 32
-                                ):
-                                    self._record_trace(
-                                        trace_buffer,
-                                        token_idx,
-                                        batch_idx,
-                                        trace_token_idx,
-                                        trace_batch_idx,
-                                        rank,
-                                        TRACE_ROLE_DESC_BQ,
-                                        traversal_seq,
-                                        TRACE_DESC_BEGIN,
-                                    )
-                                self._decode_traversal_descriptor(
-                                    mTopkIdxs,
-                                    traversal_descriptor,
+                                self._record_trace(
+                                    trace_buffer,
                                     token_idx,
                                     batch_idx,
-                                    topk,
-                                    logical_tile,
+                                    trace_token_idx,
+                                    trace_batch_idx,
+                                    rank,
+                                    TRACE_ROLE_DESC_BQ,
+                                    Int32(TRACE_ISSUE_SLOTS - 1),
+                                    TRACE_STREAM_DONE,
                                 )
-                                if tidx == Int32(
-                                    self.DESCRIPTOR_WARP * 32
-                                ):
-                                    self._record_trace(
-                                        trace_buffer,
-                                        token_idx,
-                                        batch_idx,
-                                        trace_token_idx,
-                                        trace_batch_idx,
-                                        rank,
-                                        TRACE_ROLE_DESC_BQ,
-                                        traversal_seq,
-                                        TRACE_DESC_END,
-                                    )
-                                with cute.arch.elect_one():
-                                    self._pair_arrive(
-                                        descriptor_consensus_mbars_ptr
-                                        + descriptor_slot,
-                                        peer_rank,
-                                    )
                                 cute.arch.sync_warp()
-                                consensus_pending = (
-                                    cutlass.Boolean(True)
-                                )
+                                done_published = cutlass.Boolean(True)
                                 progressed = cutlass.Boolean(True)
-                            else:
-                                if not done_published:
-                                    with cute.arch.elect_one():
-                                        self._publish_issued_stream_done(
-                                            token_idx,
-                                            committed_count,
-                                            issued_stream_state,
-                                            issued_stream_done_ack_mbars_ptr,
-                                            peer_rank,
-                                        )
-                                    self._record_trace(
-                                        trace_buffer,
-                                        token_idx,
-                                        batch_idx,
-                                        trace_token_idx,
-                                        trace_batch_idx,
-                                        rank,
-                                        TRACE_ROLE_DESC_BQ,
-                                        Int32(TRACE_ISSUE_SLOTS - 1),
-                                        TRACE_STREAM_DONE,
-                                    )
-                                    cute.arch.sync_warp()
-                                    done_published = cutlass.Boolean(True)
-                                    progressed = cutlass.Boolean(True)
 
                 engine_active = cutlass.Boolean(True)
                 if done_published:
@@ -8109,7 +7708,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             if first_valid:
                 op_state, s_state, dp_state = self._mma_sdp_tile(
                     raw_slots,
-                    resident_q,
                     score_a_layout,
                     score_b_layout,
                     score_tiled_mma,
@@ -8145,7 +7743,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                     op_state, s_state, dp_state = (
                         self._mma_sdp_tile(
                             raw_slots,
-                            resident_q,
                             score_a_layout,
                             score_b_layout,
                             score_tiled_mma,
@@ -8240,7 +7837,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         op_state, s_state, dp_state = (
                             self._mma_sdp_tile(
                                 raw_slots,
-                                resident_q,
                                 score_a_layout,
                                 score_b_layout,
                                 score_tiled_mma,
