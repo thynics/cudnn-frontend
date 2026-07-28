@@ -8736,17 +8736,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         )
 
             if is_q_route:
-                if owner_d == rank:
-                    for word in cutlass.range_constexpr(4):
-                        _store_shared_u32_at(
-                            q_destination_rows,
-                            (
-                                local_d + Int32(2 * word),
-                                global_h,
-                            ),
-                            packed[word],
-                        )
-                else:
+                # Issue the peer stripe first so the disjoint local stripe
+                # can cover the final DSM transaction drain.
+                if owner_d != rank:
                     _store_shared_remote_u32x4(
                         q_destination_rows.iterator
                         + q_destination_rows.layout(
@@ -8759,18 +8751,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         packed[2],
                         packed[3],
                     )
-            else:
-                if owner_d == rank:
+                else:
                     for word in cutlass.range_constexpr(4):
                         _store_shared_u32_at(
-                            do_destination_rows,
+                            q_destination_rows,
                             (
                                 local_d + Int32(2 * word),
                                 global_h,
                             ),
                             packed[word],
                         )
-                else:
+            else:
+                if owner_d != rank:
                     _store_shared_remote_u32x4(
                         do_destination_rows.iterator
                         + do_destination_rows.layout(
@@ -8783,6 +8775,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         packed[2],
                         packed[3],
                     )
+                else:
+                    for word in cutlass.range_constexpr(4):
+                        _store_shared_u32_at(
+                            do_destination_rows,
+                            (
+                                local_d + Int32(2 * word),
+                                global_h,
+                            ),
+                            packed[word],
+                        )
 
         _mbarrier_wait_acquire_cluster(
             q_destination_full,
