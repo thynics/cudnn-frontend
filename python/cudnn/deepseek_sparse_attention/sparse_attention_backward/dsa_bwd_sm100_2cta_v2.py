@@ -12703,6 +12703,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     two head blocks do not begin by contending on the same dKV rows.
     """
 
+    # Compatibility metadata consumed by the isolated V2 harness adapter.
+    # The inherited canonical kernel still receives block_tile=64 normally.
+    N_TILE = FlashAttentionDSABackwardSm100TwoCTA.N_TILE
+
     @cute.jit
     def _atomic_dKV_128_visit_v2(
         self,
