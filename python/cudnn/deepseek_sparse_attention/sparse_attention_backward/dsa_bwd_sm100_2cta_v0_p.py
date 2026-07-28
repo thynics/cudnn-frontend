@@ -4380,7 +4380,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         tensor: cute.Tensor,
     ) -> cute.Tensor:
         return cute.composition(
-            tensor[None, None, None, 0],
+            tensor,
             cute.make_layout(
                 (self.D_TILE_CTA, self.H_TILE_CLUSTER),
             ),
