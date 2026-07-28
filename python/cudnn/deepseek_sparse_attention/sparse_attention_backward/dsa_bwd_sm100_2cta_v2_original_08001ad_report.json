@@ -1,0 +1,85 @@
+{
+  "conclusion": {
+    "correctness": "fail",
+    "formal_performance": "not_run",
+    "iket_trace": "not_run",
+    "reason": "The original V2 failed the first dense correctness case, so the mandatory pipeline stopped before benchmark and trace stages."
+  },
+  "integrity_finding": {
+    "severity": "severe_engineering_integrity_violation",
+    "invalid_methods": [
+      "routing V2 to an old or baseline-derived implementation",
+      "using different implementations for release and trace",
+      "labelling a dormant V1 class trace as V2",
+      "hiding original correctness failure and presenting data from a different source SHA"
+    ],
+    "disposition": "All affected V2 performance and trace claims are invalid and must not be cited."
+  },
+  "original_version": {
+    "commit": "08001addf1f0fbc3c0e035ccae314a7e9dbf8340",
+    "subject": "Add DSA v2 rotated-schedule 2-CTA experiment and design doc",
+    "author": "longcheng <longcheng@nvidia.com>",
+    "author_date": "2026-07-28T22:55:45+08:00",
+    "committer": "longcheng <longcheng@nvidia.com>",
+    "commit_date": "2026-07-28T22:57:23+08:00",
+    "source_sha256": "1425bbca516f24bccbdaa9fa573f17defd002f005db5ccc7152b5df055678a3e"
+  },
+  "runs": [
+    {
+      "run_id": "20260728T145847Z_v2_v2",
+      "gpu": "NVIDIA B200",
+      "source_revision": "08001addf1f0fbc3c0e035ccae314a7e9dbf8340",
+      "selected_candidate_sha256": "1425bbca516f24bccbdaa9fa573f17defd002f005db5ccc7152b5df055678a3e",
+      "compile_seconds": 15.849394,
+      "dense_stage_seconds": 0.001360,
+      "dense_stage_time_is_formal_performance": false,
+      "correctness": {
+        "status": "fail",
+        "tensor": "dKV",
+        "mismatched_elements": 240466,
+        "total_elements": 262144,
+        "mismatch_percent": 91.7,
+        "greatest_absolute_difference": 3.758673906326294,
+        "greatest_absolute_difference_index": [129, 135],
+        "greatest_relative_difference": 117896.4453125,
+        "greatest_relative_difference_index": [14, 380]
+      }
+    },
+    {
+      "run_id": "20260728T210935Z_original08001ad_v2orig08001ad",
+      "gpu": "NVIDIA B200",
+      "source_revision": "f81de6d17a244cfeebfa845844e22e0acd83b6fe",
+      "source_revision_note": "The candidate was an isolated byte-exact copy of the original 08001ad V2, proven by selected_candidate_sha256.",
+      "selected_candidate_sha256": "1425bbca516f24bccbdaa9fa573f17defd002f005db5ccc7152b5df055678a3e",
+      "compile_seconds": 15.510627,
+      "dense_stage_seconds": 0.001350,
+      "dense_stage_time_is_formal_performance": false,
+      "correctness": {
+        "status": "fail",
+        "tensor": "dKV",
+        "mismatched_elements": 240466,
+        "total_elements": 262144,
+        "mismatch_percent": 91.7,
+        "greatest_absolute_difference": 3.758673906326294,
+        "greatest_absolute_difference_index": [129, 135],
+        "greatest_relative_difference": 117896.4453125,
+        "greatest_relative_difference_index": [14, 380]
+      }
+    }
+  ],
+  "formal_performance": {
+    "baseline_latency_ms": null,
+    "candidate_latency_ms": null,
+    "candidate_over_baseline": null,
+    "status": "not_run"
+  },
+  "trace_comparison": {
+    "baseline_capture": "not_run",
+    "candidate_capture": "not_run",
+    "decoded_trace": null,
+    "two_trace_tables": null,
+    "role_aggregated_timeline": null,
+    "active_v2_source_native_iket_event_count": 0,
+    "status": "not_generated"
+  }
+}
