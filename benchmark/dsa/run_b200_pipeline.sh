@@ -14,7 +14,7 @@ One-click DSA backward validation on B200:
   4. run correctness, uninstrumented baseline/candidate performance, and
      baseline/candidate IKET capture;
   5. generate the two Markdown/JSON span tables;
-  6. download only lightweight summaries and print the Markdown tables.
+  6. download the required lightweight summaries/timelines and print them.
 
 Raw IKET traces remain under /home/scratch.longcheng_gpu on Computelab.
 All remote output is streamed live. Failures preserve the non-zero exit code
@@ -208,15 +208,33 @@ if ((remote_rc != 0)); then
   fi
   exit "${remote_rc}"
 fi
+if [[ -z "${lightweight_remote}" ]]; then
+  echo "ERROR: pipeline passed but no LIGHTWEIGHT_RESULT was reported" >&2
+  exit 1
+fi
 if ((download_rc != 0)); then
   exit "${download_rc}"
 fi
 
 tables="${output_dir}/two_trace_tables.md"
-if [[ ! -s "${tables}" ]]; then
-  echo "ERROR: pipeline passed but two_trace_tables.md is missing" >&2
-  exit 1
-fi
+timeline_prefix="${output_dir}/role_aggregated_h128_i1_i3"
+timeline_chrome="${timeline_prefix}.chrome.json"
+timeline_json="${timeline_prefix}.timeline.json"
+timeline_svg="${timeline_prefix}.svg"
+timeline_shared_svg="${timeline_prefix}.shared.svg"
+for required_artifact in \
+  "${tables}" \
+  "${timeline_chrome}" \
+  "${timeline_json}" \
+  "${timeline_svg}" \
+  "${timeline_shared_svg}"; do
+  if [[ ! -s "${required_artifact}" ]]; then
+    echo \
+      "ERROR: pipeline passed but required lightweight artifact is missing or empty: ${required_artifact}" \
+      >&2
+    exit 1
+  fi
+done
 
 echo
 cat "${tables}"
@@ -225,3 +243,6 @@ echo "DSA_PIPELINE_PASSED"
 echo "DSA_TABLES ${tables}"
 echo "DSA_TABLES_JSON ${output_dir}/two_trace_tables.json"
 echo "DSA_VALIDATION ${output_dir}/validation_summary.json"
+echo "DSA_TRACE_TIMELINE_JSON ${timeline_json}"
+echo "DSA_TRACE_TIMELINE_SVG ${timeline_svg}"
+echo "DSA_TRACE_TIMELINE_SHARED_SVG ${timeline_shared_svg}"
