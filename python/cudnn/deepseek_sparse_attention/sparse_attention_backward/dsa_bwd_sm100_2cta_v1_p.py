@@ -8399,47 +8399,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         """Decode one traversal tile into an immutable 272-byte context."""
 
         self.main_barrier.arrive_and_wait()
-        if tidx == Int32(0):
-            valid_lo = Int32(0)
-            valid_hi = Int32(0)
-            execute = Int32(0)
-            context[self.CTX_ISSUE_SEQ_WORD] = issue_seq
-            context[self.CTX_LOGICAL_TILE_WORD] = logical_tile
-            for logical_n in cutlass.range_constexpr(self.N_TILE):
-                topk_slot = (
-                    logical_tile * Int32(self.N_TILE)
-                    + Int32(logical_n)
+        if tidx < Int32(32):
+            self._decode_ctx_words_no_sync_v1(
+                mTopkIdxs,
+                context,
+                token_idx,
+                batch_idx,
+                topk,
+                logical_tile,
+                issue_seq,
+            )
+            if tidx == Int32(0):
+                descriptor[self.DESCRIPTOR_EXECUTE_WORD] = Int32(
+                    (
+                        context[self.CTX_VALID_LO_WORD]
+                        | context[self.CTX_VALID_HI_WORD]
+                    )
+                    != Int32(0)
                 )
-                kv_index = Int32(-1)
-                if topk_slot < topk:
-                    kv_index = mTopkIdxs[
-                        topk_slot,
-                        (token_idx, batch_idx),
-                    ]
-                context[
-                    self.CTX_KV_BASE_WORD + logical_n
-                ] = kv_index
-                if kv_index >= Int32(0):
-                    execute = Int32(1)
-                    if cutlass.const_expr(logical_n < 32):
-                        valid_lo = (
-                            valid_lo
-                            | (
-                                Int32(1)
-                                << Int32(logical_n)
-                            )
-                        )
-                    else:
-                        valid_hi = (
-                            valid_hi
-                            | (
-                                Int32(1)
-                                << Int32(logical_n - 32)
-                            )
-                        )
-            context[self.CTX_VALID_LO_WORD] = valid_lo
-            context[self.CTX_VALID_HI_WORD] = valid_hi
-            descriptor[self.DESCRIPTOR_EXECUTE_WORD] = execute
         self.main_barrier.arrive_and_wait()
         return (
             descriptor[self.DESCRIPTOR_EXECUTE_WORD]
