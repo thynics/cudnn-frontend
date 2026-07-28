@@ -188,6 +188,35 @@ def _load_shared_u32_at_v0_p(
     return packed[0]
 
 
+@dsl_user_op
+def _load_peer_shared_u32_at_v0_p(
+    pointer: cute.Pointer,
+    peer_rank: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Load one immutable word from the same address in ``peer_rank``."""
+
+    peer_pointer_i32 = _map_smem_to_cluster_rank(
+        pointer,
+        peer_rank,
+        loc=loc,
+        ip=ip,
+    ).ir_value()
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [peer_pointer_i32],
+            "ld.volatile.shared::cluster.u32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 @cute.jit
 def _store_shared_u32_at_v0_p(
     tensor: cute.Tensor,
@@ -4471,19 +4500,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     def _route_resident_q_round(
         self,
         round_index: cutlass.Constexpr[int],
-        issue_seq: Int32,
         resident_q: cute.Tensor,
         destination_q: cute.Tensor,
-        destination_full: cute.Pointer,
         rank: Int32,
         peer_rank: Int32,
     ) -> None:
-        """Materialize one D-owned Q round from immutable H-owned Q."""
+        """Pull one complete D-owned Q round from both resident images."""
 
         # The preceding dO-empty wait is produced by the sole CG2 consumer,
         # so both rank-local BV destinations are already dead before either
-        # W7 can enter this route.  Keep the CTA schedulers independent here:
-        # an extra pair rendezvous can form a cycle with descriptor credit.
+        # W7 can enter this route. Each W7 pulls the peer half itself so its
+        # progress never depends on the peer W7's descriptor/refill choice.
         source_rows_0 = self._score_chunk_rows_v0_p(
             resident_q,
             0,
@@ -4513,7 +4540,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             global_h = (
                 rank * Int32(self.H_TILE_CTA) + local_h
             )
-            packed = cute.make_rmem_tensor(
+            peer_global_h = (
+                peer_rank * Int32(self.H_TILE_CTA) + local_h
+            )
+            local_packed = cute.make_rmem_tensor(
+                (4,),
+                cutlass.Uint32,
+            )
+            peer_packed = cute.make_rmem_tensor(
                 (4,),
                 cutlass.Uint32,
             )
@@ -4524,25 +4558,45 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 )
                 if cutlass.const_expr(round_index == 0):
                     if rank == Int32(0):
-                        packed[word] = _load_shared_u32_at_v0_p(
+                        local_packed[word] = _load_shared_u32_at_v0_p(
                             source_rows_0,
                             source_coordinate,
                         )
+                        peer_packed[word] = _load_peer_shared_u32_at_v0_p(
+                            source_rows_0.iterator
+                            + source_rows_0.layout(source_coordinate),
+                            peer_rank,
+                        )
                     else:
-                        packed[word] = _load_shared_u32_at_v0_p(
+                        local_packed[word] = _load_shared_u32_at_v0_p(
                             source_rows_1,
                             source_coordinate,
                         )
+                        peer_packed[word] = _load_peer_shared_u32_at_v0_p(
+                            source_rows_1.iterator
+                            + source_rows_1.layout(source_coordinate),
+                            peer_rank,
+                        )
                 else:
                     if rank == Int32(0):
-                        packed[word] = _load_shared_u32_at_v0_p(
+                        local_packed[word] = _load_shared_u32_at_v0_p(
                             source_rows_2,
                             source_coordinate,
                         )
+                        peer_packed[word] = _load_peer_shared_u32_at_v0_p(
+                            source_rows_2.iterator
+                            + source_rows_2.layout(source_coordinate),
+                            peer_rank,
+                        )
                     else:
-                        packed[word] = _load_shared_u32_at_v0_p(
+                        local_packed[word] = _load_shared_u32_at_v0_p(
                             source_rows_3,
                             source_coordinate,
+                        )
+                        peer_packed[word] = _load_peer_shared_u32_at_v0_p(
+                            source_rows_3.iterator
+                            + source_rows_3.layout(source_coordinate),
+                            peer_rank,
                         )
             for word in cutlass.range_constexpr(4):
                 _store_shared_u32_at_v0_p(
@@ -4551,51 +4605,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         local_d + Int32(2 * word),
                         global_h,
                     ),
-                    packed[word],
+                    local_packed[word],
                 )
-
-        if lane == Int32(0):
-            if cutlass.const_expr(round_index == 0):
-                if peer_rank == Int32(0):
-                    self._issue_resident_q_peer_bulk(
-                        source_rows_0,
-                        destination_rows,
-                        destination_full,
-                        rank,
-                        peer_rank,
-                    )
-                else:
-                    self._issue_resident_q_peer_bulk(
-                        source_rows_1,
-                        destination_rows,
-                        destination_full,
-                        rank,
-                        peer_rank,
-                    )
-            else:
-                if peer_rank == Int32(0):
-                    self._issue_resident_q_peer_bulk(
-                        source_rows_2,
-                        destination_rows,
-                        destination_full,
-                        rank,
-                        peer_rank,
-                    )
-                else:
-                    self._issue_resident_q_peer_bulk(
-                        source_rows_3,
-                        destination_rows,
-                        destination_full,
-                        rank,
-                        peer_rank,
-                    )
-
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            _mbarrier_wait_acquire_cluster_v0_p(
-                destination_full,
-                issue_seq & Int32(1),
-            )
+                _store_shared_u32_at_v0_p(
+                    destination_rows,
+                    (
+                        local_d + Int32(2 * word),
+                        peer_global_h,
+                    ),
+                    peer_packed[word],
+                )
         cute.arch.sync_warp()
         cute.arch.fence_view_async_shared()
 
@@ -4939,7 +4958,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         raw_slots: cute.Tensor,
         resident_q: cute.Tensor,
         dkv_a_layout: cute.ComposedLayout,
-        grad_q_source_mbars: cute.Pointer,
         do_empty_pipeline,
         first_do_ready: cutlass.Boolean,
         q_full_pipeline,
@@ -5044,10 +5062,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         )
         self._route_resident_q_round(
             0,
-            issue_seq,
             resident_q,
             first_bq_q,
-            grad_q_source_mbars + first_bv_slot,
             rank,
             peer_rank,
         )
@@ -5123,10 +5139,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         )
         self._route_resident_q_round(
             1,
-            issue_seq,
             resident_q,
             second_bq_q,
-            grad_q_source_mbars + second_bv_slot,
             rank,
             peer_rank,
         )
@@ -7784,7 +7798,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             raw_slots,
                             resident_q,
                             dkv_a_layout,
-                            grad_q_source_mbars_ptr,
                             do_empty_pipeline,
                             do_ready,
                             q_full_pipeline,
