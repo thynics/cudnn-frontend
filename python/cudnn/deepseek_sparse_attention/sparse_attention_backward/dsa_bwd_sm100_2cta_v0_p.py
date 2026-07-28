@@ -3423,19 +3423,13 @@ def _run_math_role(
             cute.arch.mbarrier_arrive(
                 ctx_reader_done_mbars + context_slot
             )
-            self._detach_issued_context(
-                issue_seq,
-                issued_ctx,
-                reducer_ctx,
-                issued_ctx_mbars,
-                reducer_ctx_mbars,
-                ctx_reader_done_mbars,
-                peer,
-            )
-        math_barrier.arrive_and_wait()
-        if is_math_leader:
+            # The exchange depends only on the completed P/dS stores, not on
+            # the load coordinator releasing IssuedCtx. Start it immediately
+            # so the remote quadrants and their consumers can progress while
+            # context detach waits for the final metadata reader.
             cute.arch.mbarrier_arrive(p_local_ready + stage)
             cute.arch.mbarrier_arrive(ds_local_ready + stage)
+        math_barrier.arrive_and_wait()
 
         phase = (
             issue_seq // Int32(self.PD_STAGES)
@@ -3489,6 +3483,18 @@ def _run_math_role(
                 issue_seq,
                 TRACE_PD_PUBLISH,
             )
+            self._detach_issued_context(
+                issue_seq,
+                issued_ctx,
+                reducer_ctx,
+                issued_ctx_mbars,
+                reducer_ctx_mbars,
+                ctx_reader_done_mbars,
+                peer,
+            )
+        # Keep all four math warps on the same issue while the leader snapshots
+        # reducer metadata and releases the IssuedCtx slot.
+        math_barrier.arrive_and_wait()
         p_state.advance()
         dsk_state.advance()
         dsq_state.advance()
