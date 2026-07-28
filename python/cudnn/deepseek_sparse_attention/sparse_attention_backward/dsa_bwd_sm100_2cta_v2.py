@@ -12707,6 +12707,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # The inherited canonical kernel still receives block_tile=64 normally.
     N_TILE = FlashAttentionDSABackwardSm100TwoCTA.N_TILE
 
+    @cute.kernel
+    def _copy_clamp_topk_lengths_v2(
+        self,
+        source: cute.Tensor,
+        destination: cute.Tensor,
+        count: Int32,
+    ):
+        """Copy compact lengths while keeping every token on one tile."""
+        block_idx, _, _ = cute.arch.block_idx()
+        thread_idx, _, _ = cute.arch.thread_idx()
+        index = block_idx * 256 + thread_idx
+        if index < count:
+            value = source[index]
+            if value == Int32(0):
+                value = Int32(1)
+            destination[index] = value
+
     @cute.jit
     def __call__(
         self,
@@ -12733,6 +12750,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         """Adapt the V2 harness signature to the canonical CG1 launcher."""
 
         del trace_buffer, trace_token_idx, trace_batch_idx
+        if cutlass.const_expr(mTopkLength is not None):
+            length_count = mTopkLength.shape[0]
+            length_scratch = cute.make_tensor(
+                cute.recast_ptr(mdKV.iterator, dtype=Int32),
+                cute.make_layout((length_count,), stride=(1,)),
+            )
+            self._copy_clamp_topk_lengths_v2(
+                mTopkLength,
+                length_scratch,
+                length_count,
+            ).launch(
+                grid=[cute.ceil_div(length_count, 256), 1, 1],
+                block=[256, 1, 1],
+                stream=stream,
+            )
+            mTopkLength = length_scratch
+
         return super().__call__(
             problem_shape,
             mQ,
@@ -12751,6 +12785,90 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             softmax_scale,
             stream,
         )
+
+    @cute.jit
+    def _load_kv_rows(
+        self,
+        mKV: cute.Tensor,
+        sK_slice: cute.Tensor,
+        rTopkIdx: cute.Tensor,
+        tile_index: Int32,
+        topk: Int32,
+        mTopkLength: Optional[cute.Tensor],
+        is_first: bool,
+        local_tidx: Int32,
+        local_warp_idx: Int32,
+        async_copy_atom: cute.CopyAtom,
+        async_thr_copy: cute.TiledCopy,
+    ):
+        """Load only valid sparse KV rows; zero padding and index holes."""
+        token_idx, _, batch_idx = cute.arch.block_idx()
+
+        rows_per_warp = self.block_tile // self.num_load_KV_warps
+        for i in range(rows_per_warp):
+            row = i * self.num_load_KV_warps + local_warp_idx
+            idx = tile_index * self.block_tile + row
+            tile_sK = sK_slice[row, (None, None)]
+            topk_idx = rTopkIdx[i]
+
+            if cutlass.const_expr(mTopkLength is not None):
+                if cutlass.const_expr(is_first):
+                    if idx >= 0:
+                        if idx < topk:
+                            if topk_idx >= 0:
+                                self._copy_kv_row(
+                                    mKV,
+                                    topk_idx,
+                                    batch_idx,
+                                    tile_sK,
+                                    local_tidx,
+                                    async_copy_atom,
+                                    async_thr_copy,
+                                )
+                            else:
+                                self._zero_kv_row(tile_sK, local_tidx)
+                        else:
+                            self._zero_kv_row(tile_sK, local_tidx)
+                    else:
+                        self._zero_kv_row(tile_sK, local_tidx)
+                else:
+                    if idx >= 0:
+                        if idx < topk:
+                            if topk_idx >= 0:
+                                self._copy_kv_row(
+                                    mKV,
+                                    topk_idx,
+                                    batch_idx,
+                                    tile_sK,
+                                    local_tidx,
+                                    async_copy_atom,
+                                    async_thr_copy,
+                                )
+                            else:
+                                self._zero_kv_row(tile_sK, local_tidx)
+                        else:
+                            self._zero_kv_row(tile_sK, local_tidx)
+                    else:
+                        self._zero_kv_row(tile_sK, local_tidx)
+            else:
+                if idx >= 0:
+                    if idx < topk:
+                        if topk_idx >= 0:
+                            self._copy_kv_row(
+                                mKV,
+                                topk_idx,
+                                batch_idx,
+                                tile_sK,
+                                local_tidx,
+                                async_copy_atom,
+                                async_thr_copy,
+                            )
+                        else:
+                            self._zero_kv_row(tile_sK, local_tidx)
+                    else:
+                        self._zero_kv_row(tile_sK, local_tidx)
+                else:
+                    self._zero_kv_row(tile_sK, local_tidx)
 
     @cute.jit
     def reduce_dKV_from_reg(
