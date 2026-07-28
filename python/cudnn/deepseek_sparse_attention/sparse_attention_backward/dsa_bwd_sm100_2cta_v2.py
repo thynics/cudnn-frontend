@@ -12082,7 +12082,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 score_coordinates.shape,
                 self.element_dtype,
             )
-            landing_phase = Int32(0)
 
             for loop_iter in cutlass.range(tile_count):
                 pipe_s_done.consumer_wait(s_state)
@@ -12225,21 +12224,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             peer_rank,
                         )
 
-                # Do not publish a P/dS generation until both peer payloads
-                # have landed in their final CG2-B byte layout.
-                if mtx == Int32(0):
-                    _mbarrier_wait_acquire_cluster(
-                        landing_mbars,
-                        landing_phase,
-                    )
-                    _mbarrier_wait_acquire_cluster(
-                        landing_mbars + 1,
-                        landing_phase,
-                    )
+                # Publish local readiness after both DSM routes are issued.
+                # The dedicated relay warp owns remote-completion waiting,
+                # so math does not serialize on the peer landing here.
                 self.math_barrier.arrive_and_wait()
                 pipe_pds.producer_commit(pds_state)
                 pds_state.advance()
-                landing_phase = Int32(1) - landing_phase
             if tile_count > Int32(0):
                 pipe_pds.producer_tail(pds_state)
 
