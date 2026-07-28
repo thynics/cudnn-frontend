@@ -10957,8 +10957,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # One CTA contributes its resident H64 panel to a full N64 output.  Four
     # M128 rounds cover D512; two TMEM slots are recycled round-robin.
     DKV_CTA_GROUP_ONE = True
-    DKV_MMA_TILER = (D_TILE_CTA, N_TILE, H_TILE_CTA)
-    DKV_ROUNDS = D_HEAD // D_TILE_CTA
+    DKV_MMA_TILER = (
+        FlashAttentionDSABackwardSm100TwoCTA.D_TILE_CTA,
+        FlashAttentionDSABackwardSm100TwoCTA.N_TILE,
+        FlashAttentionDSABackwardSm100TwoCTA.H_TILE_CTA,
+    )
+    DKV_ROUNDS = (
+        FlashAttentionDSABackwardSm100TwoCTA.D_HEAD
+        // FlashAttentionDSABackwardSm100TwoCTA.D_TILE_CTA
+    )
 
     # 64-column-aligned TMEM map.  A CG1 M128xN64 dKV tile occupies the same
     # 64 columns as one old rank-local CG2 result, so the two slots stay put.
