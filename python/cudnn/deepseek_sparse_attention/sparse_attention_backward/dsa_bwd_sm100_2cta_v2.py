@@ -11232,8 +11232,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         mma = dkv_tiled_mma.with_()
         mma.set(tcgen05.Field.ACCUMULATE, accumulate)
-        for k_block in cutlass.range_constexpr(
-            cute.size(a_fragment, mode=[2])
+        for k_block in cutlass.range(
+            0,
+            cute.size(a_fragment, mode=[2]),
+            unroll=2,
         ):
             cute.gemm(
                 mma,
@@ -11269,8 +11271,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             mma = dq_tiled_mma.with_()
             mma.set(tcgen05.Field.ACCUMULATE, accumulate)
             if cutlass.const_expr(round_index == 0):
-                for k_block in cutlass.range_constexpr(
-                    cute.size(kd_fragment_a, mode=[2])
+                for k_block in cutlass.range(
+                    0,
+                    cute.size(kd_fragment_a, mode=[2]),
+                    unroll=2,
                 ):
                     cute.gemm(
                         mma,
@@ -11281,8 +11285,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
                     mma.set(tcgen05.Field.ACCUMULATE, True)
             else:
-                for k_block in cutlass.range_constexpr(
-                    cute.size(kd_fragment_b, mode=[2])
+                for k_block in cutlass.range(
+                    0,
+                    cute.size(kd_fragment_b, mode=[2]),
+                    unroll=2,
                 ):
                     cute.gemm(
                         mma,
@@ -12831,8 +12837,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         mma = tiled_mma.with_()
         mma.set(tcgen05.Field.ACCUMULATE, False)
         k_blocks_per_chunk = cute.size(a_fragment, mode=[2])
-        for flat_k_block in cutlass.range_constexpr(
-            self.K_CHUNKS * k_blocks_per_chunk
+        for flat_k_block in cutlass.range(
+            0,
+            self.K_CHUNKS * k_blocks_per_chunk,
+            unroll=4,
         ):
             chunk = flat_k_block // k_blocks_per_chunk
             k_block = flat_k_block % k_blocks_per_chunk
