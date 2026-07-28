@@ -845,17 +845,18 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         done_pipeline.producer_acquire(producer_state)
         mma = tiled_mma.with_()
         mma.set(tcgen05.Field.ACCUMULATE, False)
-        k_blocks_per_chunk = cute.size(a_fragment, mode=[2])
-        for flat_k_block in cutlass.range_constexpr(
-            self.K_CHUNKS * k_blocks_per_chunk
+        a_fragment_k = cute.group_modes(a_fragment, 2, 4)
+        b_fragment_k = cute.group_modes(b_fragment, 2, 4)
+        for k_block in cutlass.range(
+            0,
+            cute.size(a_fragment_k, mode=[2]),
+            unroll=4,
         ):
-            chunk = flat_k_block // k_blocks_per_chunk
-            k_block = flat_k_block % k_blocks_per_chunk
             cute.gemm(
                 mma,
                 accumulator,
-                a_fragment[None, None, k_block, chunk],
-                b_fragment[None, None, k_block, chunk],
+                a_fragment_k[None, None, k_block],
+                b_fragment_k[None, None, k_block],
                 accumulator,
             )
             mma.set(tcgen05.Field.ACCUMULATE, True)
