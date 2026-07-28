@@ -8447,6 +8447,108 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         )
 
     @cute.jit
+    def _decode_ctx_words_no_sync_v1(
+        self,
+        mTopkIdxs: cute.Tensor,
+        context: cute.Tensor,
+        token_idx: Int32,
+        batch_idx: Int32,
+        topk: Int32,
+        logical_tile: Int32,
+        issue_seq: Int32,
+    ) -> None:
+        """Decode one context with a single writer and no collective.
+
+        The logical-tile word is the publication tag and is written last.
+        The caller must publish the stores with an existing CTA/cluster
+        rendezvous before any warp tests the tag.
+        """
+
+        valid_lo = Int32(0)
+        valid_hi = Int32(0)
+        context[self.CTX_ISSUE_SEQ_WORD] = issue_seq
+        for logical_n in cutlass.range_constexpr(self.N_TILE):
+            topk_slot = (
+                logical_tile * Int32(self.N_TILE)
+                + Int32(logical_n)
+            )
+            kv_index = Int32(-1)
+            if topk_slot < topk:
+                kv_index = mTopkIdxs[
+                    topk_slot,
+                    (token_idx, batch_idx),
+                ]
+            context[
+                self.CTX_KV_BASE_WORD + logical_n
+            ] = kv_index
+            if kv_index >= Int32(0):
+                if cutlass.const_expr(logical_n < 32):
+                    valid_lo = (
+                        valid_lo
+                        | (
+                            Int32(1)
+                            << Int32(logical_n)
+                        )
+                    )
+                else:
+                    valid_hi = (
+                        valid_hi
+                        | (
+                            Int32(1)
+                            << Int32(logical_n - 32)
+                        )
+                    )
+        context[self.CTX_VALID_LO_WORD] = valid_lo
+        context[self.CTX_VALID_HI_WORD] = valid_hi
+        context[self.CTX_LOGICAL_TILE_WORD] = logical_tile
+
+    @cute.jit
+    def _prefetch_next_macro_ctx_v1(
+        self,
+        mTopkIdxs: cute.Tensor,
+        contexts: cute.Tensor,
+        token_idx: Int32,
+        batch_idx: Int32,
+        topk: Int32,
+        tile_count: Int32,
+        current_context_base: Int32,
+        current_ordinal_0: Int32,
+    ) -> None:
+        """Decode the next raw macro into the opposite TileCtx pair."""
+
+        next_ordinal_0 = current_ordinal_0 + Int32(2)
+        if next_ordinal_0 < tile_count:
+            next_context_base = Int32(2) - current_context_base
+            next_logical_tile_0 = (
+                tile_count - Int32(1) - next_ordinal_0
+            )
+            self._decode_ctx_words_no_sync_v1(
+                mTopkIdxs,
+                contexts[None, next_context_base],
+                token_idx,
+                batch_idx,
+                topk,
+                next_logical_tile_0,
+                next_ordinal_0,
+            )
+            if next_ordinal_0 + Int32(1) < tile_count:
+                next_logical_tile_1 = (
+                    tile_count - Int32(2) - next_ordinal_0
+                )
+                self._decode_ctx_words_no_sync_v1(
+                    mTopkIdxs,
+                    contexts[
+                        None,
+                        next_context_base + Int32(1),
+                    ],
+                    token_idx,
+                    batch_idx,
+                    topk,
+                    next_logical_tile_1,
+                    next_ordinal_0 + Int32(1),
+                )
+
+    @cute.jit
     def _load_k_from_ctx_v1(
         self,
         mKV: cute.Tensor,
@@ -10063,6 +10165,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         if tidx == Int32(0):
             cute.arch.mbarrier_init(source_mbars, 1)
             cute.arch.mbarrier_init(source_mbars + 1, 1)
+        if tidx < Int32(self.CONTEXT_STAGES):
+            contexts[
+                self.CTX_LOGICAL_TILE_WORD,
+                tidx,
+            ] = Int32(-1)
         self.main_barrier.arrive_and_wait()
 
         issued_count = Int32(0)
@@ -10077,19 +10184,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         ):
             ordinal_0 = macro_index * Int32(2)
             logical_tile_0 = Int32(tile_count - 1) - ordinal_0
-            context_0 = contexts[None, Int32(0)]
-            context_1 = contexts[None, Int32(1)]
-            active_0 = self._decode_ctx_v1(
-                mTopkIdxs,
-                context_0,
-                descriptor,
-                token_idx,
-                batch_idx,
-                topk,
-                logical_tile_0,
-                ordinal_0,
-                tidx,
+            context_base = (
+                (macro_index & Int32(1)) * Int32(2)
             )
+            context_0 = contexts[None, context_base]
+            context_1 = contexts[
+                None,
+                context_base + Int32(1),
+            ]
             active_1 = cutlass.Boolean(False)
             has_lane_1 = (
                 ordinal_0 + Int32(1) < Int32(tile_count)
@@ -10098,17 +10200,56 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                 logical_tile_1 = (
                     Int32(tile_count - 2) - ordinal_0
                 )
-                active_1 = self._decode_ctx_v1(
+            context_pair_ready = (
+                context_0[self.CTX_LOGICAL_TILE_WORD]
+                == logical_tile_0
+            )
+            if has_lane_1:
+                context_pair_ready = (
+                    context_pair_ready
+                    & (
+                        context_1[
+                            self.CTX_LOGICAL_TILE_WORD
+                        ]
+                        == logical_tile_1
+                    )
+                )
+
+            active_0 = cutlass.Boolean(False)
+            if context_pair_ready:
+                active_0 = (
+                    context_0[self.CTX_VALID_LO_WORD]
+                    | context_0[self.CTX_VALID_HI_WORD]
+                ) != Int32(0)
+                if has_lane_1:
+                    active_1 = (
+                        context_1[self.CTX_VALID_LO_WORD]
+                        | context_1[self.CTX_VALID_HI_WORD]
+                    ) != Int32(0)
+            else:
+                active_0 = self._decode_ctx_v1(
                     mTopkIdxs,
-                    context_1,
+                    context_0,
                     descriptor,
                     token_idx,
                     batch_idx,
                     topk,
-                    logical_tile_1,
-                    ordinal_0 + Int32(1),
+                    logical_tile_0,
+                    ordinal_0,
                     tidx,
                 )
+                if has_lane_1:
+                    active_1 = self._decode_ctx_v1(
+                        mTopkIdxs,
+                        context_1,
+                        descriptor,
+                        token_idx,
+                        batch_idx,
+                        topk,
+                        logical_tile_1,
+                        ordinal_0 + Int32(1),
+                        tidx,
+                    )
 
             macro_active = active_0 | active_1
             if active_0:
@@ -10117,9 +10258,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                 lane_b_count += Int32(1)
 
             # Compact issue sequence is independent of raw sparse ordinal.
-            # Slots 0/1 are safe to reuse in A0 because the entire macro is
-            # retired before the next decode; the role-specialized successor
-            # will rotate the same immutable records over TileCtx4.
+            # Raw contexts ping-pong over TileCtx4. The current macro is fully
+            # retired before its pair can be overwritten two macros later.
             if tidx == Int32(0):
                 compact_issue = issued_count
                 if active_0:
@@ -10327,6 +10467,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         )
                     )
                 # V1_SPAN_SDP_ISSUE_END
+                if tidx == Int32(self.KV_LOAD_THREAD_BEGIN):
+                    self._prefetch_next_macro_ctx_v1(
+                        mTopkIdxs,
+                        contexts,
+                        token_idx,
+                        batch_idx,
+                        topk,
+                        Int32(tile_count),
+                        context_base,
+                        ordinal_0,
+                    )
                 # V1_SPAN_MATH_P_BEGIN
                 # V1_SPAN_MATH_DS_BEGIN
                 done_consumer_state = (
@@ -10371,6 +10522,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         )
                     )
                 # V1_SPAN_SDP_ISSUE_END
+                if (
+                    not active_0
+                    and tidx
+                    == Int32(self.KV_LOAD_THREAD_BEGIN)
+                ):
+                    self._prefetch_next_macro_ctx_v1(
+                        mTopkIdxs,
+                        contexts,
+                        token_idx,
+                        batch_idx,
+                        topk,
+                        Int32(tile_count),
+                        context_base,
+                        ordinal_0,
+                    )
                 # V1_SPAN_MATH_P_BEGIN
                 # V1_SPAN_MATH_DS_BEGIN
                 done_consumer_state = (
