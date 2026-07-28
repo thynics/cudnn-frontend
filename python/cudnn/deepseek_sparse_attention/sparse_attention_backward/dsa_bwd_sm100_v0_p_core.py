@@ -2209,7 +2209,10 @@ class FlashAttentionDSABackwardSm100:
             rdKV0 = self.t2r_dKV(tdKVtdKV0)
             rdKV1 = self.t2r_dKV(tdKVtdKV1)
             cute.arch.fence_view_async_tmem_load()
-            self.t2r_dKV01_done_barrier.arrive_and_wait()
+            # The MMA warp owns the wait side of this WAR handoff.  Once the
+            # fenced T2R reads have arrived, reducers can drain their
+            # register fragments while MMA waits before reusing the columns.
+            self.t2r_dKV01_done_barrier.arrive()
             self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
             self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
 
@@ -2224,7 +2227,7 @@ class FlashAttentionDSABackwardSm100:
                 # T2R dKV4, then signal MMA that TMEM is free for dKV2/dKV3
                 rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
                 cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV4_done_barrier.arrive_and_wait()
+                self.t2r_dKV4_done_barrier.arrive()
                 self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
 
                 mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
@@ -2238,7 +2241,7 @@ class FlashAttentionDSABackwardSm100:
                 rdKV2 = self.t2r_dKV(tdKVtdKV2)
                 rdKV3 = self.t2r_dKV(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV4_done_barrier.arrive_and_wait()
+                self.t2r_dKV4_done_barrier.arrive()
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             else:
@@ -2251,7 +2254,7 @@ class FlashAttentionDSABackwardSm100:
                 rdKV2 = self.t2r_dKV(tdKVtdKV2)
                 rdKV3 = self.t2r_dKV(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV23_done_barrier.arrive_and_wait()
+                self.t2r_dKV23_done_barrier.arrive()
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
 
