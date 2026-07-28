@@ -33,6 +33,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.typing import BFloat16, Float32, Int32
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
+from ..utils.copy import cpasync_reduce_bulk_add_f32
 
 
 @dsl_user_op
@@ -10980,6 +10981,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             barrier_id=2,
             num_threads=self.THREADS_PER_CTA,
         )
+        self.reduce_barrier = pipeline.NamedBarrier(
+            barrier_id=4,
+            num_threads=self.REDUCE_THREADS,
+        )
 
     def _specialize_shared_storage(
         self,
@@ -11011,6 +11016,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         @cute.struct
         class SharedStorageV2:
+            # Packing stats with the control words recovers the final aligned
+            # 1-KiB block for the chunked bulk-reduction staging area.
+            stats: cute.struct.MemRange[Float32, 128]
             # Pipeline barrier arrays (full+empty per stage).
             s_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
@@ -11069,12 +11077,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.struct.MemRange[element_dtype, 2048],
                 1024,
             ]
-            stats: cute.struct.Align[
-                cute.struct.MemRange[Float32, 128],
-                1024,
+            dkv_reduce_scratch: cute.struct.Align[
+                cute.struct.MemRange[Float32, 8 * 64],
+                128,
             ]
 
-        assert SharedStorageV2.size_in_bytes() <= self.MAX_SMEM_BYTES
+        assert SharedStorageV2.size_in_bytes() == self.MAX_SMEM_BYTES
         return SharedStorageV2
 
     # ------------------------------------------------------------------
@@ -11591,6 +11599,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 (self.H_TILE_CTA, 2),
                 stride=(1, self.H_TILE_CTA),
             )
+        )
+        dkv_reduce_scratch = storage.dkv_reduce_scratch.get_tensor(
+            cute.make_layout((8, 64), stride=(64, 1))
         )
 
         # ------------------------------------------------------------------
@@ -12384,6 +12395,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         token_idx,
                         batch_idx,
                         rtx,
+                        dkv_reduce_scratch,
                         pipe_dkv_done,
                         dkv_state,
                     )
@@ -12946,16 +12958,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         token_idx: Int32,
         batch_idx: Int32,
         rtx: Int32,
+        dkv_reduce_scratch: cute.Tensor,
         done_pipeline,
         consumer_state: pipeline.PipelineState,
     ) -> pipeline.PipelineState:
-        """Drain one rank-owned dKV slot: T2R, release, vector atomics.
+        """Drain one rank-owned dKV slot through chunked bulk reductions.
 
         Adapted from the verified v1 reducer: two warp groups share the
         ROW_MAJOR rows, the butterfly-shuffle network rebuilds contiguous
-        FP32x4 D vectors, and each CTA covers only its own D quarters so
-        the pair issues exactly half the baseline's atomic traffic with
-        disjoint addresses.  KV indices are re-read from GMEM (L2-hot).
+        FP32x4 D vectors, and each CTA covers only its own D quarters.  The
+        vectors are staged as eight D64 rows, then reduced to GMEM with
+        256-byte cp.reduce.async.bulk operations.
         """
 
         done_pipeline.consumer_wait(consumer_state)
@@ -12988,6 +13001,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         assert cute.size(thread_values) == self.N_TILE // 2
         lane_in_quad = rtx % Int32(4)
+        scratch_row = wg_idx * Int32(4) + lane_in_quad
         tile_base = tile_index * Int32(self.N_TILE)
         for vector_index in cutlass.range_constexpr(
             self.N_TILE // 8
@@ -13064,37 +13078,73 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             d_in_round = Int32(
                 cute.get(logical_coordinate, mode=[0])
             )
+            d_base = d_in_round - lane_in_quad
+            local_d = d_base % Int32(self.D_TILE_CTA)
+            cta_d_base = (
+                d_base // Int32(self.D_TILE_CTA)
+            ) * Int32(self.D_TILE_CTA)
             n_index = (
                 Int32(
                     cute.get(logical_coordinate, mode=[1])
                 )
                 + lane_in_quad
             )
-            global_n = tile_base + n_index
-            kv_index = Int32(-1)
-            if global_n < topk:
-                kv_index = mTopkIdxs[
-                    global_n,
-                    (token_idx, batch_idx),
-                ]
-            if kv_index >= Int32(0):
-                d_index = (
-                    Int32(round_index * self.D_TILE_CLUSTER)
-                    + d_in_round
-                    - lane_in_quad
+
+            for d_half in cutlass.range_constexpr(2):
+                if local_d // Int32(64) == Int32(d_half):
+                    scratch_col = local_d % Int32(64)
+                    dkv_reduce_scratch[
+                        scratch_row, scratch_col
+                    ] = vector_0
+                    dkv_reduce_scratch[
+                        scratch_row, scratch_col + Int32(1)
+                    ] = vector_1
+                    dkv_reduce_scratch[
+                        scratch_row, scratch_col + Int32(2)
+                    ] = vector_2
+                    dkv_reduce_scratch[
+                        scratch_row, scratch_col + Int32(3)
+                    ] = vector_3
+
+                cute.arch.fence_view_async_shared()
+                self.reduce_barrier.arrive_and_wait()
+
+                if dp_idx < Int32(4):
+                    global_n = tile_base + n_index
+                    kv_index = Int32(-1)
+                    if global_n < topk:
+                        kv_index = mTopkIdxs[
+                            global_n,
+                            (token_idx, batch_idx),
+                        ]
+                    if kv_index >= Int32(0):
+                        d_index = (
+                            Int32(
+                                round_index
+                                * self.D_TILE_CLUSTER
+                            )
+                            + cta_d_base
+                            + Int32(d_half * 64)
+                        )
+                        destination_ptr = (
+                            mdKV_acc.iterator
+                            + d_index * mdKV_acc.stride[0]
+                            + kv_index * mdKV_acc.stride[1]
+                        )
+                        cpasync_reduce_bulk_add_f32(
+                            dkv_reduce_scratch[
+                                scratch_row, None
+                            ].iterator,
+                            destination_ptr,
+                            64 * (Float32.width // 8),
+                        )
+
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(
+                    0,
+                    read=True,
                 )
-                destination_ptr = (
-                    mdKV_acc.iterator
-                    + d_index * mdKV_acc.stride[0]
-                    + kv_index * mdKV_acc.stride[1]
-                )
-                _atomic_add_fp32x4_v1(
-                    vector_0,
-                    vector_1,
-                    vector_2,
-                    vector_3,
-                    destination_ptr,
-                )
+                self.reduce_barrier.arrive_and_wait()
         return consumer_state
 
 
