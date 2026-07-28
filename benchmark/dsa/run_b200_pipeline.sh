@@ -4,7 +4,7 @@ set -Eeuo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./benchmark/dsa/run_b200_pipeline.sh --impl v0|v1
+  ./benchmark/dsa/run_b200_pipeline.sh --impl v0|v1|vNAME
       [--note SHORT_SLUG] [--output-dir PATH]
 
 One-click DSA backward validation on B200:
@@ -34,7 +34,7 @@ while (($#)); do
   case "$1" in
     --impl)
       [[ $# -ge 2 ]] || {
-        echo "ERROR: --impl requires v0 or v1" >&2
+        echo "ERROR: --impl requires a registered v... implementation" >&2
         exit 2
       }
       implementation="${2,,}"
@@ -68,14 +68,13 @@ while (($#)); do
   esac
 done
 
-case "${implementation}" in
-  v0|v1) ;;
-  *)
-    echo "ERROR: --impl must be v0 or v1" >&2
-    usage >&2
-    exit 2
-    ;;
-esac
+if [[ ! "${implementation}" =~ ^v[a-z0-9_]{1,31}$ ]]; then
+  echo \
+    "ERROR: --impl must match v[a-z0-9_]{1,31}: ${implementation}" \
+    >&2
+  usage >&2
+  exit 2
+fi
 if [[ -z "${note}" ]]; then
   note="${implementation}"
 fi
@@ -88,12 +87,52 @@ if [[ ! "${frontend}" =~ ^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
   exit 2
 fi
 
-for executable in ssh scp mktemp awk tee; do
+for executable in git ssh scp mktemp awk tee; do
   command -v -- "${executable}" >/dev/null 2>&1 || {
     echo "ERROR: required executable is missing: ${executable}" >&2
     exit 2
   }
 done
+
+package_rel="python/cudnn/deepseek_sparse_attention/sparse_attention_backward"
+candidate_rel="${package_rel}/dsa_bwd_sm100_2cta_${implementation}.py"
+candidate_path="${repo_root}/${candidate_rel}"
+if [[ ! -f "${candidate_path}" ]]; then
+  echo \
+    "ERROR: implementation is not registered: ${candidate_rel}" \
+    >&2
+  echo \
+    "Create it with: python3 skills/fork-dsa-v1-variant/scripts/fork_v1_variant.py ${implementation}" \
+    >&2
+  exit 2
+fi
+if ! git -C "${repo_root}" ls-files --error-unmatch -- "${candidate_rel}" \
+  >/dev/null 2>&1; then
+  echo \
+    "ERROR: implementation must be committed before B200 validation: ${candidate_rel}" \
+    >&2
+  exit 2
+fi
+if ! git -C "${repo_root}" diff --quiet HEAD -- "${candidate_rel}"; then
+  echo \
+    "ERROR: implementation has uncommitted changes: ${candidate_rel}" \
+    >&2
+  exit 2
+fi
+local_revision="$(git -C "${repo_root}" rev-parse HEAD)"
+upstream_revision="$(
+  git -C "${repo_root}" rev-parse '@{upstream}' 2>/dev/null || true
+)"
+if [[ -z "${upstream_revision}" ]] ||
+  [[ "${local_revision}" != "${upstream_revision}" ]]; then
+  echo \
+    "ERROR: repository HEAD must be pushed to its upstream before B200 validation" \
+    >&2
+  echo \
+    "local=${local_revision} upstream=${upstream_revision:-missing}" \
+    >&2
+  exit 2
+fi
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)_${note}_${implementation}"
 

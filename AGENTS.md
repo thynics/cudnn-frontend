@@ -90,12 +90,21 @@ Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.cl
 - `skills/cutedsl-kernel-integration/` — integrating a CuTeDSL kernel as a frontend-only Python API end to end (API class, wrapper, exports, docs, tests).
 - `skills/validate-dsa-b200/` — mandatory one-command B200 correctness,
   release-performance, baseline/candidate IKET, and span-table validation
-  after changing the SM100 DSA backward baseline, v0, or v1 implementation.
+  after changing a registered SM100 DSA backward v0, v1, or v... experiment.
+- `skills/fork-dsa-v1-variant/` — create an exact, isolated, user-named copy
+  of the current SM100 DSA backward v1 before experimental development.
 
 After completing any SM100 DSA backward implementation change, the agent must
-read `skills/validate-dsa-b200/SKILL.md` and invoke its repository command
-directly. Do not replace it with manual source synchronization, allocation,
-Docker, correctness, benchmark, trace, or aggregation commands.
+read `skills/validate-dsa-b200/SKILL.md` and invoke its repository command with
+the exact implementation token. Do not replace it with manual source
+synchronization, allocation, Docker, correctness, benchmark, trace, or
+aggregation commands, and do not copy an experiment over v1 merely to test it.
+
+When a user asks to explore a named `v...` candidate from current v1, read
+`skills/fork-dsa-v1-variant/SKILL.md` before touching kernel code. Create the
+candidate with its bundled script, then keep all experimental changes in that
+copy. The untouched byte-identical fork is setup and does not itself require a
+B200 run.
 
 ## Links
 
