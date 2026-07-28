@@ -130,13 +130,20 @@ lightweight_remote="$(
   tr -d '\r' <"${local_log}" |
     awk '$1 == "LIGHTWEIGHT_RESULT" {value=$2} END {print value}'
 )"
+download_rc=0
 if [[ -n "${lightweight_remote}" ]]; then
   mkdir -p -- "${output_dir}"
-  scp -q -r -o BatchMode=yes \
+  if scp -q -r -o BatchMode=yes \
     "${frontend}:${lightweight_remote}/." \
-    "${output_dir}/"
-  install -m 644 -- "${local_log}" "${output_dir}/client.log"
-  echo "DSA_LIGHTWEIGHT_RESULT ${output_dir}"
+    "${output_dir}/"; then
+    install -m 644 -- "${local_log}" "${output_dir}/client.log"
+    echo "DSA_LIGHTWEIGHT_RESULT ${output_dir}"
+  else
+    download_rc=$?
+    echo \
+      "ERROR: failed to download lightweight result: ${lightweight_remote}" \
+      >&2
+  fi
 fi
 
 if ((remote_rc != 0)); then
@@ -161,6 +168,9 @@ if ((remote_rc != 0)); then
     echo "No remote lightweight result was produced; inspect the streamed log above." >&2
   fi
   exit "${remote_rc}"
+fi
+if ((download_rc != 0)); then
+  exit "${download_rc}"
 fi
 
 tables="${output_dir}/two_trace_tables.md"
