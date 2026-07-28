@@ -1,0 +1,674 @@
+{
+  "aggregate": "role_aggregated_h128_i1_i3.chrome.json",
+  "artifacts": {
+    "2cta": {
+      "decoded_json": "traces/2cta/iket/pid_0x2d5/iket.decoded_results.json",
+      "perfetto": "traces/2cta/iket_pid_0x2d5.pftrace"
+    },
+    "baseline": {
+      "decoded_json": "traces/baseline/iket/pid_0x26a/iket.decoded_results.json",
+      "perfetto": "traces/baseline/iket_pid_0x26a.pftrace"
+    }
+  },
+  "inputs": [
+    {
+      "capture_validation": {
+        "captured_ctas": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            1,
+            0
+          ]
+        ],
+        "cross_warp_range_count": 0,
+        "cta_lifetime_overlap_us": 154.08,
+        "cta_start_skew_us": 0.0,
+        "grid": [
+          1,
+          2,
+          1
+        ],
+        "malformed_range_count": 0,
+        "payload_mismatch_count": 0,
+        "per_cta_lifetimes": [
+          {
+            "cta": [
+              0,
+              0,
+              0
+            ],
+            "lifetime_envelope_us": 154.464,
+            "sm_ids": [
+              142
+            ],
+            "start_offset_us": 0.0,
+            "start_spread_us": 0.0,
+            "warp_count": 20
+          },
+          {
+            "cta": [
+              0,
+              1,
+              0
+            ],
+            "lifetime_envelope_us": 154.08,
+            "sm_ids": [
+              144
+            ],
+            "start_offset_us": 0.0,
+            "start_spread_us": 0.032,
+            "warp_count": 20
+          }
+        ],
+        "require_h128_standard": true,
+        "single_cluster_active": 0,
+        "warp_lifetime_count": 40,
+        "work_unit": "H128 / 2xH64 CTA"
+      },
+      "collapsed_ranges": 46,
+      "cycle_count": 3,
+      "cycle_start": 0,
+      "decoded_source": "traces/baseline/iket/pid_0x26a/iket.decoded_results.json",
+      "discarded_outside_display_i": {
+        "P(tile)": 232,
+        "REDUCE_dKV(tile,part)": 928,
+        "S_dP(tile)": 58,
+        "WAIT_KV(tile)": 58,
+        "WAIT_P(tile)": 58,
+        "WAIT_S(tile)": 232,
+        "WAIT_dKV(tile,part)": 928,
+        "WAIT_dP(tile)": 232,
+        "WAIT_dS(tile)": 58,
+        "dQ_epilogue": 8,
+        "dS(tile)": 232,
+        "dV_dK_dQ(tile)": 58,
+        "load_KV(tile)": 232
+      },
+      "discarded_payload_mismatch": {},
+      "discarded_unmarked": {},
+      "display_i_end": 3,
+      "display_i_start": 1,
+      "f_load_wait_order": [
+        {
+          "consumer_wait_end_us": 2.176,
+          "cta": [
+            0,
+            0,
+            0
+          ],
+          "i": 1,
+          "issue_after_wait": true,
+          "issue_seq": 0,
+          "issue_start_minus_wait_end_us": 0.0,
+          "load_scope_end_us": 2.112,
+          "order_tolerance_us": 0.032,
+          "ordered": true,
+          "physical_tile": 31,
+          "sdp_issue_start_us": 2.176,
+          "strictly_ordered": true,
+          "wait_end_minus_load_end_us": 0.064
+        },
+        {
+          "consumer_wait_end_us": 1.952,
+          "cta": [
+            0,
+            1,
+            0
+          ],
+          "i": 1,
+          "issue_after_wait": true,
+          "issue_seq": 0,
+          "issue_start_minus_wait_end_us": 0.0,
+          "load_scope_end_us": 1.888,
+          "order_tolerance_us": 0.032,
+          "ordered": true,
+          "physical_tile": 31,
+          "sdp_issue_start_us": 1.952,
+          "strictly_ordered": true,
+          "wait_end_minus_load_end_us": 0.064
+        },
+        {
+          "consumer_wait_end_us": 5.856,
+          "cta": [
+            0,
+            0,
+            0
+          ],
+          "i": 2,
+          "issue_after_wait": true,
+          "issue_seq": 1,
+          "issue_start_minus_wait_end_us": 0.128,
+          "load_scope_end_us": 5.824,
+          "order_tolerance_us": 0.032,
+          "ordered": true,
+          "physical_tile": 30,
+          "sdp_issue_start_us": 5.984,
+          "strictly_ordered": true,
+          "wait_end_minus_load_end_us": 0.032
+        },
+        {
+          "consumer_wait_end_us": 5.696,
+          "cta": [
+            0,
+            1,
+            0
+          ],
+          "i": 2,
+          "issue_after_wait": true,
+          "issue_seq": 1,
+          "issue_start_minus_wait_end_us": 0.096,
+          "load_scope_end_us": 5.664,
+          "order_tolerance_us": 0.032,
+          "ordered": true,
+          "physical_tile": 30,
+          "sdp_issue_start_us": 5.792,
+          "strictly_ordered": true,
+          "wait_end_minus_load_end_us": 0.032
+        },
+        {
+          "consumer_wait_end_us": 10.4,
+          "cta": [
+            0,
+            0,
+            0
+          ],
+          "i": 3,
+          "issue_after_wait": true,
+          "issue_seq": 2,
+          "issue_start_minus_wait_end_us": 0.032,
+          "load_scope_end_us": 9.696,
+          "order_tolerance_us": 0.032,
+          "ordered": true,
+          "physical_tile": 29,
+          "sdp_issue_start_us": 10.432,
+          "strictly_ordered": true,
+          "wait_end_minus_load_end_us": 0.704
+        },
+        {
+          "consumer_wait_end_us": 10.144,
+          "cta": [
+            0,
+            1,
+            0
+          ],
+          "i": 3,
+          "issue_after_wait": true,
+          "issue_seq": 2,
+          "issue_start_minus_wait_end_us": 0.16,
+          "load_scope_end_us": 9.6,
+          "order_tolerance_us": 0.032,
+          "ordered": true,
+          "physical_tile": 29,
+          "sdp_issue_start_us": 10.304,
+          "strictly_ordered": true,
+          "wait_end_minus_load_end_us": 0.544
+        }
+      ],
+      "implementation": "baseline",
+      "input_ranges_in_window": 356,
+      "macro_atomic_overlap": null,
+      "nominal_next_cycle_anchor_us": 15.072,
+      "sdp_issue_derivation": [],
+      "selection_semantics": "Only events belonging to the selected i range are retained; their trailing work is kept through completion. Unindexed startup events are retained only before the next-cycle anchor.",
+      "startup_from_empty": true,
+      "tile_timing_semantics": "completion_us is the last annotated REDUCE range end for the selected H128 tile. It is a software trace boundary, not atomic retire, GMEM visibility, or strict stage recycle completion.",
+      "tile_timings": [
+        {
+          "complete": true,
+          "completion_us": 9.408,
+          "i": 1,
+          "inflight_latency_us": 8.416,
+          "load_start_us": 0.992
+        },
+        {
+          "complete": true,
+          "completion_cadence_us": 4.512,
+          "completion_us": 13.92,
+          "i": 2,
+          "inflight_latency_us": 11.104,
+          "load_start_us": 2.816
+        },
+        {
+          "complete": true,
+          "completion_cadence_us": 4.608,
+          "completion_us": 18.528,
+          "i": 3,
+          "inflight_latency_us": 12.096,
+          "load_start_us": 6.432
+        }
+      ],
+      "v2_native_provenance": null,
+      "window_us": 18.528
+    },
+    {
+      "capture_validation": {
+        "captured_ctas": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            1,
+            0,
+            0
+          ]
+        ],
+        "cross_warp_range_count": 0,
+        "cta_lifetime_overlap_us": 444.64,
+        "cta_start_skew_us": 0.0,
+        "grid": [
+          2,
+          1,
+          1
+        ],
+        "malformed_range_count": 0,
+        "payload_mismatch_count": 0,
+        "per_cta_lifetimes": [
+          {
+            "cta": [
+              0,
+              0,
+              0
+            ],
+            "lifetime_envelope_us": 444.64,
+            "sm_ids": [
+              142
+            ],
+            "start_offset_us": 0.0,
+            "start_spread_us": 0.0,
+            "warp_count": 20
+          },
+          {
+            "cta": [
+              1,
+              0,
+              0
+            ],
+            "lifetime_envelope_us": 444.64,
+            "sm_ids": [
+              143
+            ],
+            "start_offset_us": 0.0,
+            "start_spread_us": 0.0,
+            "warp_count": 20
+          }
+        ],
+        "require_h128_standard": true,
+        "role_partition": [
+          {
+            "cta": [
+              0,
+              0,
+              0
+            ],
+            "role_warp_ids": {
+              "KV_LOAD": [
+                0,
+                1,
+                2,
+                3,
+                17
+              ],
+              "MATH": [
+                4,
+                5,
+                6,
+                7
+              ],
+              "MMA": [
+                16
+              ],
+              "REDUCE": [
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ]
+            },
+            "unmarked_warp_ids": [
+              18,
+              19
+            ]
+          },
+          {
+            "cta": [
+              1,
+              0,
+              0
+            ],
+            "role_warp_ids": {
+              "KV_LOAD": [
+                0,
+                1,
+                2,
+                3,
+                17
+              ],
+              "MATH": [
+                4,
+                5,
+                6,
+                7
+              ],
+              "REDUCE": [
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ]
+            },
+            "unmarked_warp_ids": [
+              16,
+              18,
+              19
+            ]
+          }
+        ],
+        "single_cluster_active": 0,
+        "v2_native_provenance": {
+          "marker": "V2_NATIVE_PROVENANCE",
+          "markers": [
+            {
+              "cta": [
+                0,
+                0,
+                0
+              ],
+              "payload": 0,
+              "payload_validation": "matched_cta_rank",
+              "warp_id": 16
+            },
+            {
+              "cta": [
+                1,
+                0,
+                0
+              ],
+              "payload": 1,
+              "payload_validation": "matched_cta_rank",
+              "warp_id": 16
+            }
+          ],
+          "proven": true,
+          "requirements": "warp16 in CTA0/CTA1; payload equals CTA rank when the decoder retains marker payloads; source-native 20-warp role layout",
+          "role_partition": [
+            {
+              "cta": [
+                0,
+                0,
+                0
+              ],
+              "role_warp_ids": {
+                "KV_LOAD": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  17
+                ],
+                "MATH": [
+                  4,
+                  5,
+                  6,
+                  7
+                ],
+                "MMA": [
+                  16
+                ],
+                "REDUCE": [
+                  8,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13,
+                  14,
+                  15
+                ]
+              },
+              "unmarked_warp_ids": [
+                18,
+                19
+              ]
+            },
+            {
+              "cta": [
+                1,
+                0,
+                0
+              ],
+              "role_warp_ids": {
+                "KV_LOAD": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  17
+                ],
+                "MATH": [
+                  4,
+                  5,
+                  6,
+                  7
+                ],
+                "REDUCE": [
+                  8,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13,
+                  14,
+                  15
+                ]
+              },
+              "unmarked_warp_ids": [
+                16,
+                18,
+                19
+              ]
+            }
+          ]
+        },
+        "warp_lifetime_count": 40,
+        "work_unit": "H128 / one source-native V2 2-CTA cluster"
+      },
+      "collapsed_ranges": 110,
+      "cycle_count": 3,
+      "cycle_start": 0,
+      "decoded_source": "traces/2cta/iket/pid_0x2d5/iket.decoded_results.json",
+      "discarded_outside_display_i": {
+        "DQ_EPI(r)": 16,
+        "LOAD_K(i)": 232,
+        "MATH_PD(i,phase)": 464,
+        "MAT_QDO(m,r)": 116,
+        "REDUCE_ATOMIC(i,r)": 928,
+        "REDUCE_T2R(i,r)": 928,
+        "ROUTE_K(i)": 58,
+        "ROUTE_P(i)": 58,
+        "ROUTE_dS(i)": 58,
+        "S_ACQUIRE(i)": 29,
+        "S_ISSUE(i)": 29,
+        "S_PUBLISH(i)": 29,
+        "T2R_S(i)": 232,
+        "T2R_dP(i)": 232,
+        "TAIL": 1,
+        "WAIT_S(i)": 232,
+        "WAIT_dK(i,r)": 928,
+        "WAIT_dP(i)": 232,
+        "WAIT_dQ(i,r)": 58,
+        "dP_ACQUIRE(i)": 29,
+        "dP_ISSUE(i)": 29,
+        "dP_PUBLISH(i)": 29,
+        "dQ_ISSUE(i,r)": 58,
+        "dVdK_ISSUE(i,r,p)": 232
+      },
+      "discarded_payload_mismatch": {},
+      "discarded_unmarked": {},
+      "display_i_end": 3,
+      "display_i_start": 1,
+      "f_load_wait_order": [],
+      "implementation": "2cta",
+      "input_ranges_in_window": 544,
+      "macro_atomic_overlap": null,
+      "nominal_next_cycle_anchor_us": 50.752,
+      "sdp_issue_derivation": [],
+      "selection_semantics": "Only events belonging to the selected i range are retained; their trailing work is kept through completion. Unindexed startup events are retained only before the next-cycle anchor.",
+      "startup_from_empty": true,
+      "tile_timing_semantics": "completion_us is the last annotated REDUCE range end for the selected H128 tile. It is a software trace boundary, not atomic retire, GMEM visibility, or strict stage recycle completion.",
+      "tile_timings": [
+        {
+          "complete": true,
+          "completion_us": 41.6,
+          "i": 1,
+          "inflight_latency_us": 41.536,
+          "load_start_us": 0.064
+        },
+        {
+          "complete": true,
+          "completion_cadence_us": 11.936,
+          "completion_us": 53.536,
+          "i": 2,
+          "inflight_latency_us": 52.512,
+          "load_start_us": 1.024
+        },
+        {
+          "complete": true,
+          "completion_cadence_us": 12.448,
+          "completion_us": 65.984,
+          "i": 3,
+          "inflight_latency_us": 39.744,
+          "load_start_us": 26.24
+        }
+      ],
+      "trace_variant": "v2native",
+      "v2_native_provenance": {
+        "marker": "V2_NATIVE_PROVENANCE",
+        "markers": [
+          {
+            "cta": [
+              0,
+              0,
+              0
+            ],
+            "payload": 0,
+            "payload_validation": "matched_cta_rank",
+            "warp_id": 16
+          },
+          {
+            "cta": [
+              1,
+              0,
+              0
+            ],
+            "payload": 1,
+            "payload_validation": "matched_cta_rank",
+            "warp_id": 16
+          }
+        ],
+        "proven": true,
+        "requirements": "warp16 in CTA0/CTA1; payload equals CTA rank when the decoder retains marker payloads; source-native 20-warp role layout",
+        "role_partition": [
+          {
+            "cta": [
+              0,
+              0,
+              0
+            ],
+            "role_warp_ids": {
+              "KV_LOAD": [
+                0,
+                1,
+                2,
+                3,
+                17
+              ],
+              "MATH": [
+                4,
+                5,
+                6,
+                7
+              ],
+              "MMA": [
+                16
+              ],
+              "REDUCE": [
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ]
+            },
+            "unmarked_warp_ids": [
+              18,
+              19
+            ]
+          },
+          {
+            "cta": [
+              1,
+              0,
+              0
+            ],
+            "role_warp_ids": {
+              "KV_LOAD": [
+                0,
+                1,
+                2,
+                3,
+                17
+              ],
+              "MATH": [
+                4,
+                5,
+                6,
+                7
+              ],
+              "REDUCE": [
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ]
+            },
+            "unmarked_warp_ids": [
+              16,
+              18,
+              19
+            ]
+          }
+        ]
+      },
+      "window_us": 65.984
+    }
+  ],
+  "selection": "empty-pipeline i=1..3 with complete annotated tails",
+  "semantics": "Each slice is the min(start)..max(end) envelope of ranges with the same role, aligned name, and payload. IKET timestamps are software annotation arrival times, not async completion times. When present, 2cta SDP_ISSUE(i,k) slices are explicitly marked as derived software issue intervals in their args. Tile completion_us is the last annotated REDUCE range end, not atomic retire, GMEM visibility, or strict stage recycle completion.",
+  "shared_svg": "role_aggregated_h128_i1_i3.shared.svg",
+  "status": "pass",
+  "svg": "role_aggregated_h128_i1_i3.svg",
+  "timeline": "role_aggregated_h128_i1_i3.timeline.json",
+  "validated_at": "2026-07-28T23:54:20.235417+00:00"
+}
