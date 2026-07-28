@@ -1,0 +1,4 @@
+interface:
+  display_name: "Validate DSA on B200"
+  short_description: "Run the mandatory one-click DSA B200 validation"
+  default_prompt: "Use $validate-dsa-b200 to validate the completed DSA implementation on B200."

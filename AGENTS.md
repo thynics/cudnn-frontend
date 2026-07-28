@@ -88,6 +88,14 @@ First invocation builds the hook environments and can take >5 minutes; later run
 Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
 
 - `skills/cutedsl-kernel-integration/` — integrating a CuTeDSL kernel as a frontend-only Python API end to end (API class, wrapper, exports, docs, tests).
+- `skills/validate-dsa-b200/` — mandatory one-command B200 correctness,
+  release-performance, baseline/candidate IKET, and span-table validation
+  after changing the SM100 DSA backward baseline, v0, or v1 implementation.
+
+After completing any SM100 DSA backward implementation change, the agent must
+read `skills/validate-dsa-b200/SKILL.md` and invoke its repository command
+directly. Do not replace it with manual source synchronization, allocation,
+Docker, correctness, benchmark, trace, or aggregation commands.
 
 ## Links
 
