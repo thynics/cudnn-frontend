@@ -1,12 +1,14 @@
-"""CG1 baseline-core reset for the experimental SM100 DSA backward v0_p.
+"""Safe CG1 baseline-core reset for the experimental SM100 DSA backward v0_p.
 
 The H128 work unit is launched as two independent H64 CTAs by the canonical
 backward kernel.  All MMA, TMA, shared-memory, and TMEM ownership stays
 CTA-local; dKV keeps the canonical FP32 atomic accumulation contract.
 
-Unlike the historical v2 adapter, release and IKET builds select this exact
-same class.  The sentinel below lets the trace harness select the matching
-baseline event schema without substituting a different kernel.
+The private core retains the post-6c577ac TMEM WAR and
+read-before-deallocation ordering fixes that were accidentally rolled back
+from the shared development source, while preserving the current FP32
+sum-OdO math.  Release and IKET builds select this exact same class; neither
+build substitutes a different kernel.
 """
 
 from typing import Optional, Tuple
@@ -17,10 +19,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32
 
-from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
+from .dsa_bwd_sm100_v0_p_core import FlashAttentionDSABackwardSm100
 
 
 V0_P_CG1_BASELINE_CORE = True
+V0_P_SAFE_CG1_CORE = True
 
 
 class FlashAttentionDSABackwardSm100TwoCTAV0(
