@@ -10133,25 +10133,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         t_do_smem[None, 0],
                         tma_bar_ptr=source_mbars + 1,
                     )
-                # V1_SPAN_LOAD_QDO_END
-
-                # V1_SPAN_LOAD_STATS_BEGIN
-                if warp_idx == Int32(0):
-                    cute.copy(
-                        stats_copy_atom,
-                        t_g_scaled_lse[None, 0],
-                        t_s_scaled_lse[None, 0],
-                    )
-                    cute.copy(
-                        stats_copy_atom,
-                        t_g_sum_odo[None, 0],
-                        t_s_sum_odo[None, 0],
-                    )
-                    cute.arch.cp_async_commit_group()
-                # V1_SPAN_LOAD_STATS_END
-
-                if warp_idx == Int32(0):
-                    cute.arch.cp_async_wait_group(0)
                     cute.arch.mbarrier_wait(
                         source_mbars,
                         Int32(0),
@@ -10164,6 +10145,26 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                 self.main_barrier.arrive_and_wait()
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
+                # V1_SPAN_LOAD_QDO_END
+
+                # V1_SPAN_LOAD_STATS_BEGIN
+                if tidx < Int32(self.H_TILE_CTA):
+                    if warp_idx == Int32(0):
+                        cute.copy(
+                            stats_copy_atom,
+                            t_g_scaled_lse[None, 0],
+                            t_s_scaled_lse[None, 0],
+                        )
+                        cute.copy(
+                            stats_copy_atom,
+                            t_g_sum_odo[None, 0],
+                            t_s_sum_odo[None, 0],
+                        )
+                        cute.arch.cp_async_commit_group()
+                        cute.arch.cp_async_wait_group(0)
+                cute.arch.fence_view_async_shared()
+                self.main_barrier.arrive_and_wait()
+                # V1_SPAN_LOAD_STATS_END
                 stationary_loaded = Int32(1)
 
             # V1_SPAN_LOAD_K_BEGIN
