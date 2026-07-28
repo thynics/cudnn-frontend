@@ -365,11 +365,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
 
         cg2 = tcgen05.CtaGroup.TWO
         score_tiler = (self.H_TILE_CLUSTER, self.N_TILE, self.K_CHUNK)
-        sdp_tiler = (
-            2 * self.H_TILE_CLUSTER,
-            self.N_TILE,
-            self.K_CHUNK,
-        )
         dkv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
             self.element_dtype,
@@ -406,21 +401,11 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             cg2,
             score_tiler[:2],
         )
-        sdp_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.element_dtype,
-            self.element_dtype,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            self.acc_dtype,
-            cg2,
-            sdp_tiler[:2],
-        )
         atom_thr_size = cute.size(dkv_tiled_mma.thr_id.shape)
         assert atom_thr_size == self.CLUSTER_SHAPE_MNK[0]
         assert cute.size(dq_tiled_mma.thr_id.shape) == atom_thr_size
         assert cute.size(score_tiled_mma.thr_id.shape) == atom_thr_size
         assert cute.size(dp_tiled_mma.thr_id.shape) == atom_thr_size
-        assert cute.size(sdp_tiled_mma.thr_id.shape) == atom_thr_size
 
         cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.CLUSTER_SHAPE_MNK),
@@ -438,21 +423,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             score_tiler,
             self.element_dtype,
             self.K_CHUNKS,
-        )
-        # One operand slot already stores local [Q H64; dO H64]
-        # contiguously. Reinterpret those 32 KiB, plus the unchanged KV
-        # quadrant, as one local-M128 half of a pair-wide M256 SDP MMA.
-        sdp_a_layout = sm100_utils.make_smem_layout_a(
-            sdp_tiled_mma,
-            sdp_tiler,
-            self.element_dtype,
-            1,
-        )
-        sdp_b_layout = sm100_utils.make_smem_layout_b(
-            sdp_tiled_mma,
-            sdp_tiler,
-            self.element_dtype,
-            1,
         )
         dkv_a_layout_staged = sm100_utils.make_smem_layout_a(
             dkv_tiled_mma,
@@ -508,8 +478,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         self.layout_report = {
             "score_a": str(score_a_layout_staged),
             "score_b": str(score_b_layout_staged),
-            "sdp_a": str(sdp_a_layout),
-            "sdp_b": str(sdp_b_layout),
             "dkv_a_staged": str(dkv_a_layout_staged),
             "dkv_b_staged": str(dkv_b_layout_staged),
             "dq_a_staged": str(dq_a_layout_staged),
@@ -519,14 +487,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         }
         assert cute.cosize(score_a_layout_staged) <= 32768
         assert cute.cosize(score_b_layout_staged) <= 16384
-        assert cute.size_in_bytes(
-            self.element_dtype,
-            sdp_a_layout,
-        ) == 32 * 1024
-        assert cute.size_in_bytes(
-            self.element_dtype,
-            sdp_b_layout,
-        ) == 8 * 1024
         assert cute.cosize(dkv_a_layout_staged) <= 16384
         assert cute.cosize(dkv_b_layout_staged) <= 4096
         assert cute.cosize(dq_a_layout_staged) <= 8192
@@ -544,41 +504,13 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             score_a_layout_staged,
             mode=[0, 1, 2],
         )
-        # M256 SDP uses a local M128 A image whose two H64 halves are
-        # interleaved across the K-high mode.  Derive the native H64 view
-        # for the existing per-rank Q/dO TMA loads instead of treating the
-        # two halves as contiguous 16-KiB M128 operands.
-        sdp_a_halves = cute.zipped_divide(
-            sdp_a_layout,
-            score_a_layout.shape,
-        )
-        sdp_a_half_layout = cute.slice_(
-            sdp_a_halves,
-            (
-                ((None, None), None, (None, None)),
-                ((0, 0), 0, (0, 0), 0),
-            ),
-        )
-        sdp_a_half_layout = cute.group_modes(
-            sdp_a_half_layout,
-            0,
-            2,
-        )
-        sdp_a_half_layout = cute.group_modes(
-            sdp_a_half_layout,
-            2,
-            4,
-        )
-        assert cute.size(sdp_a_half_layout) == (
-            self.H_TILE_CTA * self.K_CHUNK
-        )
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(
             tcgen05.CtaGroup.ONE
         )
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             mQ,
-            sdp_a_half_layout,
+            score_a_layout,
             score_tiler,
             score_tiled_mma,
             cluster_layout_vmnk.shape,
@@ -586,15 +518,14 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         tma_atom_do, tma_tensor_do = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             mdO,
-            sdp_a_half_layout,
+            score_a_layout,
             score_tiler,
             dp_tiled_mma,
             cluster_layout_vmnk.shape,
         )
-        score_a_stage_bytes = (
-            cute.size(sdp_a_half_layout)
-            * self.element_dtype.width
-            // 8
+        score_a_stage_bytes = cute.size_in_bytes(
+            self.element_dtype,
+            score_a_layout,
         )
         grad_a_layout = cute.select(
             dkv_a_layout_staged,
@@ -721,27 +652,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             score_epi_tile,
             True,
         )
-        score_quad_cta_shape = (
-            self.H_TILE_CTA,
-            self.N_TILE_CTA,
-            self.K_CHUNK,
-        )
-        score_quad_epi_tile = (
-            sm100_utils.compute_epilogue_tile_shape(
-                score_quad_cta_shape,
-                True,
-                utils.LayoutEnum.ROW_MAJOR,
-                self.acc_dtype,
-            )
-        )
-        score_quad_tmem_load = sm100_utils.get_tmem_load_op(
-            score_quad_cta_shape,
-            utils.LayoutEnum.ROW_MAJOR,
-            self.acc_dtype,
-            self.acc_dtype,
-            score_quad_epi_tile,
-            True,
-        )
         dkv_cta_shape = (
             self.D_TILE_CTA,
             self.N_TILE,
@@ -840,21 +750,16 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             Float32(softmax_scale),
             score_tiled_mma,
             dp_tiled_mma,
-            sdp_tiled_mma,
             dkv_tiled_mma,
             dq_tiled_mma,
             score_a_layout_staged,
             score_b_layout_staged,
-            sdp_a_layout,
-            sdp_a_half_layout,
-            sdp_b_layout,
             dkv_a_layout_staged,
             dkv_b_layout_staged,
             dq_a_layout_staged,
             dq_b_layout_staged,
             cluster_layout_vmnk,
             score_tmem_load,
-            score_quad_tmem_load,
             dkv_tmem_load,
             dq_tmem_load,
             tma_atom_dq_epi,
@@ -1710,21 +1615,16 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         scale_softmax: Float32,
         score_tiled_mma: cute.TiledMma,
         dp_tiled_mma: cute.TiledMma,
-        sdp_tiled_mma: cute.TiledMma,
         dkv_tiled_mma: cute.TiledMma,
         dq_tiled_mma: cute.TiledMma,
         score_a_layout_staged: cute.ComposedLayout,
         score_b_layout_staged: cute.ComposedLayout,
-        sdp_a_layout: cute.ComposedLayout,
-        sdp_a_half_layout: cute.ComposedLayout,
-        sdp_b_layout: cute.ComposedLayout,
         dkv_a_layout_staged: cute.ComposedLayout,
         dkv_b_layout_staged: cute.ComposedLayout,
         dq_a_layout_staged: cute.ComposedLayout,
         dq_b_layout_staged: cute.ComposedLayout,
         cluster_layout_vmnk: cute.Layout,
         score_tmem_load: cute.CopyAtom,
-        score_quad_tmem_load: cute.CopyAtom,
         dkv_tmem_load: cute.CopyAtom,
         dq_tmem_load: cute.CopyAtom,
         tma_atom_dq_epi: cute.CopyAtom,
@@ -1740,8 +1640,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
 
         # The sequential checkpoint keeps its direct dQ stores.  These
         # launcher-built values are consumed by the v0 kernel override.
-        _ = sdp_a_half_layout
-        _ = score_quad_tmem_load
         _ = tma_atom_dq_epi
         _ = tma_tensor_dq_epi
         _ = dq_epi_layout_staged
@@ -2670,7 +2568,6 @@ def _compute_and_store_pd(
     owner: cutlass.Constexpr[object],
     r_score: cute.Tensor,
     r_dp: cute.Tensor,
-    score_coordinates: cute.Tensor,
     softmax_stats: cute.Tensor,
     valid_lo: Int32,
     valid_hi: Int32,
@@ -2683,10 +2580,21 @@ def _compute_and_store_pd(
 ) -> None:
     """Compute one score-distributed BF16 P/dS fragment in registers."""
 
-    # The M256 accumulator is read through native H64xN32 quadrants, while
-    # P/dS retain the legacy R2S register layout.  Decode the native T2R
-    # coordinates and place each result at its legacy local-N index.
+    # For the CG2 H128xN64 accumulator copied by W8-W11, each thread owns
+    # one rank-local H row and one contiguous N32 quadrant:
+    #
+    #   local_h = math_tidx % 64
+    #   n_owner = math_tidx // 64
+    #   local_n = value_index
+    #
+    # This mapping has been exhaustively validated over the H64xN64 rank
+    # tile.  Keep the x4 FP32/BF16 fragments and the three scalar destinations,
+    # but remove per-value identity-coordinate decoding and address rebuilds.
+    local_h = math_tidx % Int32(owner.H_TILE_CTA)
     n_owner = math_tidx // Int32(owner.H_TILE_CTA)
+
+    lse = softmax_stats[local_h, 0]
+    sum_odo = softmax_stats[local_h, 1]
     if cutlass.const_expr(apply_mask):
         valid_bits = valid_lo
         if n_owner != Int32(0):
@@ -2704,34 +2612,18 @@ def _compute_and_store_pd(
             value_index_0 = fragment_index * 4 + pair_index * 2
             value_index_1 = value_index_0 + 1
             pair_offset = pair_index * 2
-            coordinate_0 = score_coordinates[value_index_0]
-            coordinate_1 = score_coordinates[value_index_1]
-            local_h_0 = Int32(
-                cute.get(coordinate_0, mode=[0])
-            )
-            local_h_1 = Int32(
-                cute.get(coordinate_1, mode=[0])
-            )
-            local_n_0 = Int32(
-                cute.get(coordinate_0, mode=[1])
-            )
-            local_n_1 = Int32(
-                cute.get(coordinate_1, mode=[1])
-            )
-            lse_0 = softmax_stats[local_h_0, 0]
-            lse_1 = softmax_stats[local_h_1, 0]
-            sum_odo_0 = softmax_stats[local_h_0, 1]
-            sum_odo_1 = softmax_stats[local_h_1, 1]
+            lse_0 = lse
+            lse_1 = lse
             if cutlass.const_expr(apply_mask):
                 is_valid_0 = (
                     (
-                        valid_bits >> local_n_0
+                        valid_bits >> Int32(value_index_0)
                     )
                     & Int32(1)
                 ) != Int32(0)
                 is_valid_1 = (
                     (
-                        valid_bits >> local_n_1
+                        valid_bits >> Int32(value_index_1)
                     )
                     & Int32(1)
                 ) != Int32(0)
@@ -2760,8 +2652,8 @@ def _compute_and_store_pd(
                     r_dp[value_index_1],
                 ),
                 (
-                    sum_odo_0,
-                    sum_odo_1,
+                    sum_odo,
+                    sum_odo,
                 ),
             )
             ds_0, ds_1 = cute.arch.mul_packed_f32x2(
@@ -2788,10 +2680,8 @@ def _compute_and_store_pd(
         ds_bf16.store(ds_fp32.load().to(owner.element_dtype))
         for fragment_value in cutlass.range_constexpr(4):
             value_index = fragment_index * 4 + fragment_value
-            coordinate = score_coordinates[value_index]
-            local_n = Int32(cute.get(coordinate, mode=[1]))
-            r_p[local_n] = p_bf16[fragment_value]
-            r_dsq[local_n] = ds_bf16[fragment_value]
+            r_p[value_index] = p_bf16[fragment_value]
+            r_dsq[value_index] = ds_bf16[fragment_value]
 
 
 @cute.jit
@@ -2975,8 +2865,6 @@ def _run_math_role(
     reducer_ctx: cute.Tensor,
     t_score: cute.Tensor,
     t_dp: cute.Tensor,
-    t_score_r2s_basis: cute.Tensor,
-    score_quad_tmem_load: cute.CopyAtom,
     score_tmem_load: cute.CopyAtom,
     rank_score_coordinates: cute.Tensor,
     scaled_lse: cute.Tensor,
@@ -3015,77 +2903,19 @@ def _run_math_role(
     math_tidx = tidx - self.MATH_WARPS[0] * 32
     is_math_leader = math_tidx == 0
     peer = Int32(1) - rank
-    n_owner = cute.arch.make_warp_uniform(
-        math_tidx // Int32(self.H_TILE_CTA)
-    )
-    local_math_tidx = math_tidx % Int32(self.H_TILE_CTA)
 
-    score_quad_core_layout = cute.make_layout(
-        (self.H_TILE_CTA, self.N_TILE_CTA),
-        stride=(1 << 16, 1),
+    score_copy = tcgen05.make_tmem_copy(
+        score_tmem_load,
+        t_score,
     )
-    score_quad_full_layout = cute.make_layout(
-        (score_quad_core_layout.shape, 1, 1),
-        stride=(score_quad_core_layout.stride, 0, 0),
-    )
-    raw_score_quad = t_score[
-        ((None, None), 0, 0, n_owner)
-    ]
-    raw_dp_quad = t_dp[
-        ((None, None), 0, 0, n_owner)
-    ]
-    score_quad = cute.make_tensor(
-        raw_score_quad.iterator,
-        score_quad_full_layout,
-    )
-    dp_quad = cute.make_tensor(
-        raw_dp_quad.iterator,
-        score_quad_full_layout,
-    )
-    score_quad_copy = tcgen05.make_tmem_copy(
-        score_quad_tmem_load,
-        score_quad,
-    )
-    score_quad_thread = score_quad_copy.get_slice(
-        local_math_tidx
-    )
-    score_source = score_quad_thread.partition_S(
-        score_quad
-    )
-    score_quad_identity = cute.make_identity_tensor(
-        (self.H_TILE_CTA, self.N_TILE_CTA)
-    )
-    score_quad_identity = cute.make_tensor(
-        score_quad_identity.iterator,
-        cute.make_layout(
-            (score_quad_identity.layout.shape, 1, 1),
-            stride=(score_quad_identity.layout.stride, 0, 0),
-        ),
-    )
-    score_quad_coordinates = score_quad_thread.partition_D(
-        score_quad_identity
+    score_thread = score_copy.get_slice(math_tidx)
+    score_source = score_thread.partition_S(t_score)
+    score_coordinates = score_thread.partition_D(
+        rank_score_coordinates
     )
     r_score = cute.make_rmem_tensor(
-        score_quad_coordinates.shape,
+        score_coordinates.shape,
         self.acc_dtype,
-    )
-    dp_source = score_quad_thread.partition_S(
-        dp_quad
-    )
-    r_dp = cute.make_rmem_tensor(
-        score_quad_coordinates.shape,
-        self.acc_dtype,
-    )
-
-    # Keep the former CG2 M128 distribution only for the proven R2S
-    # mapping.  No T2R instruction reads through this alias.
-    score_r2s_copy = tcgen05.make_tmem_copy(
-        score_tmem_load,
-        t_score_r2s_basis,
-    )
-    score_r2s_thread = score_r2s_copy.get_slice(math_tidx)
-    score_coordinates = score_r2s_thread.partition_D(
-        rank_score_coordinates
     )
     r_p = cute.make_rmem_tensor(
         score_coordinates.shape,
@@ -3099,15 +2929,26 @@ def _run_math_role(
         utils.LayoutEnum.COL_MAJOR,
         self.element_dtype,
         self.acc_dtype,
-        score_r2s_copy,
+        score_copy,
     )
     tiled_copy_r2s = cute.make_tiled_copy_D(
         smem_store_atom,
-        score_r2s_copy,
+        score_copy,
     )
     thread_copy_r2s = tiled_copy_r2s.get_slice(math_tidx)
     r_p_store = thread_copy_r2s.retile(r_p)
     r_dsq_store = thread_copy_r2s.retile(r_dsq)
+    dp_copy = tcgen05.make_tmem_copy(
+        score_tmem_load,
+        t_dp,
+    )
+    dp_thread = dp_copy.get_slice(math_tidx)
+    dp_source = dp_thread.partition_S(t_dp)
+    r_dp = cute.make_rmem_tensor(
+        score_coordinates.shape,
+        self.acc_dtype,
+    )
+
     s_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer,
         1,
@@ -3235,7 +3076,7 @@ def _run_math_role(
                 TRACE_S_T2R_BEGIN,
             )
         math_barrier.arrive_and_wait()
-        cute.copy(score_quad_copy, score_source, r_score)
+        cute.copy(score_copy, score_source, r_score)
         cute.arch.fence_view_async_tmem_load()
         math_barrier.arrive_and_wait()
         if is_math_leader:
@@ -3289,7 +3130,7 @@ def _run_math_role(
                 TRACE_DP_T2R_BEGIN,
             )
         math_barrier.arrive_and_wait()
-        cute.copy(score_quad_copy, dp_source, r_dp)
+        cute.copy(dp_copy, dp_source, r_dp)
         cute.arch.fence_view_async_tmem_load()
         math_barrier.arrive_and_wait()
         if is_math_leader:
@@ -3398,7 +3239,6 @@ def _run_math_role(
                 self,
                 r_score,
                 r_dp,
-                score_quad_coordinates,
                 softmax_stats,
                 valid_lo,
                 valid_hi,
@@ -3414,7 +3254,6 @@ def _run_math_role(
                 self,
                 r_score,
                 r_dp,
-                score_quad_coordinates,
                 softmax_stats,
                 valid_lo,
                 valid_hi,
@@ -3590,6 +3429,15 @@ def _run_math_role(
             # context detach waits for the final metadata reader.
             cute.arch.mbarrier_arrive(p_local_ready + stage)
             cute.arch.mbarrier_arrive(ds_local_ready + stage)
+            self._detach_issued_context(
+                issue_seq,
+                issued_ctx,
+                reducer_ctx,
+                issued_ctx_mbars,
+                reducer_ctx_mbars,
+                ctx_reader_done_mbars,
+                peer,
+            )
 
         phase = (
             issue_seq // Int32(self.PD_STAGES)
@@ -3643,17 +3491,8 @@ def _run_math_role(
                 issue_seq,
                 TRACE_PD_PUBLISH,
             )
-            self._detach_issued_context(
-                issue_seq,
-                issued_ctx,
-                reducer_ctx,
-                issued_ctx_mbars,
-                reducer_ctx_mbars,
-                ctx_reader_done_mbars,
-                peer,
-            )
-        # Keep all four math warps on the same issue while the leader snapshots
-        # reducer metadata and releases the IssuedCtx slot.
+        # Keep all four math warps on the same issue until the leader has
+        # published the P/dS consumer generations.
         math_barrier.arrive_and_wait()
         p_state.advance()
         dsk_state.advance()
@@ -3768,7 +3607,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     OP_BYTES_PER_STAGE = 48 * 1024
     OP_PAYLOAD_BYTES = OP_STAGES * OP_BYTES_PER_STAGE
     OP_MAIN_OFFSET_BYTES = 0
-    OP_F_DO_OFFSET_BYTES = 8 * 1024
+    OP_F_DO_OFFSET_BYTES = 16 * 1024
     OP_SIDE_OFFSET_BYTES = 32 * 1024
 
     PD_NESTED_ELEMENTS_PER_STAGE = 32 * 128
@@ -4467,7 +4306,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     def _load_f_task(
         self,
         raw_slots: cute.Tensor,
-        sdp_a_half_layout: cute.ComposedLayout,
+        score_a_layout: cute.ComposedLayout,
         score_b_layout: cute.ComposedLayout,
         tma_atom_q: cute.CopyAtom,
         tma_atom_do: cute.CopyAtom,
@@ -4542,13 +4381,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             raw_slots,
             slot,
             self.OP_MAIN_OFFSET_BYTES,
-            sdp_a_half_layout,
+            score_a_layout,
         )
         f_do = self._make_operand_slot_view(
             raw_slots,
             slot,
             self.OP_F_DO_OFFSET_BYTES,
-            sdp_a_half_layout,
+            score_a_layout,
         )
         f_kv = self._make_operand_slot_view(
             raw_slots,
@@ -4959,10 +4798,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     def _mma_sdp_tile(
         self,
         raw_slots: cute.Tensor,
-        sdp_a_layout: cute.ComposedLayout,
-        sdp_b_layout: cute.ComposedLayout,
-        sdp_tiled_mma: cute.TiledMma,
-        t_sdp: cute.Tensor,
+        score_a_layout: cute.ComposedLayout,
+        score_b_layout: cute.ComposedLayout,
+        score_tiled_mma: cute.TiledMma,
+        dp_tiled_mma: cute.TiledMma,
+        t_score: cute.Tensor,
+        t_dp: cute.Tensor,
         op_pipeline,
         op_state: pipeline.PipelineState,
         s_pipeline,
@@ -5001,37 +4842,69 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         for _chunk in cutlass.range_constexpr(self.K_CHUNKS):
             op_pipeline.consumer_wait(op_state)
             slot = op_state.index
-            f_qdo = self._make_operand_slot_view(
+            f_q = self._make_operand_slot_view(
                 raw_slots,
                 slot,
                 self.OP_MAIN_OFFSET_BYTES,
-                sdp_a_layout,
+                score_a_layout,
+            )
+            f_do = self._make_operand_slot_view(
+                raw_slots,
+                slot,
+                self.OP_F_DO_OFFSET_BYTES,
+                score_a_layout,
             )
             f_kv = self._make_operand_slot_view(
                 raw_slots,
                 slot,
                 self.OP_SIDE_OFFSET_BYTES,
-                sdp_b_layout,
+                score_b_layout,
             )
-            sdp_a_fragment = sdp_tiled_mma.make_fragment_A(f_qdo)
-            sdp_b_fragment = sdp_tiled_mma.make_fragment_B(f_kv)
+            score_q_fragment = score_tiled_mma.make_fragment_A(
+                f_q
+            )
+            score_kv_fragment = score_tiled_mma.make_fragment_B(
+                f_kv
+            )
+            dp_do_fragment = dp_tiled_mma.make_fragment_A(f_do)
+            dp_kv_fragment = dp_tiled_mma.make_fragment_B(f_kv)
 
-            sdp_mma = sdp_tiled_mma.with_()
-            sdp_mma.set(
+            score_mma = score_tiled_mma.with_()
+            score_mma.set(
                 tcgen05.Field.ACCUMULATE,
                 _chunk != 0,
             )
             for k_block in cutlass.range_constexpr(
-                cute.size(sdp_a_fragment, mode=[2])
+                cute.size(score_q_fragment, mode=[2])
             ):
                 cute.gemm(
-                    sdp_mma,
-                    t_sdp,
-                    sdp_a_fragment[None, None, k_block],
-                    sdp_b_fragment[None, None, k_block],
-                    t_sdp,
+                    score_mma,
+                    t_score,
+                    score_q_fragment[None, None, k_block],
+                    score_kv_fragment[None, None, k_block],
+                    t_score,
                 )
-                sdp_mma.set(
+                score_mma.set(
+                    tcgen05.Field.ACCUMULATE,
+                    True,
+                )
+
+            dp_mma = dp_tiled_mma.with_()
+            dp_mma.set(
+                tcgen05.Field.ACCUMULATE,
+                _chunk != 0,
+            )
+            for k_block in cutlass.range_constexpr(
+                cute.size(dp_do_fragment, mode=[2])
+            ):
+                cute.gemm(
+                    dp_mma,
+                    t_dp,
+                    dp_do_fragment[None, None, k_block],
+                    dp_kv_fragment[None, None, k_block],
+                    t_dp,
+                )
+                dp_mma.set(
                     tcgen05.Field.ACCUMULATE,
                     True,
                 )
@@ -6155,21 +6028,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         scale_softmax: Float32,
         score_tiled_mma: cute.TiledMma,
         dp_tiled_mma: cute.TiledMma,
-        sdp_tiled_mma: cute.TiledMma,
         dkv_tiled_mma: cute.TiledMma,
         dq_tiled_mma: cute.TiledMma,
         score_a_layout_staged: cute.ComposedLayout,
         score_b_layout_staged: cute.ComposedLayout,
-        sdp_a_layout: cute.ComposedLayout,
-        sdp_a_half_layout: cute.ComposedLayout,
-        sdp_b_layout: cute.ComposedLayout,
         dkv_a_layout_staged: cute.ComposedLayout,
         dkv_b_layout_staged: cute.ComposedLayout,
         dq_a_layout_staged: cute.ComposedLayout,
         dq_b_layout_staged: cute.ComposedLayout,
         cluster_layout_vmnk: cute.Layout,
         score_tmem_load: cute.CopyAtom,
-        score_quad_tmem_load: cute.CopyAtom,
         dkv_tmem_load: cute.CopyAtom,
         dq_tmem_load: cute.CopyAtom,
         tma_atom_dq_epi: cute.CopyAtom,
@@ -6720,12 +6588,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         dp_c_layout = dp_tiled_mma.make_fragment_C(
             dp_c_shape
         ).layout
-        sdp_c_shape = sdp_tiled_mma.partition_shape_C(
-            (2 * self.H_TILE_CLUSTER, self.N_TILE)
-        )
-        sdp_c_layout = sdp_tiled_mma.make_fragment_C(
-            sdp_c_shape
-        ).layout
         dkv_c_shape = dkv_tiled_mma.partition_shape_C(
             self.DKV_MMA_TILER[:2]
         )
@@ -6739,46 +6601,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             dq_c_shape
         ).layout
 
-        t_sdp = cute.make_tensor(
-            tmem_ptr + self.TMEM_S_OFFSET,
-            sdp_c_layout,
-        )
-        t_sdp_epi = cute.flat_divide(
-            t_sdp[((None, None), 0, 0)],
-            (self.H_TILE_CTA, self.N_TILE),
-        )
-        score_half = t_sdp_epi[(None, None, 0, 0)]
-        dp_half = t_sdp_epi[(None, None, 1, 0)]
-        # M256 stores each local H64xN64 half as (h,n):(2^16,1).
-        # Expose its two N32 quadrants explicitly so W8/W10 and W9/W11
-        # retain the established one-row, one-N32 ownership contract.
-        score_quad_layout = cute.make_layout(
-            (
-                (self.H_TILE_CTA, self.N_TILE_CTA),
-                1,
-                1,
-                self.N_TILE // self.N_TILE_CTA,
-            ),
-            stride=(
-                (1 << 16, 1),
-                0,
-                0,
-                self.N_TILE_CTA,
-            ),
-        )
         t_score = cute.make_tensor(
-            score_half.iterator,
-            score_quad_layout,
-        )
-        t_dp = cute.make_tensor(
-            dp_half.iterator,
-            score_quad_layout,
-        )
-        # This legacy-layout alias is never read from TMEM.  It only
-        # preserves the proven 128-thread register-to-SMEM distribution.
-        t_score_r2s_basis = cute.make_tensor(
             tmem_ptr + self.TMEM_S_OFFSET,
             score_c_layout,
+        )
+        t_dp = cute.make_tensor(
+            tmem_ptr + self.TMEM_DP_OFFSET,
+            dp_c_layout,
         )
         t_dkv = (
             cute.make_tensor(
@@ -6808,14 +6637,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         )
         score_b_layout = cute.select(
             score_b_layout_staged,
-            mode=[0, 1, 2],
-        )
-        sdp_a_layout = cute.select(
-            sdp_a_layout,
-            mode=[0, 1, 2],
-        )
-        sdp_b_layout = cute.select(
-            sdp_b_layout,
             mode=[0, 1, 2],
         )
         dkv_a_layout = cute.select(
@@ -7100,7 +6921,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 for chunk in cutlass.range_constexpr(self.K_CHUNKS):
                     producer_state = self._load_f_task(
                         raw_slots,
-                        sdp_a_half_layout,
+                        score_a_layout,
                         score_b_layout,
                         tma_atom_q,
                         tma_atom_do,
@@ -7155,7 +6976,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             if has_next:
                                 producer_state = self._load_f_task(
                                     raw_slots,
-                                    sdp_a_half_layout,
+                                    score_a_layout,
                                     score_b_layout,
                                     tma_atom_q,
                                     tma_atom_do,
@@ -7609,10 +7430,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             if first_valid:
                 op_state, s_state, dp_state = self._mma_sdp_tile(
                     raw_slots,
-                    sdp_a_layout,
-                    sdp_b_layout,
-                    sdp_tiled_mma,
-                    t_sdp,
+                    score_a_layout,
+                    score_b_layout,
+                    score_tiled_mma,
+                    dp_tiled_mma,
+                    t_score,
+                    t_dp,
                     op_pipeline,
                     op_state,
                     s_pipeline,
@@ -7642,10 +7465,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                     op_state, s_state, dp_state = (
                         self._mma_sdp_tile(
                             raw_slots,
-                            sdp_a_layout,
-                            sdp_b_layout,
-                            sdp_tiled_mma,
-                            t_sdp,
+                            score_a_layout,
+                            score_b_layout,
+                            score_tiled_mma,
+                            dp_tiled_mma,
+                            t_score,
+                            t_dp,
                             op_pipeline,
                             op_state,
                             s_pipeline,
@@ -7736,10 +7561,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         op_state, s_state, dp_state = (
                             self._mma_sdp_tile(
                                 raw_slots,
-                                sdp_a_layout,
-                                sdp_b_layout,
-                                sdp_tiled_mma,
-                                t_sdp,
+                                score_a_layout,
+                                score_b_layout,
+                                score_tiled_mma,
+                                dp_tiled_mma,
+                                t_score,
+                                t_dp,
                                 op_pipeline,
                                 op_state,
                                 s_pipeline,
@@ -7907,8 +7734,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 reducer_ctx_ring,
                 t_score,
                 t_dp,
-                t_score_r2s_basis,
-                score_quad_tmem_load,
                 score_tmem_load,
                 rank_score_coordinates,
                 scaled_lse,
