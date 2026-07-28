@@ -10204,12 +10204,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                 # V1_SPAN_LOAD_STATS_END
                 stationary_loaded = Int32(1)
 
-            # V1_SPAN_LOAD_K_BEGIN
             # A1-input CP0: when both macro lanes are live, W4-W5 and W6-W7
             # own disjoint K_N images and commit/wait their warp-local
-            # cp.async groups before one shared CTA/cluster publication.
-            # Single-lane tails retain the original four-warp mapping.
-            if active_0 and active_1:
+            # cp.async groups before the first CTA/cluster publication.
+            # Keep the second publication point as a trace-compatible,
+            # behavior-neutral rendezvous until source-native role tracing
+            # replaces the current patch-based instrumentation.
+            # V1_SPAN_LOAD_K_BEGIN
+            if active_0:
                 if (
                     tidx >= Int32(self.KV_LOAD_THREAD_BEGIN)
                     and tidx
@@ -10222,32 +10224,48 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         tidx
                         - Int32(self.KV_LOAD_THREAD_BEGIN)
                     )
-                    if lane_loader_tidx < Int32(
-                        self.KV_LOAD_THREADS_PER_LANE
-                    ):
+                    if active_1:
+                        if lane_loader_tidx < Int32(
+                            self.KV_LOAD_THREADS_PER_LANE
+                        ):
+                            self._load_k_from_ctx_v1(
+                                mKV,
+                                context_0,
+                                k_n_0,
+                                batch_idx,
+                                rank,
+                                lane_loader_tidx,
+                                self.KV_LOAD_GROUPS_PER_LANE,
+                                kv_copy_atom,
+                                kv_thread_copy,
+                            )
+                        else:
+                            self._load_k_from_ctx_v1(
+                                mKV,
+                                context_1,
+                                k_n_1,
+                                batch_idx,
+                                rank,
+                                lane_loader_tidx
+                                - Int32(
+                                    self.KV_LOAD_THREADS_PER_LANE
+                                ),
+                                self.KV_LOAD_GROUPS_PER_LANE,
+                                kv_copy_atom,
+                                kv_thread_copy,
+                            )
+                    else:
                         self._load_k_from_ctx_v1(
                             mKV,
                             context_0,
                             k_n_0,
                             batch_idx,
                             rank,
-                            lane_loader_tidx,
-                            self.KV_LOAD_GROUPS_PER_LANE,
-                            kv_copy_atom,
-                            kv_thread_copy,
-                        )
-                    else:
-                        self._load_k_from_ctx_v1(
-                            mKV,
-                            context_1,
-                            k_n_1,
-                            batch_idx,
-                            rank,
-                            lane_loader_tidx
+                            tidx
                             - Int32(
-                                self.KV_LOAD_THREADS_PER_LANE
+                                self.KV_LOAD_THREAD_BEGIN
                             ),
-                            self.KV_LOAD_GROUPS_PER_LANE,
+                            self.KV_NUM_GROUPS,
                             kv_copy_atom,
                             kv_thread_copy,
                         )
@@ -10257,45 +10275,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                 self.main_barrier.arrive_and_wait()
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
-            else:
-                if active_0:
-                    if (
-                        tidx >= Int32(self.KV_LOAD_THREAD_BEGIN)
-                        and tidx
-                        < Int32(
-                            self.KV_LOAD_THREAD_BEGIN
-                            + self.KV_LOAD_THREADS
-                        )
-                    ):
-                        self._load_k_from_ctx_v1(
-                            mKV,
-                            context_0,
-                            k_n_0,
-                            batch_idx,
-                            rank,
-                            tidx
-                            - Int32(
-                                self.KV_LOAD_THREAD_BEGIN
-                            ),
-                            self.KV_NUM_GROUPS,
-                            kv_copy_atom,
-                            kv_thread_copy,
-                        )
-                        cute.arch.cp_async_commit_group()
-                        cute.arch.cp_async_wait_group(0)
-                        cute.arch.fence_view_async_shared()
-                    self.main_barrier.arrive_and_wait()
-                    cute.arch.cluster_arrive()
-                    cute.arch.cluster_wait()
-                if active_1:
-                    if (
-                        tidx >= Int32(self.KV_LOAD_THREAD_BEGIN)
-                        and tidx
-                        < Int32(
-                            self.KV_LOAD_THREAD_BEGIN
-                            + self.KV_LOAD_THREADS
-                        )
-                    ):
+            if active_1:
+                if (
+                    tidx >= Int32(self.KV_LOAD_THREAD_BEGIN)
+                    and tidx
+                    < Int32(
+                        self.KV_LOAD_THREAD_BEGIN
+                        + self.KV_LOAD_THREADS
+                    )
+                ):
+                    if not active_0:
                         self._load_k_from_ctx_v1(
                             mKV,
                             context_1,
@@ -10313,9 +10302,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
                         cute.arch.cp_async_commit_group()
                         cute.arch.cp_async_wait_group(0)
                         cute.arch.fence_view_async_shared()
-                    self.main_barrier.arrive_and_wait()
-                    cute.arch.cluster_arrive()
-                    cute.arch.cluster_wait()
+                self.main_barrier.arrive_and_wait()
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
             # V1_SPAN_LOAD_K_END
 
             if active_0:
