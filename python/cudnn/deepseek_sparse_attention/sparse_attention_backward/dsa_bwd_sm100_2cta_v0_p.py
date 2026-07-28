@@ -4475,23 +4475,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         resident_q: cute.Tensor,
         destination_q: cute.Tensor,
         destination_full: cute.Pointer,
-        route_ready_mbar: cute.Pointer,
         rank: Int32,
         peer_rank: Int32,
     ) -> None:
         """Materialize one D-owned Q round from immutable H-owned Q."""
 
-        # A sender must not touch its peer's BV slot until both descriptor
-        # warps have acquired the corresponding local destinations.
-        cute.arch.fence_view_async_shared()
-        with cute.arch.elect_one():
-            self._pair_arrive(route_ready_mbar, peer_rank)
-            self._wait_pair(
-                route_ready_mbar,
-                Int32(round_index),
-            )
-        cute.arch.sync_warp()
-
+        # The preceding dO-empty wait is produced by the sole CG2 consumer,
+        # so both rank-local BV destinations are already dead before either
+        # W7 can enter this route.  Keep the CTA schedulers independent here:
+        # an extra pair rendezvous can form a cycle with descriptor credit.
         source_rows_0 = self._score_chunk_rows_v0_p(
             resident_q,
             0,
@@ -4948,7 +4940,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         resident_q: cute.Tensor,
         dkv_a_layout: cute.ComposedLayout,
         grad_q_source_mbars: cute.Pointer,
-        resident_q_route_ready_mbar: cute.Pointer,
         do_empty_pipeline,
         first_do_ready: cutlass.Boolean,
         q_full_pipeline,
@@ -5057,7 +5048,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             resident_q,
             first_bq_q,
             grad_q_source_mbars + first_bv_slot,
-            resident_q_route_ready_mbar,
             rank,
             peer_rank,
         )
@@ -5137,7 +5127,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             resident_q,
             second_bq_q,
             grad_q_source_mbars + second_bv_slot,
-            resident_q_route_ready_mbar,
             rank,
             peer_rank,
         )
@@ -6633,7 +6622,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 cutlass.Int64,
                 2,
             ]
-            resident_q_route_ready_mbar: cutlass.Int64
             operand_consumer_done_mbar: cutlass.Int64
             dq_epilogue_source_done_mbar: cutlass.Int64
             outer_role_drain_mbar: cutlass.Int64
@@ -6812,9 +6800,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         )
         issued_stream_done_ack_mbars_ptr = (
             storage.issued_stream_done_ack_mbars.data_ptr()
-        )
-        resident_q_route_ready_mbar_ptr = (
-            storage.resident_q_route_ready_mbar.ptr
         )
         operand_consumer_done_mbar_ptr = (
             storage.operand_consumer_done_mbar.ptr
@@ -7130,10 +7115,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             )
             self._init_pair_mbar_range(
                 issued_stream_done_ack_mbars_ptr,
-                2,
-            )
-            cute.arch.mbarrier_init(
-                resident_q_route_ready_mbar_ptr,
                 2,
             )
             cute.arch.mbarrier_init(
@@ -7804,7 +7785,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             resident_q,
                             dkv_a_layout,
                             grad_q_source_mbars_ptr,
-                            resident_q_route_ready_mbar_ptr,
                             do_empty_pipeline,
                             do_ready,
                             q_full_pipeline,
