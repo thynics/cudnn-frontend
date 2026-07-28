@@ -7394,6 +7394,57 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         if done_published:
                             refill_admitted = cutlass.Boolean(True)
 
+                # Give a ready successor context first refusal before BQ.
+                # This is deliberately non-blocking: while its IssuedCtx
+                # slot is still live, the original refill path remains able
+                # to break the context/gradient dependency cycle.
+                if pending_descriptor:
+                    slot = (
+                        committed_count
+                        % Int32(self.CONTEXT_STAGES)
+                    )
+                    epoch = (
+                        committed_count
+                        // Int32(self.CONTEXT_STAGES)
+                    ) & Int32(1)
+                    empty_ready = _mbarrier_try_wait(
+                        issued_ctx_mbars_ptr
+                        + self.ISSUED_EMPTY_MBAR_BASE
+                        + slot,
+                        epoch ^ Int32(1),
+                    )
+                    if empty_ready:
+                        self._publish_issued_context(
+                            committed_count,
+                            traversal_descriptor,
+                            issued_ctx_ring,
+                            issued_ctx_mbars_ptr,
+                            peer_rank,
+                        )
+                        if tidx == Int32(
+                            self.DESCRIPTOR_WARP * 32
+                        ):
+                            self._record_trace(
+                                trace_buffer,
+                                token_idx,
+                                batch_idx,
+                                trace_token_idx,
+                                trace_batch_idx,
+                                rank,
+                                TRACE_ROLE_DESC_BQ,
+                                committed_count,
+                                TRACE_CTX_COMMIT,
+                            )
+                        committed_count += Int32(1)
+                        pending_descriptor = (
+                            cutlass.Boolean(False)
+                        )
+                        # Defer a concurrently ready refill by one engine
+                        # turn so the newly published loader work can overlap
+                        # it whenever their operand slots permit.
+                        refill_admitted = cutlass.Boolean(False)
+                        progressed = cutlass.Boolean(True)
+
                 if refill_admitted:
                     do_phase = (
                         refill_count // Int32(self.ROUND_STAGES)
@@ -7479,49 +7530,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         progressed = cutlass.Boolean(True)
 
                 if not progressed:
-                    if pending_descriptor:
-                        slot = (
-                            committed_count
-                            % Int32(self.CONTEXT_STAGES)
-                        )
-                        epoch = (
-                            committed_count
-                            // Int32(self.CONTEXT_STAGES)
-                        ) & Int32(1)
-                        empty_ready = _mbarrier_try_wait(
-                            issued_ctx_mbars_ptr
-                            + self.ISSUED_EMPTY_MBAR_BASE
-                            + slot,
-                            epoch ^ Int32(1),
-                        )
-                        if empty_ready:
-                            self._publish_issued_context(
-                                committed_count,
-                                traversal_descriptor,
-                                issued_ctx_ring,
-                                issued_ctx_mbars_ptr,
-                                peer_rank,
-                            )
-                            if tidx == Int32(
-                                self.DESCRIPTOR_WARP * 32
-                            ):
-                                self._record_trace(
-                                    trace_buffer,
-                                    token_idx,
-                                    batch_idx,
-                                    trace_token_idx,
-                                    trace_batch_idx,
-                                    rank,
-                                    TRACE_ROLE_DESC_BQ,
-                                    committed_count,
-                                    TRACE_CTX_COMMIT,
-                                )
-                            committed_count += Int32(1)
-                            pending_descriptor = (
-                                cutlass.Boolean(False)
-                            )
-                            progressed = cutlass.Boolean(True)
-                    else:
+                    if not pending_descriptor:
                         if traversal_seq < traversal_tile_count:
                             logical_tile = (
                                 traversal_tile_count
