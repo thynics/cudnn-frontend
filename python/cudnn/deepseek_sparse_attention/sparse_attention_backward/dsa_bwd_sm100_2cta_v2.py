@@ -10919,7 +10919,7 @@ def _store_shared_bf16_at_v2(
     packed[0] = value
 
 
-class FlashAttentionDSABackwardSm100TwoCTAV2(
+class FlashAttentionDSABackwardSm100TwoCTAV2HybridUnsupported(
     FlashAttentionDSABackwardSm100TwoCTA
 ):
     """v2: CG2 score/dQ pipeline with CTA-local CG1 dKV.
@@ -12691,6 +12691,327 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     destination_ptr,
                 )
         return consumer_state
+
+
+class FlashAttentionDSABackwardSm100TwoCTAV2(
+    FlashAttentionDSABackwardSm100
+):
+    """Canonical CG1 kernel with head-staggered dKV atomic visits.
+
+    The canonical pipeline and math stay unchanged.  Only head block 1
+    circularly shifts each reducer thread's eight row visits by four so the
+    two head blocks do not begin by contending on the same dKV rows.
+    """
+
+    @cute.jit
+    def _atomic_dKV_128_visit_v2(
+        self,
+        dKV_acc: cute.Tensor,
+        tTR_rdKV: cute.Tensor,
+        rTopkIdx: cute.Tensor,
+        batch_idx: Int32,
+        dp_idx: Int32,
+        sub_tile_idx: cutlass.Constexpr[int],
+        visit_idx: cutlass.Constexpr[int],
+    ):
+        """Atomically store one statically indexed 128-wide row visit."""
+        coord_base = visit_idx * 2 - visit_idx % 2
+
+        rdKV_frg = cute.make_rmem_tensor((4,), self.acc_dtype)
+        rdKV_frg[0] = tTR_rdKV[coord_base]
+        rdKV_frg[1] = tTR_rdKV[coord_base + 2]
+        rdKV_frg[2] = tTR_rdKV[coord_base + 16]
+        rdKV_frg[3] = tTR_rdKV[coord_base + 18]
+
+        topk_idx = rTopkIdx[visit_idx]
+        if topk_idx >= 0:
+            dKV_row = dKV_acc[None, topk_idx, (0, batch_idx)]
+            tile_dKV_row = cute.flat_divide(dKV_row, (128,))
+            tile_dKV_row = tile_dKV_row[None, sub_tile_idx]
+            tile_dKV_row = cute.flat_divide(tile_dKV_row, (4,))
+            cur_dKV_frg = tile_dKV_row[None, dp_idx // 4]
+            cute.arch.atomic_add(
+                cur_dKV_frg.iterator.llvm_ptr,
+                rdKV_frg.load(),
+            )
+
+    @cute.jit
+    def _atomic_dKV_64_visit_v2(
+        self,
+        dKV_acc: cute.Tensor,
+        tTR_rdKV: cute.Tensor,
+        rTopkIdx: cute.Tensor,
+        batch_idx: Int32,
+        dp_idx: Int32,
+        visit_idx: cutlass.Constexpr[int],
+    ):
+        """Atomically store one statically indexed 64-wide row visit."""
+        coord_base = visit_idx * 2 - visit_idx % 2
+
+        rdKV_frg = cute.make_rmem_tensor((2,), self.acc_dtype)
+        rdKV_frg[0] = tTR_rdKV[coord_base]
+        rdKV_frg[1] = tTR_rdKV[coord_base + 2]
+
+        topk_idx = rTopkIdx[visit_idx]
+        if topk_idx >= 0:
+            dKV_row = dKV_acc[None, topk_idx, (0, batch_idx)]
+            tile_dKV_row = cute.flat_divide(dKV_row, (64,))
+            tile_dKV_row = tile_dKV_row[
+                None,
+                self.head_dim_main // 64,
+            ]
+            tile_dKV_row = cute.flat_divide(tile_dKV_row, (2,))
+            cur_dKV_frg = tile_dKV_row[None, dp_idx // 4]
+            cute.arch.atomic_add(
+                cur_dKV_frg.iterator.llvm_ptr,
+                rdKV_frg.load(),
+            )
+
+    @cute.jit
+    def _reduce_dKV_128_visits_v2(
+        self,
+        dKV_acc: cute.Tensor,
+        tTR_rdKV: cute.Tensor,
+        rTopkIdx: cute.Tensor,
+        sub_tile_idx: cutlass.Constexpr[int],
+    ):
+        """Visit all eight 128-wide rows in a head-dependent static order."""
+        tidx, _, _ = cute.arch.thread_idx()
+        _, head_block_idx, batch_idx = cute.arch.block_idx()
+        tidx_in_wg = (
+            tidx
+            - self.reduce_warp_id[0] * self.threads_per_warp
+        )
+        dp_idx = tidx_in_wg % 128
+
+        # This branch is CTA-uniform.  Both paths pass constexpr indices to
+        # the helper, avoiding a runtime-indexed register tensor.
+        if head_block_idx == Int32(1):
+            for visit_idx in cutlass.range_constexpr(4, 8):
+                self._atomic_dKV_128_visit_v2(
+                    dKV_acc,
+                    tTR_rdKV,
+                    rTopkIdx,
+                    batch_idx,
+                    dp_idx,
+                    sub_tile_idx,
+                    visit_idx,
+                )
+            for visit_idx in cutlass.range_constexpr(4):
+                self._atomic_dKV_128_visit_v2(
+                    dKV_acc,
+                    tTR_rdKV,
+                    rTopkIdx,
+                    batch_idx,
+                    dp_idx,
+                    sub_tile_idx,
+                    visit_idx,
+                )
+        else:
+            for visit_idx in cutlass.range_constexpr(8):
+                self._atomic_dKV_128_visit_v2(
+                    dKV_acc,
+                    tTR_rdKV,
+                    rTopkIdx,
+                    batch_idx,
+                    dp_idx,
+                    sub_tile_idx,
+                    visit_idx,
+                )
+
+    @cute.jit
+    def _reduce_dKV_64_visits_v2(
+        self,
+        dKV_acc: cute.Tensor,
+        tTR_rdKV: cute.Tensor,
+        rTopkIdx: cute.Tensor,
+    ):
+        """Visit all eight 64-wide rows in a head-dependent static order."""
+        tidx, _, _ = cute.arch.thread_idx()
+        _, head_block_idx, batch_idx = cute.arch.block_idx()
+        tidx_in_wg = (
+            tidx
+            - self.reduce_warp_id[0] * self.threads_per_warp
+        )
+        dp_idx = tidx_in_wg % 128
+
+        if head_block_idx == Int32(1):
+            for visit_idx in cutlass.range_constexpr(4, 8):
+                self._atomic_dKV_64_visit_v2(
+                    dKV_acc,
+                    tTR_rdKV,
+                    rTopkIdx,
+                    batch_idx,
+                    dp_idx,
+                    visit_idx,
+                )
+            for visit_idx in cutlass.range_constexpr(4):
+                self._atomic_dKV_64_visit_v2(
+                    dKV_acc,
+                    tTR_rdKV,
+                    rTopkIdx,
+                    batch_idx,
+                    dp_idx,
+                    visit_idx,
+                )
+        else:
+            for visit_idx in cutlass.range_constexpr(8):
+                self._atomic_dKV_64_visit_v2(
+                    dKV_acc,
+                    tTR_rdKV,
+                    rTopkIdx,
+                    batch_idx,
+                    dp_idx,
+                    visit_idx,
+                )
+
+    @cute.jit
+    def reduce_dKV_from_reg(
+        self,
+        dKV_acc: cute.Tensor,
+        tTR_rdKV: cute.Tensor,
+        rTopkIdx: cute.Tensor,
+        sub_tile_idx: int,
+    ):
+        """Reduce a canonical 128-wide register fragment with v2 ordering."""
+        self._reduce_dKV_128_visits_v2(
+            dKV_acc,
+            tTR_rdKV,
+            rTopkIdx,
+            sub_tile_idx,
+        )
+        self.reduce_sync_barrier.arrive_and_wait()
+
+    @cute.jit
+    def reduce_dKV_64_from_reg(
+        self,
+        dKV_acc: cute.Tensor,
+        tTR_rdKV: cute.Tensor,
+        rTopkIdx: cute.Tensor,
+    ):
+        """Reduce a canonical 64-wide register fragment with v2 ordering."""
+        self._reduce_dKV_64_visits_v2(
+            dKV_acc,
+            tTR_rdKV,
+            rTopkIdx,
+        )
+        self.reduce_sync_barrier.arrive_and_wait()
+
+    @cute.jit
+    def store_dKV(
+        self,
+        dKV_acc: cute.Tensor,
+        tdKVtdKV: cute.Tensor,
+        rTopkIdx: cute.Tensor,
+        sub_tile_idx: int,
+    ):
+        """T2R and store a canonical 128-wide tile with v2 ordering."""
+        tidx, _, _ = cute.arch.thread_idx()
+        tidx_in_wg = (
+            tidx
+            - self.reduce_warp_id[0] * self.threads_per_warp
+        )
+        dp_idx = tidx_in_wg % 128
+        wg_idx = tidx_in_wg // (4 * self.threads_per_warp)
+        num_warp_groups = self.num_reduce_warps // 4
+
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+            self.acc_dtype,
+        )
+        tiled_t2r_dKV = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tdKVtdKV,
+        )
+        thr_t2r_dKV = tiled_t2r_dKV.get_slice(dp_idx)
+
+        cdKV = cute.make_identity_tensor(
+            (self.dOP_mma_tiler[0], self.dOP_mma_tiler[1])
+        )
+        tTR_cdKV_p = thr_t2r_dKV.partition_D(cdKV)
+        tTR_cdKV = self.split_wg(
+            tTR_cdKV_p,
+            num_warp_groups,
+            wg_idx,
+        )
+        tTR_rdKV = cute.make_rmem_tensor(
+            tTR_cdKV.shape,
+            self.acc_dtype,
+        )
+        tTR_tdKV = thr_t2r_dKV.partition_S(tdKVtdKV)
+        tTR_tdKV = self.split_wg(
+            tTR_tdKV,
+            num_warp_groups,
+            wg_idx,
+        )
+
+        cute.copy(tiled_t2r_dKV, tTR_tdKV, tTR_rdKV)
+        cute.arch.fence_view_async_tmem_load()
+
+        self._reduce_dKV_128_visits_v2(
+            dKV_acc,
+            tTR_rdKV,
+            rTopkIdx,
+            sub_tile_idx,
+        )
+        self.reduce_sync_barrier.arrive_and_wait()
+
+    @cute.jit
+    def store_dKV_64(
+        self,
+        dKV_acc: cute.Tensor,
+        tdKVtdKV: cute.Tensor,
+        rTopkIdx: cute.Tensor,
+    ):
+        """T2R and store a canonical 64-wide tile with v2 ordering."""
+        tidx, _, _ = cute.arch.thread_idx()
+        tidx_in_wg = (
+            tidx
+            - self.reduce_warp_id[0] * self.threads_per_warp
+        )
+        dp_idx = tidx_in_wg % 128
+        wg_idx = tidx_in_wg // (4 * self.threads_per_warp)
+        num_warp_groups = self.num_reduce_warps // 4
+
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+            self.acc_dtype,
+        )
+        tiled_t2r_dKV = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tdKVtdKV,
+        )
+        thr_t2r_dKV = tiled_t2r_dKV.get_slice(dp_idx)
+
+        cdKV = cute.make_identity_tensor(
+            (self.dKV4_mma_tiler[0], self.dKV4_mma_tiler[1])
+        )
+        tTR_cdKV_p = thr_t2r_dKV.partition_D(cdKV)
+        tTR_cdKV = self.split_wg(
+            tTR_cdKV_p,
+            num_warp_groups,
+            wg_idx,
+        )
+        tTR_rdKV = cute.make_rmem_tensor(
+            tTR_cdKV.shape,
+            self.acc_dtype,
+        )
+        tTR_tdKV = thr_t2r_dKV.partition_S(tdKVtdKV)
+        tTR_tdKV = self.split_wg(
+            tTR_tdKV,
+            num_warp_groups,
+            wg_idx,
+        )
+
+        cute.copy(tiled_t2r_dKV, tTR_tdKV, tTR_rdKV)
+        cute.arch.fence_view_async_tmem_load()
+
+        self._reduce_dKV_64_visits_v2(
+            dKV_acc,
+            tTR_rdKV,
+            rTopkIdx,
+        )
+        self.reduce_sync_barrier.arrive_and_wait()
 
 
 # Workspace-only host alias used by the harness integration patch.  The
