@@ -35,6 +35,33 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
 
+class _IketProxy:
+    """Forward to real IKET when loaded; otherwise make annotations no-ops."""
+
+    @staticmethod
+    def _api():
+        experimental = getattr(cute, "experimental", None)
+        return getattr(experimental, "iket", None)
+
+    @classmethod
+    def mark(cls, *args):
+        api = cls._api()
+        return None if api is None else api.mark(*args)
+
+    @classmethod
+    def range_start(cls, *args):
+        api = cls._api()
+        return None if api is None else api.range_start(*args)
+
+    @classmethod
+    def range_end(cls, *args):
+        api = cls._api()
+        return None if api is None else api.range_end(*args)
+
+
+_iket = _IketProxy()
+
+
 @dsl_user_op
 def _map_smem_to_cluster_rank(
     smem_ptr: cute.Pointer,
@@ -11295,16 +11322,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 issue_seq * Int32(self.D_ROUNDS)
                 + Int32(round_index)
             )
-            wait_dq_token = cute.experimental.iket.range_start(
+            wait_dq_token = _iket.range_start(
                 "WAIT_dQ(i,r)",
                 packed_issue,
             )
             round_pipeline.consumer_wait(round_consumer_state)
-            cute.experimental.iket.range_end(
+            _iket.range_end(
                 wait_dq_token,
                 packed_issue,
             )
-            dq_issue_token = cute.experimental.iket.range_start(
+            dq_issue_token = _iket.range_start(
                 "dQ_ISSUE(i,r)",
                 packed_issue,
             )
@@ -11334,7 +11361,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         t_dq_1,
                     )
                     mma.set(tcgen05.Field.ACCUMULATE, True)
-            cute.experimental.iket.range_end(
+            _iket.range_end(
                 dq_issue_token,
                 packed_issue,
             )
@@ -11995,14 +12022,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # ==================================================================
         if warp_idx < Int32(self.GATHER_WARPS):
             # --- gather: rank-owned N32 x D512 score B, one gen per tile.
-            cute.experimental.iket.mark("ROLE_KV_LOAD", rank)
+            _iket.mark("ROLE_KV_LOAD", rank)
             gather_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 1,
             )
             for loop_iter in cutlass.range(tile_count):
                 tile_index = tile_count - Int32(1) - loop_iter
-                load_k_token = cute.experimental.iket.range_start(
+                load_k_token = _iket.range_start(
                     "LOAD_K(i)",
                     loop_iter,
                 )
@@ -12025,7 +12052,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.arch.fence_view_async_shared()
                 pipe_kscore.producer_commit(gather_state)
                 gather_state.advance()
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     load_k_token,
                     loop_iter,
                 )
@@ -12034,10 +12061,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
             # --- math: stats, per-tile softmax + publication, dQ epilogue.
-            cute.experimental.iket.mark("ROLE_MATH", rank)
+            _iket.mark("ROLE_MATH", rank)
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
             if warp_idx == Int32(self.MATH_WARP_BEGIN):
-                load_stats_token = cute.experimental.iket.range_start(
+                load_stats_token = _iket.range_start(
                     "LOAD_STATS",
                     Int32(0),
                 )
@@ -12055,7 +12082,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     load_stats_token,
                     Int32(0),
                 )
@@ -12127,16 +12154,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
 
             for loop_iter in cutlass.range(tile_count):
-                wait_s_token = cute.experimental.iket.range_start(
+                wait_s_token = _iket.range_start(
                     "WAIT_S(i)",
                     loop_iter,
                 )
                 pipe_s_done.consumer_wait(s_state)
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     wait_s_token,
                     loop_iter,
                 )
-                t2r_s_token = cute.experimental.iket.range_start(
+                t2r_s_token = _iket.range_start(
                     "T2R_S(i)",
                     loop_iter,
                 )
@@ -12144,21 +12171,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.arch.fence_view_async_tmem_load()
                 pipe_s_done.consumer_release(s_state)
                 s_state.advance()
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     t2r_s_token,
                     loop_iter,
                 )
 
-                wait_dp_token = cute.experimental.iket.range_start(
+                wait_dp_token = _iket.range_start(
                     "WAIT_dP(i)",
                     loop_iter,
                 )
                 pipe_dp_done.consumer_wait(dp_state)
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     wait_dp_token,
                     loop_iter,
                 )
-                t2r_dp_token = cute.experimental.iket.range_start(
+                t2r_dp_token = _iket.range_start(
                     "T2R_dP(i)",
                     loop_iter,
                 )
@@ -12166,12 +12193,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.arch.fence_view_async_tmem_load()
                 pipe_dp_done.consumer_release(dp_state)
                 dp_state.advance()
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     t2r_dp_token,
                     loop_iter,
                 )
 
-                math_pd_token = cute.experimental.iket.range_start(
+                math_pd_token = _iket.range_start(
                     "MATH_PD(i)",
                     loop_iter,
                 )
@@ -12258,7 +12285,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self.math_barrier.arrive_and_wait()
 
                 if warp_idx == Int32(self.MATH_WARP_BEGIN):
-                    route_p_token = cute.experimental.iket.range_start(
+                    route_p_token = _iket.range_start(
                         "ROUTE_P(i)",
                         loop_iter,
                     )
@@ -12286,12 +12313,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 self.PDS_BLOCK_BYTES,
                                 peer_rank,
                             )
-                    cute.experimental.iket.range_end(
+                    _iket.range_end(
                         route_p_token,
                         loop_iter,
                     )
 
-                    route_ds_token = cute.experimental.iket.range_start(
+                    route_ds_token = _iket.range_start(
                         "ROUTE_dS(i)",
                         loop_iter,
                     )
@@ -12317,7 +12344,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 self.PDS_BLOCK_BYTES,
                                 peer_rank,
                             )
-                    cute.experimental.iket.range_end(
+                    _iket.range_end(
                         route_ds_token,
                         loop_iter,
                     )
@@ -12328,7 +12355,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self.math_barrier.arrive_and_wait()
                 pipe_pds.producer_commit(pds_state)
                 pds_state.advance()
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     math_pd_token,
                     loop_iter,
                 )
@@ -12339,7 +12366,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # rank-owned [D128, H128] slices (disjoint across CTAs/rounds).
             if tile_count > Int32(0):
                 pipe_dq_done.consumer_wait(dq_done_state)
-                dq_epi_0_token = cute.experimental.iket.range_start(
+                dq_epi_0_token = _iket.range_start(
                     "DQ_EPI(r)",
                     Int32(0),
                 )
@@ -12353,11 +12380,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     batch_idx,
                     mtx,
                 )
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     dq_epi_0_token,
                     Int32(0),
                 )
-                dq_epi_1_token = cute.experimental.iket.range_start(
+                dq_epi_1_token = _iket.range_start(
                     "DQ_EPI(r)",
                     Int32(1),
                 )
@@ -12371,7 +12398,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     batch_idx,
                     mtx,
                 )
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     dq_epi_1_token,
                     Int32(1),
                 )
@@ -12397,7 +12424,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         elif warp_idx < Int32(self.MMA_WARP):
             # --- reduce: drain both dKV slots per tile, rank-owned.
-            cute.experimental.iket.mark("ROLE_REDUCE", rank)
+            _iket.mark("ROLE_REDUCE", rank)
             rtx = tidx - Int32(self.REDUCE_THREAD_BEGIN)
             dkv_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
@@ -12428,12 +12455,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
             # executes no pipeline operation at all (FA4 rule).
-            cute.experimental.iket.mark(
+            _iket.mark(
                 self.IKET_V2_NATIVE_PROVENANCE,
                 rank,
             )
             if is_leader_cta:
-                cute.experimental.iket.mark("ROLE_MMA", rank)
+                _iket.mark("ROLE_MMA", rank)
                 s_prod = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
                     1,
@@ -12555,7 +12582,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
                 # Drain the final tile's gradients.
                 if tile_count > Int32(0):
-                    tail_token = cute.experimental.iket.range_start(
+                    tail_token = _iket.range_start(
                         "TAIL",
                         tile_count - Int32(1),
                     )
@@ -12614,14 +12641,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_dp_done.producer_tail(dp_prod)
                     pipe_dkv_done.producer_tail(dkv_prod)
                     pipe_dq_done.producer_tail(dq_done_prod)
-                    cute.experimental.iket.range_end(
+                    _iket.range_end(
                         tail_token,
                         tile_count - Int32(1),
                     )
 
         elif warp_idx == Int32(self.LOAD_WARP):
             # --- load: stationary TMA once, then 10 round gens per tile.
-            cute.experimental.iket.mark("ROLE_KV_LOAD", rank)
+            _iket.mark("ROLE_KV_LOAD", rank)
             lane_idx = tidx % Int32(32)
             round_prod = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
@@ -12629,7 +12656,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             tma_phase = Int32(0)
             if tile_count > Int32(0):
-                load_qdo_token = cute.experimental.iket.range_start(
+                load_qdo_token = _iket.range_start(
                     "LOAD_QDO",
                     Int32(0),
                 )
@@ -12654,7 +12681,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     t_do_smem[None, 0],
                     tma_bar_ptr=stationary_tma_mbars + 1,
                 )
-                cute.experimental.iket.range_end(
+                _iket.range_end(
                     load_qdo_token,
                     Int32(0),
                 )
@@ -12677,7 +12704,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         tile_count - Int32(1) - loop_iter
                     )
                     # g0/g1: K_dQ r0 (buf A), r1 (buf B) via cp.async.
-                    route_k_token = cute.experimental.iket.range_start(
+                    route_k_token = _iket.range_start(
                         "ROUTE_K(i)",
                         loop_iter,
                     )
@@ -12726,7 +12753,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         with cute.arch.elect_one():
                             pipe_round.producer_commit(round_prod)
                         round_prod.advance()
-                    cute.experimental.iket.range_end(
+                    _iket.range_end(
                         route_k_token,
                         loop_iter,
                     )
@@ -12741,7 +12768,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             + Int32(grad_round)
                         )
                         mat_qdo_token = (
-                            cute.experimental.iket.range_start(
+                            _iket.range_start(
                                 "MAT_QDO(m,r)",
                                 packed_mat_qdo,
                             )
@@ -12820,7 +12847,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                         round_prod
                                     )
                                 round_prod.advance()
-                        cute.experimental.iket.range_end(
+                        _iket.range_end(
                             mat_qdo_token,
                             packed_mat_qdo,
                         )
@@ -12873,27 +12900,27 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         """Issue one score-side CG2 GEMM over four resident D128 chunks."""
 
         if cutlass.const_expr(is_dp):
-            acquire_token = cute.experimental.iket.range_start(
+            acquire_token = _iket.range_start(
                 "dP_ACQUIRE(i)",
                 issue_seq,
             )
         else:
-            acquire_token = cute.experimental.iket.range_start(
+            acquire_token = _iket.range_start(
                 "S_ACQUIRE(i)",
                 issue_seq,
             )
         done_pipeline.producer_acquire(producer_state)
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             acquire_token,
             issue_seq,
         )
         if cutlass.const_expr(is_dp):
-            mma_issue_token = cute.experimental.iket.range_start(
+            mma_issue_token = _iket.range_start(
                 "dP_ISSUE(i)",
                 issue_seq,
             )
         else:
-            mma_issue_token = cute.experimental.iket.range_start(
+            mma_issue_token = _iket.range_start(
                 "S_ISSUE(i)",
                 issue_seq,
             )
@@ -12913,24 +12940,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 accumulator,
             )
             mma.set(tcgen05.Field.ACCUMULATE, True)
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             mma_issue_token,
             issue_seq,
         )
         if cutlass.const_expr(is_dp):
-            publish_token = cute.experimental.iket.range_start(
+            publish_token = _iket.range_start(
                 "dP_PUBLISH(i)",
                 issue_seq,
             )
         else:
-            publish_token = cute.experimental.iket.range_start(
+            publish_token = _iket.range_start(
                 "S_PUBLISH(i)",
                 issue_seq,
             )
         cute.arch.fence_view_async_tmem_store()
         done_pipeline.producer_commit(producer_state)
         producer_state.advance()
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             publish_token,
             issue_seq,
         )
@@ -12997,7 +13024,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         packed_issue = issue_seq * Int32(self.D_ROUNDS * 4)
         dkv_done_pipeline.producer_acquire(dkv_producer_state)
         round_pipeline.consumer_wait(round_consumer_state)
-        dkv_issue_token = cute.experimental.iket.range_start(
+        dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue,
         )
@@ -13008,14 +13035,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             p_fragment_0,
             False,
         )
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             dkv_issue_token,
             packed_issue,
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        dkv_issue_token = cute.experimental.iket.range_start(
+        dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(1),
         )
@@ -13026,14 +13053,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             p_fragment_1,
             True,
         )
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             dkv_issue_token,
             packed_issue + Int32(1),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        dkv_issue_token = cute.experimental.iket.range_start(
+        dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(2),
         )
@@ -13044,14 +13071,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ds_fragment_0,
             True,
         )
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             dkv_issue_token,
             packed_issue + Int32(2),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        dkv_issue_token = cute.experimental.iket.range_start(
+        dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(3),
         )
@@ -13062,7 +13089,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ds_fragment_1,
             True,
         )
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             dkv_issue_token,
             packed_issue + Int32(3),
         )
@@ -13102,7 +13129,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         dkv_done_pipeline.producer_acquire(dkv_producer_state)
         round_pipeline.consumer_wait(round_consumer_state)
-        dkv_issue_token = cute.experimental.iket.range_start(
+        dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue,
         )
@@ -13113,14 +13140,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             p_fragment_0,
             False,
         )
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             dkv_issue_token,
             packed_issue,
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        dkv_issue_token = cute.experimental.iket.range_start(
+        dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(1),
         )
@@ -13131,14 +13158,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             p_fragment_1,
             True,
         )
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             dkv_issue_token,
             packed_issue + Int32(1),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        dkv_issue_token = cute.experimental.iket.range_start(
+        dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(2),
         )
@@ -13149,14 +13176,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ds_fragment_0,
             True,
         )
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             dkv_issue_token,
             packed_issue + Int32(2),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        dkv_issue_token = cute.experimental.iket.range_start(
+        dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(3),
         )
@@ -13167,7 +13194,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ds_fragment_1,
             True,
         )
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             dkv_issue_token,
             packed_issue + Int32(3),
         )
@@ -13210,17 +13237,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             issue_seq * Int32(self.D_ROUNDS)
             + Int32(round_index)
         )
-        wait_dk_token = cute.experimental.iket.range_start(
+        wait_dk_token = _iket.range_start(
             "WAIT_dK(i,r)",
             packed_issue,
         )
         done_pipeline.consumer_wait(consumer_state)
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             wait_dk_token,
             packed_issue,
         )
 
-        reduce_t2r_token = cute.experimental.iket.range_start(
+        reduce_t2r_token = _iket.range_start(
             "REDUCE_T2R(i,r)",
             packed_issue,
         )
@@ -13249,13 +13276,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         cute.arch.fence_view_async_tmem_load()
         done_pipeline.consumer_release(consumer_state)
         consumer_state.advance()
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             reduce_t2r_token,
             packed_issue,
         )
 
         assert cute.size(thread_values) == self.N_TILE // 2
-        reduce_atomic_token = cute.experimental.iket.range_start(
+        reduce_atomic_token = _iket.range_start(
             "REDUCE_ATOMIC(i,r)",
             packed_issue,
         )
@@ -13367,7 +13394,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     vector_3,
                     destination_ptr,
                 )
-        cute.experimental.iket.range_end(
+        _iket.range_end(
             reduce_atomic_token,
             packed_issue,
         )
