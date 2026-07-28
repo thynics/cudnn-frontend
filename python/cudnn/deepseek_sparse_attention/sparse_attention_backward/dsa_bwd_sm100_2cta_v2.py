@@ -12707,6 +12707,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # The inherited canonical kernel still receives block_tile=64 normally.
     N_TILE = FlashAttentionDSABackwardSm100TwoCTA.N_TILE
 
+    @cute.jit
     def __call__(
         self,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
