@@ -4671,7 +4671,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         return producer_state
 
     @cute.jit
-    def _begin_bq_refill(
+    def _refill_bq_task(
         self,
         round_index: cutlass.Constexpr[int],
         bv_slot: Int32,
@@ -4697,7 +4697,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         trace_token_idx: Int32,
         trace_batch_idx: Int32,
     ) -> None:
-        """Issue one admitted BQ TMA without waiting for its completion."""
+        """Service one already-admitted BV refill without taking a whole slot."""
 
         if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
@@ -4771,28 +4771,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             t_qt_smem[None],
             tma_bar_ptr=grad_q_source_mbars + bv_slot,
         )
-
-    @cute.jit
-    def _finish_bq_refill(
-        self,
-        round_index: cutlass.Constexpr[int],
-        bv_slot: Int32,
-        grad_q_source_mbars: cute.Pointer,
-        do_empty_pipeline,
-        do_state: pipeline.PipelineState,
-        q_full_pipeline,
-        q_state: pipeline.PipelineState,
-        issue_seq: Int32,
-        rank: Int32,
-        tidx: Int32,
-        token_idx: Int32,
-        batch_idx: Int32,
-        trace_buffer: Optional[cute.Tensor],
-        trace_token_idx: Int32,
-        trace_batch_idx: Int32,
-    ) -> None:
-        """Publish one BQ refill after its source transaction is ready."""
-
         with cute.arch.elect_one():
             cute.arch.mbarrier_wait(
                 grad_q_source_mbars + bv_slot,
@@ -7378,10 +7356,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                     )
 
         # W7 multiplexes descriptor production and the older BV's Q refill.
-        # BQ admission and issue remain highest priority, but descriptor work
-        # may advance while the Q TMA is in flight.  Both the source-TMA and
-        # cross-CTA consensus barriers are polled so either ready dependency
-        # can be retired without waiting behind the other.
+        # A pending executable descriptor never blocks on IssuedCtx credit:
+        # while its target slot is live, dO-empty is polled and serviced
+        # first.  Traversal completion publishes sticky done independently
+        # of both metadata-ring and BQ credit.
         if (
             cutlass.const_expr(
                 self.DIAGNOSTIC_AUX_STAGE >= 3
@@ -7391,10 +7369,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             traversal_seq = Int32(0)
             committed_count = Int32(0)
             pending_descriptor = cutlass.Boolean(False)
-            descriptor_consensus_pending = cutlass.Boolean(False)
             done_published = cutlass.Boolean(False)
             refill_count = Int32(0)
-            refill_inflight = cutlass.Boolean(False)
             whole_ordinal = Int32(self.K_CHUNKS)
             engine_active = cutlass.Boolean(True)
             while engine_active:
@@ -7405,7 +7381,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 refill_round = (
                     refill_count % Int32(self.D_ROUNDS)
                 )
-                if refill_inflight:
+                refill_admitted = cutlass.Boolean(False)
+                refill_has_next = cutlass.Boolean(False)
+                if refill_issue_seq < committed_count:
+                    if (
+                        refill_issue_seq + Int32(1)
+                        < committed_count
+                    ):
+                        refill_admitted = cutlass.Boolean(True)
+                        refill_has_next = cutlass.Boolean(True)
+                    else:
+                        if done_published:
+                            refill_admitted = cutlass.Boolean(True)
+
+                if refill_admitted:
                     do_phase = (
                         refill_count // Int32(self.ROUND_STAGES)
                     ) & Int32(1)
@@ -7421,23 +7410,34 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         refill_count % Int32(self.ROUND_STAGES),
                         Int32(1) ^ do_phase,
                     )
-                    refill_slot = (
-                        whole_ordinal % Int32(self.OP_STAGES)
+                    do_ready = (
+                        do_empty_pipeline.consumer_try_wait(
+                            do_state
+                        )
                     )
-                    refill_ready = _mbarrier_try_wait(
-                        grad_q_source_mbars_ptr + refill_slot,
-                        Int32(0),
-                    )
-                    if refill_ready:
+                    if do_ready:
                         if refill_round == Int32(0):
-                            self._finish_bq_refill(
+                            if refill_has_next:
+                                whole_ordinal += Int32(
+                                    self.K_CHUNKS
+                                )
+                            self._refill_bq_task(
                                 0,
-                                refill_slot,
+                                whole_ordinal
+                                % Int32(self.OP_STAGES),
+                                raw_slots,
+                                dkv_a_layout,
+                                tma_atom_qt,
+                                rank_g_qt,
+                                block_coord_vmnk,
+                                a_cta_layout,
                                 grad_q_source_mbars_ptr,
                                 do_empty_pipeline,
                                 do_state,
+                                do_ready,
                                 q_full_pipeline,
                                 q_state,
+                                grad_a_stage_bytes,
                                 refill_issue_seq,
                                 rank,
                                 tidx,
@@ -7448,14 +7448,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                                 trace_batch_idx,
                             )
                         else:
-                            self._finish_bq_refill(
+                            self._refill_bq_task(
                                 1,
-                                refill_slot,
+                                whole_ordinal
+                                % Int32(self.OP_STAGES),
+                                raw_slots,
+                                dkv_a_layout,
+                                tma_atom_qt,
+                                rank_g_qt,
+                                block_coord_vmnk,
+                                a_cta_layout,
                                 grad_q_source_mbars_ptr,
                                 do_empty_pipeline,
                                 do_state,
+                                do_ready,
                                 q_full_pipeline,
                                 q_state,
+                                grad_a_stage_bytes,
                                 refill_issue_seq,
                                 rank,
                                 tidx,
@@ -7467,155 +7476,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             )
                         whole_ordinal += Int32(1)
                         refill_count += Int32(1)
-                        refill_inflight = cutlass.Boolean(False)
                         progressed = cutlass.Boolean(True)
 
                 if not progressed:
-                    refill_admitted = cutlass.Boolean(False)
-                    refill_has_next = cutlass.Boolean(False)
-                    if not refill_inflight:
-                        if refill_issue_seq < committed_count:
-                            if (
-                                refill_issue_seq + Int32(1)
-                                < committed_count
-                            ):
-                                refill_admitted = (
-                                    cutlass.Boolean(True)
-                                )
-                                refill_has_next = (
-                                    cutlass.Boolean(True)
-                                )
-                            else:
-                                if done_published:
-                                    refill_admitted = (
-                                        cutlass.Boolean(True)
-                                    )
-
-                    if refill_admitted:
-                        do_phase = (
-                            refill_count
-                            // Int32(self.ROUND_STAGES)
-                        ) & Int32(1)
-                        do_state = pipeline.PipelineState(
-                            self.ROUND_STAGES,
-                            refill_count,
-                            refill_count
-                            % Int32(self.ROUND_STAGES),
-                            do_phase,
-                        )
-                        q_state = pipeline.PipelineState(
-                            self.ROUND_STAGES,
-                            refill_count,
-                            refill_count
-                            % Int32(self.ROUND_STAGES),
-                            Int32(1) ^ do_phase,
-                        )
-                        do_ready = (
-                            do_empty_pipeline.consumer_try_wait(
-                                do_state
-                            )
-                        )
-                        if do_ready:
-                            if refill_round == Int32(0):
-                                if refill_has_next:
-                                    whole_ordinal += Int32(
-                                        self.K_CHUNKS
-                                    )
-                                self._begin_bq_refill(
-                                    0,
-                                    whole_ordinal
-                                    % Int32(self.OP_STAGES),
-                                    raw_slots,
-                                    dkv_a_layout,
-                                    tma_atom_qt,
-                                    rank_g_qt,
-                                    block_coord_vmnk,
-                                    a_cta_layout,
-                                    grad_q_source_mbars_ptr,
-                                    do_empty_pipeline,
-                                    do_state,
-                                    do_ready,
-                                    q_full_pipeline,
-                                    q_state,
-                                    grad_a_stage_bytes,
-                                    refill_issue_seq,
-                                    rank,
-                                    tidx,
-                                    token_idx,
-                                    batch_idx,
-                                    trace_buffer,
-                                    trace_token_idx,
-                                    trace_batch_idx,
-                                )
-                            else:
-                                self._begin_bq_refill(
-                                    1,
-                                    whole_ordinal
-                                    % Int32(self.OP_STAGES),
-                                    raw_slots,
-                                    dkv_a_layout,
-                                    tma_atom_qt,
-                                    rank_g_qt,
-                                    block_coord_vmnk,
-                                    a_cta_layout,
-                                    grad_q_source_mbars_ptr,
-                                    do_empty_pipeline,
-                                    do_state,
-                                    do_ready,
-                                    q_full_pipeline,
-                                    q_state,
-                                    grad_a_stage_bytes,
-                                    refill_issue_seq,
-                                    rank,
-                                    tidx,
-                                    token_idx,
-                                    batch_idx,
-                                    trace_buffer,
-                                    trace_token_idx,
-                                    trace_batch_idx,
-                                )
-                            refill_inflight = cutlass.Boolean(
-                                True
-                            )
-                            progressed = cutlass.Boolean(True)
-
-                if not progressed:
-                    if descriptor_consensus_pending:
-                        descriptor_slot = (
-                            traversal_seq
-                            % Int32(self.CONTEXT_STAGES)
-                        )
-                        descriptor_phase = (
-                            traversal_seq
-                            // Int32(self.CONTEXT_STAGES)
-                        ) & Int32(1)
-                        consensus_ready = _mbarrier_try_wait(
-                            descriptor_consensus_mbars_ptr
-                            + descriptor_slot,
-                            descriptor_phase,
-                        )
-                        if consensus_ready:
-                            with cute.arch.elect_one():
-                                self._wait_pair(
-                                    descriptor_consensus_mbars_ptr
-                                    + descriptor_slot,
-                                    descriptor_phase,
-                                )
-                            cute.arch.sync_warp()
-                            cute.arch.fence_view_async_shared()
-                            pending_descriptor = (
-                                traversal_descriptor[
-                                    self.DESCRIPTOR_EXECUTE_WORD
-                                ]
-                                != Int32(0)
-                            )
-                            traversal_seq += Int32(1)
-                            descriptor_consensus_pending = (
-                                cutlass.Boolean(False)
-                            )
-                            progressed = cutlass.Boolean(True)
-
-                if not progressed and not descriptor_consensus_pending:
                     if pending_descriptor:
                         slot = (
                             committed_count
@@ -7669,6 +7532,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                                 traversal_seq
                                 % Int32(self.CONTEXT_STAGES)
                             )
+                            descriptor_phase = (
+                                traversal_seq
+                                // Int32(self.CONTEXT_STAGES)
+                            ) & Int32(1)
                             if tidx == Int32(
                                 self.DESCRIPTOR_WARP * 32
                             ):
@@ -7711,10 +7578,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                                     + descriptor_slot,
                                     peer_rank,
                                 )
+                                self._wait_pair(
+                                    descriptor_consensus_mbars_ptr
+                                    + descriptor_slot,
+                                    descriptor_phase,
+                                )
                             cute.arch.sync_warp()
-                            descriptor_consensus_pending = (
-                                cutlass.Boolean(True)
+                            cute.arch.fence_view_async_shared()
+                            pending_descriptor = (
+                                traversal_descriptor[
+                                    self.DESCRIPTOR_EXECUTE_WORD
+                                ]
+                                != Int32(0)
                             )
+                            traversal_seq += Int32(1)
                             progressed = cutlass.Boolean(True)
                         else:
                             if not done_published:
