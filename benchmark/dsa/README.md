@@ -36,6 +36,40 @@ FLOPs = 2 * S_q * H * topk * (3 * d_qk + 2 * d_v)
 
 ## How to run
 
+### B200 correctness + performance + IKET
+
+The repository entry point below selects the self-contained `v0` or `v1`
+implementation after synchronizing the fixed Computelab worktree with
+`git pull --ff-only`. It pairs that implementation with
+`dsa_bwd_sm100_baseline.py`, serializes concurrent callers through the single
+global B200 manager, and runs the canonical correctness, uninstrumented
+performance, and two-trace IKET pipeline:
+
+```bash
+./benchmark/dsa/run_b200_pipeline.sh --impl v1
+```
+
+It streams every stage to the terminal. On success it downloads only compact
+JSON summaries and the two-table Markdown report, then prints that report.
+Raw baseline and candidate traces remain in Computelab scratch. On failure it
+returns the remote non-zero exit code and downloads stage status plus bounded
+log tails when those artifacts exist.
+
+Useful options:
+
+```bash
+./benchmark/dsa/run_b200_pipeline.sh \
+  --impl v0 \
+  --note reducer-check \
+  --output-dir /path/to/lightweight-results
+```
+
+The default local result directory is `.dsa_b200_results/<run-id>/`.
+The global manager keeps one `crun` allocation and one Docker container alive
+for reuse. If it has not been created yet, the same command blocks while the
+manager allocates a B200 and deploys the container. Callers never attach to or
+manage the allocation directly; lock release is automatic on every exit path.
+
 Default sweep (`seqlens 4096,8192 x topks 128,512,1024,2048`, bf16,
 `d_qk = d_v = 512`, 64 heads):
 

@@ -207,6 +207,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Local lightweight summaries from benchmark/dsa/run_b200_pipeline.sh.
+.dsa_b200_results/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
