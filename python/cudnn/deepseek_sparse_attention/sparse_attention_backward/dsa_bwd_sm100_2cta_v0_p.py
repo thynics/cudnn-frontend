@@ -544,13 +544,41 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             score_a_layout_staged,
             mode=[0, 1, 2],
         )
+        # M256 SDP uses a local M128 A image whose two H64 halves are
+        # interleaved across the K-high mode.  Derive the native H64 view
+        # for the existing per-rank Q/dO TMA loads instead of treating the
+        # two halves as contiguous 16-KiB M128 operands.
+        sdp_a_halves = cute.zipped_divide(
+            sdp_a_layout,
+            score_a_layout.shape,
+        )
+        sdp_a_half_layout = cute.slice_(
+            sdp_a_halves,
+            (
+                ((None, None), None, (None, None)),
+                ((0, 0), 0, (0, 0)),
+            ),
+        )
+        sdp_a_half_layout = cute.group_modes(
+            sdp_a_half_layout,
+            0,
+            2,
+        )
+        sdp_a_half_layout = cute.group_modes(
+            sdp_a_half_layout,
+            2,
+            4,
+        )
+        assert cute.size(sdp_a_half_layout) == (
+            self.H_TILE_CTA * self.K_CHUNK
+        )
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(
             tcgen05.CtaGroup.ONE
         )
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             mQ,
-            score_a_layout,
+            sdp_a_half_layout,
             score_tiler,
             score_tiled_mma,
             cluster_layout_vmnk.shape,
@@ -558,14 +586,15 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         tma_atom_do, tma_tensor_do = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             mdO,
-            score_a_layout,
+            sdp_a_half_layout,
             score_tiler,
             dp_tiled_mma,
             cluster_layout_vmnk.shape,
         )
-        score_a_stage_bytes = cute.size_in_bytes(
-            self.element_dtype,
-            score_a_layout,
+        score_a_stage_bytes = (
+            cute.size(sdp_a_half_layout)
+            * self.element_dtype.width
+            // 8
         )
         grad_a_layout = cute.select(
             dkv_a_layout_staged,
@@ -692,6 +721,27 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             score_epi_tile,
             True,
         )
+        score_quad_cta_shape = (
+            self.H_TILE_CTA,
+            self.N_TILE_CTA,
+            self.K_CHUNK,
+        )
+        score_quad_epi_tile = (
+            sm100_utils.compute_epilogue_tile_shape(
+                score_quad_cta_shape,
+                True,
+                utils.LayoutEnum.ROW_MAJOR,
+                self.acc_dtype,
+            )
+        )
+        score_quad_tmem_load = sm100_utils.get_tmem_load_op(
+            score_quad_cta_shape,
+            utils.LayoutEnum.ROW_MAJOR,
+            self.acc_dtype,
+            self.acc_dtype,
+            score_quad_epi_tile,
+            True,
+        )
         dkv_cta_shape = (
             self.D_TILE_CTA,
             self.N_TILE,
@@ -796,6 +846,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             score_a_layout_staged,
             score_b_layout_staged,
             sdp_a_layout,
+            sdp_a_half_layout,
             sdp_b_layout,
             dkv_a_layout_staged,
             dkv_b_layout_staged,
@@ -803,6 +854,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             dq_b_layout_staged,
             cluster_layout_vmnk,
             score_tmem_load,
+            score_quad_tmem_load,
             dkv_tmem_load,
             dq_tmem_load,
             tma_atom_dq_epi,
@@ -1664,6 +1716,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         score_a_layout_staged: cute.ComposedLayout,
         score_b_layout_staged: cute.ComposedLayout,
         sdp_a_layout: cute.ComposedLayout,
+        sdp_a_half_layout: cute.ComposedLayout,
         sdp_b_layout: cute.ComposedLayout,
         dkv_a_layout_staged: cute.ComposedLayout,
         dkv_b_layout_staged: cute.ComposedLayout,
@@ -1671,6 +1724,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         dq_b_layout_staged: cute.ComposedLayout,
         cluster_layout_vmnk: cute.Layout,
         score_tmem_load: cute.CopyAtom,
+        score_quad_tmem_load: cute.CopyAtom,
         dkv_tmem_load: cute.CopyAtom,
         dq_tmem_load: cute.CopyAtom,
         tma_atom_dq_epi: cute.CopyAtom,
@@ -1686,6 +1740,8 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
 
         # The sequential checkpoint keeps its direct dQ stores.  These
         # launcher-built values are consumed by the v0 kernel override.
+        _ = sdp_a_half_layout
+        _ = score_quad_tmem_load
         _ = tma_atom_dq_epi
         _ = tma_tensor_dq_epi
         _ = dq_epi_layout_staged
@@ -2911,6 +2967,8 @@ def _run_math_role(
     reducer_ctx: cute.Tensor,
     t_score: cute.Tensor,
     t_dp: cute.Tensor,
+    t_score_r2s_basis: cute.Tensor,
+    score_quad_tmem_load: cute.CopyAtom,
     score_tmem_load: cute.CopyAtom,
     rank_score_coordinates: cute.Tensor,
     scaled_lse: cute.Tensor,
@@ -2949,19 +3007,77 @@ def _run_math_role(
     math_tidx = tidx - self.MATH_WARPS[0] * 32
     is_math_leader = math_tidx == 0
     peer = Int32(1) - rank
-
-    score_copy = tcgen05.make_tmem_copy(
-        score_tmem_load,
-        t_score,
+    n_owner = cute.arch.make_warp_uniform(
+        math_tidx // Int32(self.H_TILE_CTA)
     )
-    score_thread = score_copy.get_slice(math_tidx)
-    score_source = score_thread.partition_S(t_score)
-    score_coordinates = score_thread.partition_D(
-        rank_score_coordinates
+    local_math_tidx = math_tidx % Int32(self.H_TILE_CTA)
+
+    score_quad_core_layout = cute.make_layout(
+        (self.H_TILE_CTA, self.N_TILE_CTA),
+        stride=(1 << 16, 1),
+    )
+    score_quad_full_layout = cute.make_layout(
+        (score_quad_core_layout.shape, 1, 1),
+        stride=(score_quad_core_layout.stride, 0, 0),
+    )
+    raw_score_quad = t_score[
+        ((None, None), 0, 0, n_owner)
+    ]
+    raw_dp_quad = t_dp[
+        ((None, None), 0, 0, n_owner)
+    ]
+    score_quad = cute.make_tensor(
+        raw_score_quad.iterator,
+        score_quad_full_layout,
+    )
+    dp_quad = cute.make_tensor(
+        raw_dp_quad.iterator,
+        score_quad_full_layout,
+    )
+    score_quad_copy = tcgen05.make_tmem_copy(
+        score_quad_tmem_load,
+        score_quad,
+    )
+    score_quad_thread = score_quad_copy.get_slice(
+        local_math_tidx
+    )
+    score_source = score_quad_thread.partition_S(
+        score_quad
+    )
+    score_quad_identity = cute.make_identity_tensor(
+        (self.H_TILE_CTA, self.N_TILE_CTA)
+    )
+    score_quad_identity = cute.make_tensor(
+        score_quad_identity.iterator,
+        cute.make_layout(
+            (score_quad_identity.layout.shape, 1, 1),
+            stride=(score_quad_identity.layout.stride, 0, 0),
+        ),
+    )
+    score_quad_coordinates = score_quad_thread.partition_D(
+        score_quad_identity
     )
     r_score = cute.make_rmem_tensor(
-        score_coordinates.shape,
+        score_quad_coordinates.shape,
         self.acc_dtype,
+    )
+    dp_source = score_quad_thread.partition_S(
+        dp_quad
+    )
+    r_dp = cute.make_rmem_tensor(
+        score_quad_coordinates.shape,
+        self.acc_dtype,
+    )
+
+    # Keep the former CG2 M128 distribution only for the proven R2S
+    # mapping.  No T2R instruction reads through this alias.
+    score_r2s_copy = tcgen05.make_tmem_copy(
+        score_tmem_load,
+        t_score_r2s_basis,
+    )
+    score_r2s_thread = score_r2s_copy.get_slice(math_tidx)
+    score_coordinates = score_r2s_thread.partition_D(
+        rank_score_coordinates
     )
     r_p = cute.make_rmem_tensor(
         score_coordinates.shape,
@@ -2975,26 +3091,15 @@ def _run_math_role(
         utils.LayoutEnum.COL_MAJOR,
         self.element_dtype,
         self.acc_dtype,
-        score_copy,
+        score_r2s_copy,
     )
     tiled_copy_r2s = cute.make_tiled_copy_D(
         smem_store_atom,
-        score_copy,
+        score_r2s_copy,
     )
     thread_copy_r2s = tiled_copy_r2s.get_slice(math_tidx)
     r_p_store = thread_copy_r2s.retile(r_p)
     r_dsq_store = thread_copy_r2s.retile(r_dsq)
-    dp_copy = tcgen05.make_tmem_copy(
-        score_tmem_load,
-        t_dp,
-    )
-    dp_thread = dp_copy.get_slice(math_tidx)
-    dp_source = dp_thread.partition_S(t_dp)
-    r_dp = cute.make_rmem_tensor(
-        score_coordinates.shape,
-        self.acc_dtype,
-    )
-
     s_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer,
         1,
@@ -3122,7 +3227,7 @@ def _run_math_role(
                 TRACE_S_T2R_BEGIN,
             )
         math_barrier.arrive_and_wait()
-        cute.copy(score_copy, score_source, r_score)
+        cute.copy(score_quad_copy, score_source, r_score)
         cute.arch.fence_view_async_tmem_load()
         math_barrier.arrive_and_wait()
         if is_math_leader:
@@ -3176,7 +3281,7 @@ def _run_math_role(
                 TRACE_DP_T2R_BEGIN,
             )
         math_barrier.arrive_and_wait()
-        cute.copy(dp_copy, dp_source, r_dp)
+        cute.copy(score_quad_copy, dp_source, r_dp)
         cute.arch.fence_view_async_tmem_load()
         math_barrier.arrive_and_wait()
         if is_math_leader:
@@ -3653,7 +3758,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     OP_BYTES_PER_STAGE = 48 * 1024
     OP_PAYLOAD_BYTES = OP_STAGES * OP_BYTES_PER_STAGE
     OP_MAIN_OFFSET_BYTES = 0
-    OP_F_DO_OFFSET_BYTES = 16 * 1024
+    OP_F_DO_OFFSET_BYTES = 8 * 1024
     OP_SIDE_OFFSET_BYTES = 32 * 1024
 
     PD_NESTED_ELEMENTS_PER_STAGE = 32 * 128
@@ -4352,7 +4457,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     def _load_f_task(
         self,
         raw_slots: cute.Tensor,
-        score_a_layout: cute.ComposedLayout,
+        sdp_a_half_layout: cute.ComposedLayout,
         score_b_layout: cute.ComposedLayout,
         tma_atom_q: cute.CopyAtom,
         tma_atom_do: cute.CopyAtom,
@@ -4427,13 +4532,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             raw_slots,
             slot,
             self.OP_MAIN_OFFSET_BYTES,
-            score_a_layout,
+            sdp_a_half_layout,
         )
         f_do = self._make_operand_slot_view(
             raw_slots,
             slot,
             self.OP_F_DO_OFFSET_BYTES,
-            score_a_layout,
+            sdp_a_half_layout,
         )
         f_kv = self._make_operand_slot_view(
             raw_slots,
@@ -6046,6 +6151,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         score_a_layout_staged: cute.ComposedLayout,
         score_b_layout_staged: cute.ComposedLayout,
         sdp_a_layout: cute.ComposedLayout,
+        sdp_a_half_layout: cute.ComposedLayout,
         sdp_b_layout: cute.ComposedLayout,
         dkv_a_layout_staged: cute.ComposedLayout,
         dkv_b_layout_staged: cute.ComposedLayout,
@@ -6053,6 +6159,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         dq_b_layout_staged: cute.ComposedLayout,
         cluster_layout_vmnk: cute.Layout,
         score_tmem_load: cute.CopyAtom,
+        score_quad_tmem_load: cute.CopyAtom,
         dkv_tmem_load: cute.CopyAtom,
         dq_tmem_load: cute.CopyAtom,
         tma_atom_dq_epi: cute.CopyAtom,
@@ -6630,11 +6737,39 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             t_sdp[((None, None), 0, 0)],
             (self.H_TILE_CTA, self.N_TILE),
         )
-        # Keep the native M256 row-major TMEM layout for each H64 half.
-        # Rewrapping these iterators in the former M128 CG2 layout would
-        # make its high N32 mode jump into the other half's datapath.
-        t_score = t_sdp_epi[(None, None, 0, 0)]
-        t_dp = t_sdp_epi[(None, None, 1, 0)]
+        score_half = t_sdp_epi[(None, None, 0, 0)]
+        dp_half = t_sdp_epi[(None, None, 1, 0)]
+        # M256 stores each local H64xN64 half as (h,n):(2^16,1).
+        # Expose its two N32 quadrants explicitly so W8/W10 and W9/W11
+        # retain the established one-row, one-N32 ownership contract.
+        score_quad_layout = cute.make_layout(
+            (
+                (self.H_TILE_CTA, self.N_TILE_CTA),
+                1,
+                1,
+                self.N_TILE // self.N_TILE_CTA,
+            ),
+            stride=(
+                (1 << 16, 1),
+                0,
+                0,
+                self.N_TILE_CTA,
+            ),
+        )
+        t_score = cute.make_tensor(
+            score_half.iterator,
+            score_quad_layout,
+        )
+        t_dp = cute.make_tensor(
+            dp_half.iterator,
+            score_quad_layout,
+        )
+        # This legacy-layout alias is never read from TMEM.  It only
+        # preserves the proven 128-thread register-to-SMEM distribution.
+        t_score_r2s_basis = cute.make_tensor(
+            tmem_ptr + self.TMEM_S_OFFSET,
+            score_c_layout,
+        )
         t_dkv = (
             cute.make_tensor(
                 tmem_ptr + self.TMEM_DKV0_OFFSET,
@@ -6727,8 +6862,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         rank_dp_mma = dp_tiled_mma.get_slice(rank)
         rank_dkv_mma = dkv_tiled_mma.get_slice(rank)
         rank_dq_mma = dq_tiled_mma.get_slice(rank)
-        rank_score_coordinates = cute.make_identity_tensor(
-            (self.H_TILE_CTA, self.N_TILE)
+        rank_score_coordinates = rank_score_mma.partition_C(
+            cute.make_identity_tensor(
+                (self.H_TILE_CLUSTER, self.N_TILE)
+            )
         )
         rank_dkv_coordinates = rank_dkv_mma.partition_C(
             cute.make_identity_tensor(self.DKV_MMA_TILER[:2])
@@ -6953,7 +7090,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 for chunk in cutlass.range_constexpr(self.K_CHUNKS):
                     producer_state = self._load_f_task(
                         raw_slots,
-                        score_a_layout,
+                        sdp_a_half_layout,
                         score_b_layout,
                         tma_atom_q,
                         tma_atom_do,
@@ -7008,7 +7145,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             if has_next:
                                 producer_state = self._load_f_task(
                                     raw_slots,
-                                    score_a_layout,
+                                    sdp_a_half_layout,
                                     score_b_layout,
                                     tma_atom_q,
                                     tma_atom_do,
@@ -7760,6 +7897,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 reducer_ctx_ring,
                 t_score,
                 t_dp,
+                t_score_r2s_basis,
+                score_quad_tmem_load,
                 score_tmem_load,
                 rank_score_coordinates,
                 scaled_lse,
