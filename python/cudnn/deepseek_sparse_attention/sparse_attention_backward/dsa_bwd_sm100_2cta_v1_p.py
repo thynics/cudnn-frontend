@@ -10196,6 +10196,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
             has_lane_1 = (
                 ordinal_0 + Int32(1) < Int32(tile_count)
             )
+            logical_tile_1 = Int32(-1)
             if has_lane_1:
                 logical_tile_1 = (
                     Int32(tile_count - 2) - ordinal_0
