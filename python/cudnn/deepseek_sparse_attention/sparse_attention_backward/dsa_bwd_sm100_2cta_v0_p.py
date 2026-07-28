@@ -6630,19 +6630,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             t_sdp[((None, None), 0, 0)],
             (self.H_TILE_CTA, self.N_TILE),
         )
-        score_sdp_view = t_sdp_epi[(None, None, 0, 0)]
-        dp_sdp_view = t_sdp_epi[(None, None, 1, 0)]
-        # Preserve the M256 layout's true per-half iterator offsets, then
-        # restore the original M128 fragment ranks expected by the T2R
-        # copy atom.
-        t_score = cute.make_tensor(
-            score_sdp_view.iterator,
-            score_c_layout,
-        )
-        t_dp = cute.make_tensor(
-            dp_sdp_view.iterator,
-            dp_c_layout,
-        )
+        # Keep the native M256 row-major TMEM layout for each H64 half.
+        # Rewrapping these iterators in the former M128 CG2 layout would
+        # make its high N32 mode jump into the other half's datapath.
+        t_score = t_sdp_epi[(None, None, 0, 0)]
+        t_dp = t_sdp_epi[(None, None, 1, 0)]
         t_dkv = (
             cute.make_tensor(
                 tmem_ptr + self.TMEM_DKV0_OFFSET,
@@ -6735,10 +6727,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         rank_dp_mma = dp_tiled_mma.get_slice(rank)
         rank_dkv_mma = dkv_tiled_mma.get_slice(rank)
         rank_dq_mma = dq_tiled_mma.get_slice(rank)
-        rank_score_coordinates = rank_score_mma.partition_C(
-            cute.make_identity_tensor(
-                (self.H_TILE_CLUSTER, self.N_TILE)
-            )
+        rank_score_coordinates = cute.make_identity_tensor(
+            (self.H_TILE_CTA, self.N_TILE)
         )
         rank_dkv_coordinates = rank_dkv_mma.partition_C(
             cute.make_identity_tensor(self.DKV_MMA_TILER[:2])
