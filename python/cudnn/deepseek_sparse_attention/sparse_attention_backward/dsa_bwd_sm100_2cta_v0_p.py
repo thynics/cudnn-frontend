@@ -5353,45 +5353,71 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             value_2 = thread_values[value_base + 2]
             value_3 = thread_values[value_base + 3]
 
-            # Swap lane bit 0 with register-index bit 0.
-            peer_0 = cute.arch.shuffle_sync_bfly(value_1, offset=1)
-            peer_1 = cute.arch.shuffle_sync_bfly(value_0, offset=1)
-            peer_2 = cute.arch.shuffle_sync_bfly(value_3, offset=1)
-            peer_3 = cute.arch.shuffle_sync_bfly(value_2, offset=1)
+            # Swap lane bit 0 with register-index bit 0. Select the two
+            # required sources before shuffling so this stage uses two
+            # shuffles instead of four.
+            swap_0 = value_0
+            swap_1 = value_1
+            if (lane_in_quad & Int32(1)) == Int32(0):
+                swap_0 = value_1
+                swap_1 = value_3
+            else:
+                swap_0 = value_0
+                swap_1 = value_2
+            peer_0 = cute.arch.shuffle_sync_bfly(swap_0, offset=1)
+            peer_1 = cute.arch.shuffle_sync_bfly(swap_1, offset=1)
             stage_0 = value_0
             stage_1 = value_1
             stage_2 = value_2
             stage_3 = value_3
             if (lane_in_quad & Int32(1)) == Int32(0):
-                stage_1 = peer_1
-                stage_3 = peer_3
+                stage_0 = value_0
+                stage_1 = peer_0
+                stage_2 = value_2
+                stage_3 = peer_1
             else:
                 stage_0 = peer_0
-                stage_2 = peer_2
+                stage_1 = value_1
+                stage_2 = peer_1
+                stage_3 = value_3
 
-            # Swap lane bit 1 with register-index bit 1.
-            peer_0 = cute.arch.shuffle_sync_bfly(stage_2, offset=2)
-            peer_1 = cute.arch.shuffle_sync_bfly(stage_3, offset=2)
-            peer_2 = cute.arch.shuffle_sync_bfly(stage_0, offset=2)
-            peer_3 = cute.arch.shuffle_sync_bfly(stage_1, offset=2)
+            # Swap lane bit 1 with register-index bit 1, again selecting the
+            # required pair before issuing the two shuffles.
+            swap_0 = stage_0
+            swap_1 = stage_1
+            if (lane_in_quad & Int32(2)) == Int32(0):
+                swap_0 = stage_2
+                swap_1 = stage_3
+            else:
+                swap_0 = stage_0
+                swap_1 = stage_1
+            peer_0 = cute.arch.shuffle_sync_bfly(swap_0, offset=2)
+            peer_1 = cute.arch.shuffle_sync_bfly(swap_1, offset=2)
             vector_0 = stage_0
             vector_1 = stage_1
             vector_2 = stage_2
             vector_3 = stage_3
             if (lane_in_quad & Int32(2)) == Int32(0):
-                vector_2 = peer_2
-                vector_3 = peer_3
+                vector_0 = stage_0
+                vector_1 = stage_1
+                vector_2 = peer_0
+                vector_3 = peer_1
             else:
                 vector_0 = peer_0
                 vector_1 = peer_1
+                vector_2 = stage_2
+                vector_3 = stage_3
 
+            logical_coordinate = thread_coordinates[value_base]
             d_in_round = Int32(
-                cute.get(
-                    thread_coordinates[value_base],
-                    mode=[0],
-                )
+                cute.get(logical_coordinate, mode=[0])
             )
-            n_index = Int32(value_base) + lane_in_quad
+            n_index = (
+                Int32(
+                    cute.get(logical_coordinate, mode=[1])
+                )
+                + lane_in_quad
+            )
             kv_index = reducer_ctx[
                 self.CTX_KV_BASE_WORD + n_index,
                 reducer_slot,
