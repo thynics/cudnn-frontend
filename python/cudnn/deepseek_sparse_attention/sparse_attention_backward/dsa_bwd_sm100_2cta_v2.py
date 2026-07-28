@@ -10950,7 +10950,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     PDS_BLOCK_BYTES = 4_096
     DKV_A_QUAD_ELEMENTS = 8_192
     DKV_A_QUAD_BYTES = 16_384
-    DKV_A_QUAD_U64S = 2_048
 
     # 64-column-aligned TMEM map (the layout the v1 CG2 T2R code ran with).
     TMEM_S_OFFSET = 0
@@ -11239,43 +11238,60 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
 
     @cute.jit
-    def _copy_resident_quad_local_v2(
+    def _fanout_resident_quad_v2(
         self,
-        source: cute.Pointer,
+        source_base: cute.Pointer,
         destination: cute.Pointer,
+        completion_mbar: cute.Pointer,
+        round_index: cutlass.Constexpr[int],
+        h_half: cutlass.Constexpr[int],
+        rank: Int32,
+        peer_rank: Int32,
         lane_idx: Int32,
     ) -> None:
-        """Copy one byte-identical 16-KiB Q/dO quadrant within SMEM."""
+        """Bulk-copy one local and one peer D quadrant from its H owner."""
 
-        source_u64 = cute.make_tensor(
-            cute.recast_ptr(
-                source,
-                dtype=cutlass.Uint64,
-            ),
-            cute.make_layout(
-                (self.DKV_A_QUAD_U64S,),
-                stride=(1,),
-            ),
+        _ = lane_idx
+        if rank == Int32(h_half):
+            local_chunk = 2 * round_index + h_half
+            peer_chunk = 2 * round_index + (1 - h_half)
+            with cute.arch.elect_one():
+                # The stage barrier has count 33.  Its extra arrival both
+                # arms this local transfer and prevents an early phase flip.
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    completion_mbar,
+                    self.DKV_A_QUAD_BYTES,
+                )
+                _cpasync_bulk_s2cluster(
+                    source_base
+                    + local_chunk * self.DKV_A_QUAD_ELEMENTS,
+                    destination,
+                    completion_mbar,
+                    self.DKV_A_QUAD_BYTES,
+                    rank,
+                )
+
+                # Arm the peer's same-offset barrier before issuing the DSM
+                # transfer; its 32 local arrivals may already be pending.
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    completion_mbar,
+                    self.DKV_A_QUAD_BYTES,
+                    peer_cta_rank_in_cluster=peer_rank,
+                )
+                _cpasync_bulk_s2cluster(
+                    source_base
+                    + peer_chunk * self.DKV_A_QUAD_ELEMENTS,
+                    destination,
+                    completion_mbar,
+                    self.DKV_A_QUAD_BYTES,
+                    peer_rank,
+                )
+
+        # Every target CTA contributes 32 arrivals.  The H-owner contributes
+        # the 33rd locally; its matching remote arm contributes the peer's.
+        cute.arch.mbarrier_arrive(
+            completion_mbar
         )
-        destination_u64 = cute.make_tensor(
-            cute.recast_ptr(
-                destination,
-                dtype=cutlass.Uint64,
-            ),
-            cute.make_layout(
-                (self.DKV_A_QUAD_U64S,),
-                stride=(1,),
-            ),
-        )
-        for iteration in cutlass.range(32, unroll=1):
-            index = (
-                iteration * Int32(64)
-                + lane_idx * Int32(2)
-            )
-            value_0 = source_u64[index]
-            value_1 = source_u64[index + Int32(1)]
-            destination_u64[index] = value_0
-            destination_u64[index + Int32(1)] = value_1
 
     @cute.jit
     def _issue_dkv_pass_v2(
@@ -11449,6 +11465,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         _ = problem_shape
         _ = mQ
         _ = mdO
+        _ = tma_atom_qt
+        _ = tma_tensor_qt
+        _ = tma_atom_dot
+        _ = tma_tensor_dot
         _ = trace_buffer
         _ = trace_token_idx
         _ = trace_batch_idx
@@ -11461,7 +11481,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         rank = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
-        block_coord_vmnk = cluster_layout_vmnk.get_flat_coord(rank)
         peer_rank = Int32(1) - rank
         token_idx = physical_x // self.CLUSTER_SHAPE_MNK[0]
         is_leader_cta = rank == Int32(0)
@@ -11469,8 +11488,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         if warp_idx == Int32(self.LOAD_WARP):
             cpasync.prefetch_descriptor(tma_atom_q)
             cpasync.prefetch_descriptor(tma_atom_do)
-            cpasync.prefetch_descriptor(tma_atom_qt)
-            cpasync.prefetch_descriptor(tma_atom_dot)
             cpasync.prefetch_descriptor(tma_atom_dq_epi)
 
         smem = utils.SmemAllocator()
@@ -11748,54 +11765,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.make_identity_tensor(self.DQ_MMA_TILER[:2])
         )
 
-        # Per-CTA quadrant TMA partitions (mQT/mdOT tiled (D256, H64)).
-        g_qt = cute.local_tile(
-            tma_tensor_qt,
-            cute.select(self.DKV_MMA_TILER, mode=[0, 2]),
-            (None, None, (token_idx, batch_idx)),
-        )
-        g_dot = cute.local_tile(
-            tma_tensor_dot,
-            cute.select(self.DKV_MMA_TILER, mode=[0, 2]),
-            (None, None, (token_idx, batch_idx)),
-        )
-        rank_g_qt = rank_dkv_mma.partition_A(g_qt)
-        rank_g_dot = rank_dkv_mma.partition_A(g_dot)
-        a_cta_layout = cute.make_layout(
-            cute.slice_(
-                cluster_layout_vmnk,
-                (0, 0, None, 0),
-            ).shape
-        )
-        t_qt_smem_a, t_qt_gmem = cpasync.tma_partition(
-            tma_atom_qt,
-            block_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(round_quad[0], 0, 3),
-            cute.group_modes(rank_g_qt, 0, 3),
-        )
-        t_qt_smem_b, _ = cpasync.tma_partition(
-            tma_atom_qt,
-            block_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(round_quad[1], 0, 3),
-            cute.group_modes(rank_g_qt, 0, 3),
-        )
-        t_dot_smem_a, t_dot_gmem = cpasync.tma_partition(
-            tma_atom_dot,
-            block_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(round_quad[0], 0, 3),
-            cute.group_modes(rank_g_dot, 0, 3),
-        )
-        t_dot_smem_b, _ = cpasync.tma_partition(
-            tma_atom_dot,
-            block_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(round_quad[1], 0, 3),
-            cute.group_modes(rank_g_dot, 0, 3),
-        )
-
         # ------------------------------------------------------------------
         # MMA fragments.
         # ------------------------------------------------------------------
@@ -11940,10 +11909,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(landing_mbars + 1, 1)
             cute.arch.mbarrier_init(relay_mbars, 2)
             cute.arch.mbarrier_init(relay_mbars + 1, 2)
-            cute.arch.mbarrier_init(round_completion_mbars, 32)
+            cute.arch.mbarrier_init(round_completion_mbars, 33)
             cute.arch.mbarrier_init(
                 round_completion_mbars + 1,
-                32,
+                33,
             )
             cute.arch.mbarrier_init(
                 dq_epilogue_source_done_mbar,
@@ -12758,89 +12727,30 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     round_completion_mbars
                                     + round_issue_state.index
                                 )
-                                if rank == Int32(h_half):
-                                    if cutlass.const_expr(
-                                        tensor_kind == 0
-                                    ):
-                                        resident_source = (
-                                            stationary_do_raw
-                                        )
-                                    else:
-                                        resident_source = (
-                                            stationary_q_raw
-                                        )
-                                    source_chunk = (
-                                        2 * grad_round + h_half
-                                    )
-                                    self._copy_resident_quad_local_v2(
-                                        resident_source
-                                        + source_chunk
-                                        * self.DKV_A_QUAD_ELEMENTS,
+                                if cutlass.const_expr(
+                                    tensor_kind == 0
+                                ):
+                                    self._fanout_resident_quad_v2(
+                                        stationary_do_raw,
                                         round_raw[h_half],
+                                        completion_mbar,
+                                        grad_round,
+                                        h_half,
+                                        rank,
+                                        peer_rank,
                                         lane_idx,
                                     )
-                                    cute.arch.fence_view_async_shared()
                                 else:
-                                    with cute.arch.elect_one():
-                                        cute.arch.mbarrier_expect_tx(
-                                            completion_mbar,
-                                            grad_a_stage_bytes,
-                                        )
-                                    if cutlass.const_expr(
-                                        tensor_kind == 0
-                                    ):
-                                        if cutlass.const_expr(
-                                            h_half == 0
-                                        ):
-                                            cute.copy(
-                                                tma_atom_dot,
-                                                t_dot_gmem[
-                                                    None,
-                                                    grad_round,
-                                                    0,
-                                                ],
-                                                t_dot_smem_a[None, 0],
-                                                tma_bar_ptr=completion_mbar,
-                                            )
-                                        else:
-                                            cute.copy(
-                                                tma_atom_dot,
-                                                t_dot_gmem[
-                                                    None,
-                                                    grad_round,
-                                                    1,
-                                                ],
-                                                t_dot_smem_b[None, 0],
-                                                tma_bar_ptr=completion_mbar,
-                                            )
-                                    else:
-                                        if cutlass.const_expr(
-                                            h_half == 0
-                                        ):
-                                            cute.copy(
-                                                tma_atom_qt,
-                                                t_qt_gmem[
-                                                    None,
-                                                    grad_round,
-                                                    0,
-                                                ],
-                                                t_qt_smem_a[None, 0],
-                                                tma_bar_ptr=completion_mbar,
-                                            )
-                                        else:
-                                            cute.copy(
-                                                tma_atom_qt,
-                                                t_qt_gmem[
-                                                    None,
-                                                    grad_round,
-                                                    1,
-                                                ],
-                                                t_qt_smem_b[None, 0],
-                                                tma_bar_ptr=completion_mbar,
-                                            )
-                                cute.arch.mbarrier_arrive(
-                                    completion_mbar
-                                )
+                                    self._fanout_resident_quad_v2(
+                                        stationary_q_raw,
+                                        round_raw[h_half],
+                                        completion_mbar,
+                                        grad_round,
+                                        h_half,
+                                        rank,
+                                        peer_rank,
+                                        lane_idx,
+                                    )
                                 round_issue_state.advance()
 
                             if cutlass.const_expr(
@@ -12858,6 +12768,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                         round_completion_mbars
                                         + round_issue_state.index
                                     )
+                                    with cute.arch.elect_one():
+                                        cute.arch.mbarrier_arrive(
+                                            completion_mbar
+                                        )
                                     if cutlass.const_expr(
                                         round_index == 0
                                     ):
