@@ -3429,7 +3429,6 @@ def _run_math_role(
             # context detach waits for the final metadata reader.
             cute.arch.mbarrier_arrive(p_local_ready + stage)
             cute.arch.mbarrier_arrive(ds_local_ready + stage)
-        math_barrier.arrive_and_wait()
 
         phase = (
             issue_seq // Int32(self.PD_STAGES)
