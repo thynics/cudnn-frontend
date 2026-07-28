@@ -4671,10 +4671,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         return producer_state
 
     @cute.jit
-    def _refill_bq_task(
+    def _refill_bq_pair(
         self,
-        round_index: cutlass.Constexpr[int],
-        bv_slot: Int32,
+        first_bv_slot: Int32,
+        refill_count: Int32,
         raw_slots: cute.Tensor,
         dkv_a_layout: cute.ComposedLayout,
         tma_atom_qt: cute.CopyAtom,
@@ -4683,10 +4683,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         a_cta_layout: cute.Layout,
         grad_q_source_mbars: cute.Pointer,
         do_empty_pipeline,
-        do_state: pipeline.PipelineState,
-        do_ready: cutlass.Boolean,
+        first_do_ready: cutlass.Boolean,
         q_full_pipeline,
-        q_state: pipeline.PipelineState,
         grad_a_stage_bytes: cutlass.Constexpr[int],
         issue_seq: Int32,
         rank: Int32,
@@ -4697,7 +4695,42 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         trace_token_idx: Int32,
         trace_batch_idx: Int32,
     ) -> None:
-        """Service one already-admitted BV refill without taking a whole slot."""
+        """Launch both Q refills before completing either TMA transaction."""
+
+        first_do_phase = (
+            refill_count // Int32(self.ROUND_STAGES)
+        ) & Int32(1)
+        first_do_state = pipeline.PipelineState(
+            self.ROUND_STAGES,
+            refill_count,
+            refill_count % Int32(self.ROUND_STAGES),
+            first_do_phase,
+        )
+        first_q_state = pipeline.PipelineState(
+            self.ROUND_STAGES,
+            refill_count,
+            refill_count % Int32(self.ROUND_STAGES),
+            Int32(1) ^ first_do_phase,
+        )
+        second_refill_count = refill_count + Int32(1)
+        second_do_phase = (
+            second_refill_count // Int32(self.ROUND_STAGES)
+        ) & Int32(1)
+        second_do_state = pipeline.PipelineState(
+            self.ROUND_STAGES,
+            second_refill_count,
+            second_refill_count % Int32(self.ROUND_STAGES),
+            second_do_phase,
+        )
+        second_q_state = pipeline.PipelineState(
+            self.ROUND_STAGES,
+            second_refill_count,
+            second_refill_count % Int32(self.ROUND_STAGES),
+            Int32(1) ^ second_do_phase,
+        )
+        second_bv_slot = (
+            first_bv_slot + Int32(1)
+        ) % Int32(self.OP_STAGES)
 
         if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
@@ -4710,11 +4743,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 TRACE_ROLE_DESC_BQ,
                 issue_seq,
                 TRACE_BQ_WAIT_BEGIN,
-                round_index,
+                0,
             )
         with cute.arch.elect_one():
-            do_empty_pipeline.consumer_wait(do_state, do_ready)
-            q_full_pipeline.producer_acquire(q_state)
+            do_empty_pipeline.consumer_wait(
+                first_do_state,
+                first_do_ready,
+            )
+            q_full_pipeline.producer_acquire(first_q_state)
         cute.arch.sync_warp()
         if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
@@ -4727,7 +4763,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 TRACE_ROLE_DESC_BQ,
                 issue_seq,
                 TRACE_BQ_WAIT_END,
-                round_index,
+                0,
             )
             self._record_trace(
                 trace_buffer,
@@ -4739,48 +4775,128 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 TRACE_ROLE_DESC_BQ,
                 issue_seq,
                 TRACE_BQ_LOAD_BEGIN,
-                round_index,
+                0,
             )
 
-        bq_q = self._make_operand_slot_view(
+        first_bq_q = self._make_operand_slot_view(
             raw_slots,
-            bv_slot,
+            first_bv_slot,
             self.OP_MAIN_OFFSET_BYTES,
             dkv_a_layout,
         )
-        t_qt_smem, t_qt_gmem = cpasync.tma_partition(
+        first_t_qt_smem, t_qt_gmem = cpasync.tma_partition(
             tma_atom_qt,
             block_coord_vmnk[2],
             a_cta_layout,
-            cute.group_modes(bq_q, 0, 3),
+            cute.group_modes(first_bq_q, 0, 3),
             cute.group_modes(rank_g_qt, 0, 3),
         )
         t_qt_gmem = t_qt_gmem[None, None, 0]
         with cute.arch.elect_one():
             cute.arch.mbarrier_init(
-                grad_q_source_mbars + bv_slot,
+                grad_q_source_mbars + first_bv_slot,
                 1,
             )
             cute.arch.mbarrier_arrive_and_expect_tx(
-                grad_q_source_mbars + bv_slot,
+                grad_q_source_mbars + first_bv_slot,
                 grad_a_stage_bytes,
             )
         cute.copy(
             tma_atom_qt,
-            t_qt_gmem[None, round_index],
-            t_qt_smem[None],
-            tma_bar_ptr=grad_q_source_mbars + bv_slot,
+            t_qt_gmem[None, 0],
+            first_t_qt_smem[None],
+            tma_bar_ptr=grad_q_source_mbars + first_bv_slot,
+        )
+
+        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
+            self._record_trace(
+                trace_buffer,
+                token_idx,
+                batch_idx,
+                trace_token_idx,
+                trace_batch_idx,
+                rank,
+                TRACE_ROLE_DESC_BQ,
+                issue_seq,
+                TRACE_BQ_WAIT_BEGIN,
+                1,
+            )
+        second_do_ready = do_empty_pipeline.consumer_try_wait(
+            second_do_state
         )
         with cute.arch.elect_one():
+            do_empty_pipeline.consumer_wait(
+                second_do_state,
+                second_do_ready,
+            )
+            q_full_pipeline.producer_acquire(second_q_state)
+        cute.arch.sync_warp()
+        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
+            self._record_trace(
+                trace_buffer,
+                token_idx,
+                batch_idx,
+                trace_token_idx,
+                trace_batch_idx,
+                rank,
+                TRACE_ROLE_DESC_BQ,
+                issue_seq,
+                TRACE_BQ_WAIT_END,
+                1,
+            )
+            self._record_trace(
+                trace_buffer,
+                token_idx,
+                batch_idx,
+                trace_token_idx,
+                trace_batch_idx,
+                rank,
+                TRACE_ROLE_DESC_BQ,
+                issue_seq,
+                TRACE_BQ_LOAD_BEGIN,
+                1,
+            )
+
+        second_bq_q = self._make_operand_slot_view(
+            raw_slots,
+            second_bv_slot,
+            self.OP_MAIN_OFFSET_BYTES,
+            dkv_a_layout,
+        )
+        second_t_qt_smem, second_t_qt_gmem = cpasync.tma_partition(
+            tma_atom_qt,
+            block_coord_vmnk[2],
+            a_cta_layout,
+            cute.group_modes(second_bq_q, 0, 3),
+            cute.group_modes(rank_g_qt, 0, 3),
+        )
+        second_t_qt_gmem = second_t_qt_gmem[None, None, 0]
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_init(
+                grad_q_source_mbars + second_bv_slot,
+                1,
+            )
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                grad_q_source_mbars + second_bv_slot,
+                grad_a_stage_bytes,
+            )
+        cute.copy(
+            tma_atom_qt,
+            second_t_qt_gmem[None, 1],
+            second_t_qt_smem[None],
+            tma_bar_ptr=grad_q_source_mbars + second_bv_slot,
+        )
+
+        with cute.arch.elect_one():
             cute.arch.mbarrier_wait(
-                grad_q_source_mbars + bv_slot,
+                grad_q_source_mbars + first_bv_slot,
                 Int32(0),
             )
         cute.arch.sync_warp()
         cute.arch.fence_view_async_shared()
         with cute.arch.elect_one():
-            q_full_pipeline.producer_commit(q_state)
-            do_empty_pipeline.consumer_release(do_state)
+            q_full_pipeline.producer_commit(first_q_state)
+            do_empty_pipeline.consumer_release(first_do_state)
         if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
                 trace_buffer,
@@ -4792,7 +4908,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 TRACE_ROLE_DESC_BQ,
                 issue_seq,
                 TRACE_BQ_LOAD_END,
-                round_index,
+                0,
+            )
+
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_wait(
+                grad_q_source_mbars + second_bv_slot,
+                Int32(0),
+            )
+        cute.arch.sync_warp()
+        cute.arch.fence_view_async_shared()
+        with cute.arch.elect_one():
+            q_full_pipeline.producer_commit(second_q_state)
+            do_empty_pipeline.consumer_release(second_do_state)
+        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
+            self._record_trace(
+                trace_buffer,
+                token_idx,
+                batch_idx,
+                trace_token_idx,
+                trace_batch_idx,
+                rank,
+                TRACE_ROLE_DESC_BQ,
+                issue_seq,
+                TRACE_BQ_LOAD_END,
+                1,
             )
 
     @cute.jit
@@ -7378,9 +7518,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 refill_issue_seq = (
                     refill_count // Int32(self.D_ROUNDS)
                 )
-                refill_round = (
-                    refill_count % Int32(self.D_ROUNDS)
-                )
                 refill_admitted = cutlass.Boolean(False)
                 refill_has_next = cutlass.Boolean(False)
                 if refill_issue_seq < committed_count:
@@ -7404,78 +7541,46 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         refill_count % Int32(self.ROUND_STAGES),
                         do_phase,
                     )
-                    q_state = pipeline.PipelineState(
-                        self.ROUND_STAGES,
-                        refill_count,
-                        refill_count % Int32(self.ROUND_STAGES),
-                        Int32(1) ^ do_phase,
-                    )
                     do_ready = (
                         do_empty_pipeline.consumer_try_wait(
                             do_state
                         )
                     )
                     if do_ready:
-                        if refill_round == Int32(0):
-                            if refill_has_next:
-                                whole_ordinal += Int32(
-                                    self.K_CHUNKS
-                                )
-                            self._refill_bq_task(
-                                0,
-                                whole_ordinal
-                                % Int32(self.OP_STAGES),
-                                raw_slots,
-                                dkv_a_layout,
-                                tma_atom_qt,
-                                rank_g_qt,
-                                block_coord_vmnk,
-                                a_cta_layout,
-                                grad_q_source_mbars_ptr,
-                                do_empty_pipeline,
-                                do_state,
-                                do_ready,
-                                q_full_pipeline,
-                                q_state,
-                                grad_a_stage_bytes,
-                                refill_issue_seq,
-                                rank,
-                                tidx,
-                                token_idx,
-                                batch_idx,
-                                trace_buffer,
-                                trace_token_idx,
-                                trace_batch_idx,
+                        if refill_has_next:
+                            whole_ordinal += Int32(
+                                self.K_CHUNKS
                             )
-                        else:
-                            self._refill_bq_task(
-                                1,
-                                whole_ordinal
-                                % Int32(self.OP_STAGES),
-                                raw_slots,
-                                dkv_a_layout,
-                                tma_atom_qt,
-                                rank_g_qt,
-                                block_coord_vmnk,
-                                a_cta_layout,
-                                grad_q_source_mbars_ptr,
-                                do_empty_pipeline,
-                                do_state,
-                                do_ready,
-                                q_full_pipeline,
-                                q_state,
-                                grad_a_stage_bytes,
-                                refill_issue_seq,
-                                rank,
-                                tidx,
-                                token_idx,
-                                batch_idx,
-                                trace_buffer,
-                                trace_token_idx,
-                                trace_batch_idx,
-                            )
-                        whole_ordinal += Int32(1)
-                        refill_count += Int32(1)
+                        self._refill_bq_pair(
+                            whole_ordinal
+                            % Int32(self.OP_STAGES),
+                            refill_count,
+                            raw_slots,
+                            dkv_a_layout,
+                            tma_atom_qt,
+                            rank_g_qt,
+                            block_coord_vmnk,
+                            a_cta_layout,
+                            grad_q_source_mbars_ptr,
+                            do_empty_pipeline,
+                            do_ready,
+                            q_full_pipeline,
+                            grad_a_stage_bytes,
+                            refill_issue_seq,
+                            rank,
+                            tidx,
+                            token_idx,
+                            batch_idx,
+                            trace_buffer,
+                            trace_token_idx,
+                            trace_batch_idx,
+                        )
+                        whole_ordinal += Int32(
+                            self.D_ROUNDS
+                        )
+                        refill_count += Int32(
+                            self.D_ROUNDS
+                        )
                         progressed = cutlass.Boolean(True)
 
                 if not progressed:
