@@ -11127,55 +11127,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
 
     @cute.jit
-    def _reorder_remote_dkv_b_v2(
-        self,
-        raw_block_ptr: cute.Pointer,
-        final_block: cute.Tensor,
-        mtx: Int32,
-    ) -> None:
-        """In-place canonical-to-swizzled reorder after one DSM landing."""
-
-        raw_block = cute.make_tensor(
-            raw_block_ptr,
-            cute.make_layout(
-                (self.PDS_BLOCK_ELEMENTS,),
-                stride=(1,),
-            ),
-        )
-        values = cute.make_rmem_tensor(
-            (
-                self.PDS_BLOCK_ELEMENTS // self.MATH_THREADS,
-            ),
-            self.element_dtype,
-        )
-        for slot in cutlass.range_constexpr(
-            self.PDS_BLOCK_ELEMENTS // self.MATH_THREADS
-        ):
-            canonical_index = (
-                mtx + Int32(slot * self.MATH_THREADS)
-            )
-            values[slot] = raw_block[canonical_index]
-
-        # All canonical bytes must be captured before any aliased swizzled
-        # destination write begins.
-        self.math_barrier.arrive_and_wait()
-
-        for slot in cutlass.range_constexpr(
-            self.PDS_BLOCK_ELEMENTS // self.MATH_THREADS
-        ):
-            canonical_index = (
-                mtx + Int32(slot * self.MATH_THREADS)
-            )
-            local_n = canonical_index // Int32(self.H_TILE_CTA)
-            local_h = canonical_index % Int32(self.H_TILE_CTA)
-            final_block[
-                self._dkv_partition_coord_v2(local_n, local_h)
-            ] = values[slot]
-
-        cute.arch.fence_view_async_shared()
-        self.math_barrier.arrive_and_wait()
-
-    @cute.jit
     def _split_wg_t1d_v2(
         self,
         tensor: cute.Tensor,
@@ -11618,6 +11569,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ds_blocks[0][None, None, None, 0],
             ds_blocks[1][None, None, None, 0],
         )
+        p_xchg_stage = p_xchg[None, None, None, 0]
+        ds_xchg_stage = ds_xchg[None, None, None, 0]
         assert (
             cute.size(p_block_stages[0], mode=[0, 0])
             == self.N_TILE_CTA
@@ -12218,12 +12171,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 dkv_partition_coord
                             ] = r_ds[local_n]
                     else:
-                        xchg_index = (
-                            n_in_half * Int32(self.H_TILE_CTA)
-                            + h_in_half
-                        )
-                        p_xchg_raw[xchg_index] = r_p[local_n]
-                        ds_xchg_raw[xchg_index] = r_ds[local_n]
+                        # Materialize the exact final CG2-B physical byte
+                        # image in the 4 KiB exchange buffers.  The source
+                        # and destination blocks use the same K64 layout and
+                        # 4 KiB-aligned base, so the raw DSM copy preserves
+                        # the pointer-carried swizzle without a receiver-side
+                        # reorder.
+                        p_xchg_stage[dkv_partition_coord] = r_p[local_n]
+                        ds_xchg_stage[dkv_partition_coord] = r_ds[local_n]
 
                 cute.arch.fence_view_async_shared()
                 self.math_barrier.arrive_and_wait()
@@ -12274,9 +12229,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             peer_rank,
                         )
 
-                # The DSM payload is canonical N32xH64.  Wait for both local
-                # landings, then convert each aliased block in place to the
-                # exact nested/swizzled CG2-B layout.
+                # The DSM payload already is the destination CG2-B byte
+                # image.  Wait for both local landings before publishing the
+                # completed P/dS generation; no receiver reorder is needed.
                 if mtx == Int32(0):
                     _mbarrier_wait_acquire_cluster(
                         landing_mbars,
@@ -12287,28 +12242,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         landing_phase,
                     )
                 self.math_barrier.arrive_and_wait()
-                if rank == Int32(0):
-                    self._reorder_remote_dkv_b_v2(
-                        p_block_raw_ptrs[1],
-                        p_block_stages[1],
-                        mtx,
-                    )
-                    self._reorder_remote_dkv_b_v2(
-                        ds_block_raw_ptrs[1],
-                        ds_block_stages[1],
-                        mtx,
-                    )
-                else:
-                    self._reorder_remote_dkv_b_v2(
-                        p_block_raw_ptrs[0],
-                        p_block_stages[0],
-                        mtx,
-                    )
-                    self._reorder_remote_dkv_b_v2(
-                        ds_block_raw_ptrs[0],
-                        ds_block_stages[0],
-                        mtx,
-                    )
                 pipe_pds.producer_commit(pds_state)
                 pds_state.advance()
                 landing_phase = Int32(1) - landing_phase
