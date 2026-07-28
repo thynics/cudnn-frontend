@@ -3597,7 +3597,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
 
     OP_STAGES = 3
     PD_STAGES = 2
-    CONTEXT_STAGES = 3
+    CONTEXT_STAGES = 2
     REDUCER_STAGES = 2
     ROUND_STAGES = 2
 
@@ -3682,9 +3682,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     STATS_WORDS = (
         SOFTMAX_SUM_ODO_STATS_WORD + SOFTMAX_STATS_HEADS
     )
-    # The three-stage loader/context ring keeps one descriptor ahead of the
-    # two-stage reducer ring.  Its extra 560 bytes fit in the existing tail
-    # padding, so the 1024-byte-aligned struct remains 204 KiB.
+    # The 512-byte loader ring pushes the 1024-byte-aligned struct from
+    # 203 KiB to the next whole-KiB boundary.
     EXPECTED_SHARED_STORAGE_BYTES = 208_896
 
     # DEVELOPMENT-ONLY diagnostics. These are deliberately not
@@ -3744,10 +3743,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         assert self.OP_PAYLOAD_BYTES == 144 * 1024
         assert self.PD_PAYLOAD_BYTES == 56 * 1024
         assert self.MAIN_PAYLOAD_BYTES == 200 * 1024
-        assert self.ISSUED_CTX_RING_BYTES == 816
+        assert self.ISSUED_CTX_RING_BYTES == 544
         assert self.REDUCER_CTX_RING_BYTES == 576
-        assert self.FIXED_METADATA_BYTES == 2_176
-        assert self.CONTEXT_STAGES == 3
+        assert self.FIXED_METADATA_BYTES == 1_648
+        assert self.CONTEXT_STAGES == 2
         assert self.REDUCER_STAGES == 2
         assert self.D_ROUNDS == 2
         assert (
@@ -4053,47 +4052,41 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     ) -> None:
         """Copy reducer metadata by value, then release the IssuedCtx slot."""
 
-        issued_slot = issue_seq % Int32(self.CONTEXT_STAGES)
-        issued_epoch = (
+        slot = issue_seq % Int32(self.CONTEXT_STAGES)
+        epoch = (
             issue_seq // Int32(self.CONTEXT_STAGES)
         ) & Int32(1)
-        reducer_slot = issue_seq % Int32(self.REDUCER_STAGES)
-        reducer_epoch = (
-            issue_seq // Int32(self.REDUCER_STAGES)
-        ) & Int32(1)
+        producer_phase = epoch ^ Int32(1)
         cute.arch.mbarrier_wait(
-            ctx_reader_done_mbars + issued_slot,
-            issued_epoch,
+            ctx_reader_done_mbars + slot,
+            epoch,
         )
         cute.arch.fence_view_async_shared()
         self._wait_pair(
             reducer_ctx_mbars
             + self.REDUCER_EMPTY_MBAR_BASE
-            + reducer_slot,
-            reducer_epoch ^ Int32(1),
+            + slot,
+            producer_phase,
         )
         for word in cutlass.range_constexpr(
             self.ISSUED_TILE_CONTEXT_WORDS
         ):
-            reducer_ctx[word, reducer_slot] = issued_ctx[
-                word,
-                issued_slot,
-            ]
+            reducer_ctx[word, slot] = issued_ctx[word, slot]
         reducer_ctx[
             self.REDUCER_PENDING_MASK_WORD,
-            reducer_slot,
+            slot,
         ] = Int32(0b11)
         cute.arch.fence_view_async_shared()
         self._pair_arrive(
             reducer_ctx_mbars
             + self.REDUCER_FULL_MBAR_BASE
-            + reducer_slot,
+            + slot,
             peer_rank,
         )
         self._pair_arrive(
             issued_ctx_mbars
             + self.ISSUED_EMPTY_MBAR_BASE
-            + issued_slot,
+            + slot,
             peer_rank,
         )
 
@@ -6253,11 +6246,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 cutlass.Int64,
                 self.CONTEXT_STAGES,
             ]
-            # Pair-wide traversal-descriptor consensus follows the independent
-            # IssuedCtx ring rather than the two-stage reducer ring.
+            # Reuse the formerly redundant reducer-copy-complete storage as
+            # a two-stage pair-wide traversal-descriptor consensus ring.
             descriptor_consensus_mbars: cute.struct.MemRange[
                 cutlass.Int64,
-                self.CONTEXT_STAGES,
+                self.REDUCER_STAGES,
             ]
             issued_stream_done_ack_mbars: cute.struct.MemRange[
                 cutlass.Int64,
@@ -6745,7 +6738,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 )
             self._init_pair_mbar_range(
                 descriptor_consensus_mbars_ptr,
-                self.CONTEXT_STAGES,
+                self.REDUCER_STAGES,
             )
             self._init_pair_mbar_range(
                 issued_stream_done_ack_mbars_ptr,
