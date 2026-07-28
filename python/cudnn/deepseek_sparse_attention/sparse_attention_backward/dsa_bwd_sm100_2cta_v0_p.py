@@ -188,35 +188,6 @@ def _load_shared_u32_at_v0_p(
     return packed[0]
 
 
-@dsl_user_op
-def _load_peer_shared_u32_at_v0_p(
-    pointer: cute.Pointer,
-    peer_rank: Int32,
-    *,
-    loc=None,
-    ip=None,
-) -> cutlass.Uint32:
-    """Load one immutable word from the same address in ``peer_rank``."""
-
-    peer_pointer_i32 = _map_smem_to_cluster_rank(
-        pointer,
-        peer_rank,
-        loc=loc,
-        ip=ip,
-    ).ir_value()
-    return cutlass.Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [peer_pointer_i32],
-            "ld.volatile.shared::cluster.u32 $0, [$1];",
-            "=r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
 @cute.jit
 def _store_shared_u32_at_v0_p(
     tensor: cute.Tensor,
@@ -4500,17 +4471,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     def _route_resident_q_round(
         self,
         round_index: cutlass.Constexpr[int],
+        issue_seq: Int32,
         resident_q: cute.Tensor,
         destination_q: cute.Tensor,
+        destination_full: cute.Pointer,
         rank: Int32,
         peer_rank: Int32,
     ) -> None:
-        """Pull one complete D-owned Q round from both resident images."""
+        """Materialize one D-owned Q round from immutable H-owned Q."""
 
         # The preceding dO-empty wait is produced by the sole CG2 consumer,
         # so both rank-local BV destinations are already dead before either
-        # W7 can enter this route. Each W7 pulls the peer half itself so its
-        # progress never depends on the peer W7's descriptor/refill choice.
+        # W7 can enter this route.  Keep the CTA schedulers independent here:
+        # an extra pair rendezvous can form a cycle with descriptor credit.
         source_rows_0 = self._score_chunk_rows_v0_p(
             resident_q,
             0,
@@ -4540,14 +4513,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             global_h = (
                 rank * Int32(self.H_TILE_CTA) + local_h
             )
-            peer_global_h = (
-                peer_rank * Int32(self.H_TILE_CTA) + local_h
-            )
-            local_packed = cute.make_rmem_tensor(
-                (4,),
-                cutlass.Uint32,
-            )
-            peer_packed = cute.make_rmem_tensor(
+            packed = cute.make_rmem_tensor(
                 (4,),
                 cutlass.Uint32,
             )
@@ -4558,45 +4524,25 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 )
                 if cutlass.const_expr(round_index == 0):
                     if rank == Int32(0):
-                        local_packed[word] = _load_shared_u32_at_v0_p(
+                        packed[word] = _load_shared_u32_at_v0_p(
                             source_rows_0,
                             source_coordinate,
                         )
-                        peer_packed[word] = _load_peer_shared_u32_at_v0_p(
-                            source_rows_0.iterator
-                            + source_rows_0.layout(source_coordinate),
-                            peer_rank,
-                        )
                     else:
-                        local_packed[word] = _load_shared_u32_at_v0_p(
+                        packed[word] = _load_shared_u32_at_v0_p(
                             source_rows_1,
                             source_coordinate,
                         )
-                        peer_packed[word] = _load_peer_shared_u32_at_v0_p(
-                            source_rows_1.iterator
-                            + source_rows_1.layout(source_coordinate),
-                            peer_rank,
-                        )
                 else:
                     if rank == Int32(0):
-                        local_packed[word] = _load_shared_u32_at_v0_p(
+                        packed[word] = _load_shared_u32_at_v0_p(
                             source_rows_2,
                             source_coordinate,
                         )
-                        peer_packed[word] = _load_peer_shared_u32_at_v0_p(
-                            source_rows_2.iterator
-                            + source_rows_2.layout(source_coordinate),
-                            peer_rank,
-                        )
                     else:
-                        local_packed[word] = _load_shared_u32_at_v0_p(
+                        packed[word] = _load_shared_u32_at_v0_p(
                             source_rows_3,
                             source_coordinate,
-                        )
-                        peer_packed[word] = _load_peer_shared_u32_at_v0_p(
-                            source_rows_3.iterator
-                            + source_rows_3.layout(source_coordinate),
-                            peer_rank,
                         )
             for word in cutlass.range_constexpr(4):
                 _store_shared_u32_at_v0_p(
@@ -4605,16 +4551,51 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         local_d + Int32(2 * word),
                         global_h,
                     ),
-                    local_packed[word],
+                    packed[word],
                 )
-                _store_shared_u32_at_v0_p(
-                    destination_rows,
-                    (
-                        local_d + Int32(2 * word),
-                        peer_global_h,
-                    ),
-                    peer_packed[word],
-                )
+
+        if lane == Int32(0):
+            if cutlass.const_expr(round_index == 0):
+                if peer_rank == Int32(0):
+                    self._issue_resident_q_peer_bulk(
+                        source_rows_0,
+                        destination_rows,
+                        destination_full,
+                        rank,
+                        peer_rank,
+                    )
+                else:
+                    self._issue_resident_q_peer_bulk(
+                        source_rows_1,
+                        destination_rows,
+                        destination_full,
+                        rank,
+                        peer_rank,
+                    )
+            else:
+                if peer_rank == Int32(0):
+                    self._issue_resident_q_peer_bulk(
+                        source_rows_2,
+                        destination_rows,
+                        destination_full,
+                        rank,
+                        peer_rank,
+                    )
+                else:
+                    self._issue_resident_q_peer_bulk(
+                        source_rows_3,
+                        destination_rows,
+                        destination_full,
+                        rank,
+                        peer_rank,
+                    )
+
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            _mbarrier_wait_acquire_cluster_v0_p(
+                destination_full,
+                issue_seq & Int32(1),
+            )
         cute.arch.sync_warp()
         cute.arch.fence_view_async_shared()
 
@@ -4958,6 +4939,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         raw_slots: cute.Tensor,
         resident_q: cute.Tensor,
         dkv_a_layout: cute.ComposedLayout,
+        grad_q_source_mbars: cute.Pointer,
         do_empty_pipeline,
         first_do_ready: cutlass.Boolean,
         q_full_pipeline,
@@ -5062,8 +5044,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         )
         self._route_resident_q_round(
             0,
+            issue_seq,
             resident_q,
             first_bq_q,
+            grad_q_source_mbars + first_bv_slot,
             rank,
             peer_rank,
         )
@@ -5139,8 +5123,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         )
         self._route_resident_q_round(
             1,
+            issue_seq,
             resident_q,
             second_bq_q,
+            grad_q_source_mbars + second_bv_slot,
             rank,
             peer_rank,
         )
@@ -7739,7 +7725,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         # A pending executable descriptor never blocks on IssuedCtx credit:
         # while its target slot is live, dO-empty is polled and serviced
         # first.  Traversal completion publishes sticky done independently
-        # of both metadata-ring and BQ credit.
+        # of both metadata-ring and BQ credit. Descriptor consensus is also
+        # polled so a peer waiting on a Q bulk route cannot be stranded.
         if (
             cutlass.const_expr(
                 self.DIAGNOSTIC_AUX_STAGE >= 3
@@ -7749,6 +7736,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             traversal_seq = Int32(0)
             committed_count = Int32(0)
             pending_descriptor = cutlass.Boolean(False)
+            consensus_pending = cutlass.Boolean(False)
             done_published = cutlass.Boolean(False)
             refill_count = Int32(0)
             whole_ordinal = Int32(self.K_CHUNKS)
@@ -7798,6 +7786,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             raw_slots,
                             resident_q,
                             dkv_a_layout,
+                            grad_q_source_mbars_ptr,
                             do_empty_pipeline,
                             do_ready,
                             q_full_pipeline,
@@ -7820,111 +7809,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         progressed = cutlass.Boolean(True)
 
                 if not progressed:
-                    if pending_descriptor:
-                        slot = (
-                            committed_count
+                    if consensus_pending:
+                        descriptor_slot = (
+                            traversal_seq
                             % Int32(self.CONTEXT_STAGES)
                         )
-                        epoch = (
-                            committed_count
+                        descriptor_phase = (
+                            traversal_seq
                             // Int32(self.CONTEXT_STAGES)
                         ) & Int32(1)
-                        empty_ready = _mbarrier_try_wait(
-                            issued_ctx_mbars_ptr
-                            + self.ISSUED_EMPTY_MBAR_BASE
-                            + slot,
-                            epoch ^ Int32(1),
+                        consensus_ready = _mbarrier_try_wait(
+                            descriptor_consensus_mbars_ptr
+                            + descriptor_slot,
+                            descriptor_phase,
                         )
-                        if empty_ready:
-                            self._publish_issued_context(
-                                committed_count,
-                                traversal_descriptor,
-                                issued_ctx_ring,
-                                issued_ctx_mbars_ptr,
-                                peer_rank,
-                            )
-                            if tidx == Int32(
-                                self.DESCRIPTOR_WARP * 32
-                            ):
-                                self._record_trace(
-                                    trace_buffer,
-                                    token_idx,
-                                    batch_idx,
-                                    trace_token_idx,
-                                    trace_batch_idx,
-                                    rank,
-                                    TRACE_ROLE_DESC_BQ,
-                                    committed_count,
-                                    TRACE_CTX_COMMIT,
-                                )
-                            committed_count += Int32(1)
-                            pending_descriptor = (
-                                cutlass.Boolean(False)
-                            )
-                            progressed = cutlass.Boolean(True)
-                    else:
-                        if traversal_seq < traversal_tile_count:
-                            logical_tile = (
-                                traversal_tile_count
-                                - Int32(1)
-                                - traversal_seq
-                            )
-                            descriptor_slot = (
-                                traversal_seq
-                                % Int32(self.CONTEXT_STAGES)
-                            )
-                            descriptor_phase = (
-                                traversal_seq
-                                // Int32(self.CONTEXT_STAGES)
-                            ) & Int32(1)
-                            if tidx == Int32(
-                                self.DESCRIPTOR_WARP * 32
-                            ):
-                                self._record_trace(
-                                    trace_buffer,
-                                    token_idx,
-                                    batch_idx,
-                                    trace_token_idx,
-                                    trace_batch_idx,
-                                    rank,
-                                    TRACE_ROLE_DESC_BQ,
-                                    traversal_seq,
-                                    TRACE_DESC_BEGIN,
-                                )
-                            self._decode_traversal_descriptor(
-                                mTopkIdxs,
-                                traversal_descriptor,
-                                token_idx,
-                                batch_idx,
-                                topk,
-                                logical_tile,
-                            )
-                            if tidx == Int32(
-                                self.DESCRIPTOR_WARP * 32
-                            ):
-                                self._record_trace(
-                                    trace_buffer,
-                                    token_idx,
-                                    batch_idx,
-                                    trace_token_idx,
-                                    trace_batch_idx,
-                                    rank,
-                                    TRACE_ROLE_DESC_BQ,
-                                    traversal_seq,
-                                    TRACE_DESC_END,
-                                )
-                            with cute.arch.elect_one():
-                                self._pair_arrive(
-                                    descriptor_consensus_mbars_ptr
-                                    + descriptor_slot,
-                                    peer_rank,
-                                )
-                                self._wait_pair(
-                                    descriptor_consensus_mbars_ptr
-                                    + descriptor_slot,
-                                    descriptor_phase,
-                                )
-                            cute.arch.sync_warp()
+                        if consensus_ready:
                             cute.arch.fence_view_async_shared()
                             pending_descriptor = (
                                 traversal_descriptor[
@@ -7933,31 +7832,135 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                                 != Int32(0)
                             )
                             traversal_seq += Int32(1)
+                            consensus_pending = cutlass.Boolean(
+                                False
+                            )
                             progressed = cutlass.Boolean(True)
-                        else:
-                            if not done_published:
-                                with cute.arch.elect_one():
-                                    self._publish_issued_stream_done(
-                                        token_idx,
-                                        committed_count,
-                                        issued_stream_state,
-                                    issued_stream_done_ack_mbars_ptr,
+                    else:
+                        if pending_descriptor:
+                            slot = (
+                                committed_count
+                                % Int32(self.CONTEXT_STAGES)
+                            )
+                            epoch = (
+                                committed_count
+                                // Int32(self.CONTEXT_STAGES)
+                            ) & Int32(1)
+                            empty_ready = _mbarrier_try_wait(
+                                issued_ctx_mbars_ptr
+                                + self.ISSUED_EMPTY_MBAR_BASE
+                                + slot,
+                                epoch ^ Int32(1),
+                            )
+                            if empty_ready:
+                                self._publish_issued_context(
+                                    committed_count,
+                                    traversal_descriptor,
+                                    issued_ctx_ring,
+                                    issued_ctx_mbars_ptr,
                                     peer_rank,
                                 )
-                                self._record_trace(
-                                    trace_buffer,
+                                if tidx == Int32(
+                                    self.DESCRIPTOR_WARP * 32
+                                ):
+                                    self._record_trace(
+                                        trace_buffer,
+                                        token_idx,
+                                        batch_idx,
+                                        trace_token_idx,
+                                        trace_batch_idx,
+                                        rank,
+                                        TRACE_ROLE_DESC_BQ,
+                                        committed_count,
+                                        TRACE_CTX_COMMIT,
+                                    )
+                                committed_count += Int32(1)
+                                pending_descriptor = (
+                                    cutlass.Boolean(False)
+                                )
+                                progressed = cutlass.Boolean(True)
+                        else:
+                            if traversal_seq < traversal_tile_count:
+                                logical_tile = (
+                                    traversal_tile_count
+                                    - Int32(1)
+                                    - traversal_seq
+                                )
+                                descriptor_slot = (
+                                    traversal_seq
+                                    % Int32(self.CONTEXT_STAGES)
+                                )
+                                if tidx == Int32(
+                                    self.DESCRIPTOR_WARP * 32
+                                ):
+                                    self._record_trace(
+                                        trace_buffer,
+                                        token_idx,
+                                        batch_idx,
+                                        trace_token_idx,
+                                        trace_batch_idx,
+                                        rank,
+                                        TRACE_ROLE_DESC_BQ,
+                                        traversal_seq,
+                                        TRACE_DESC_BEGIN,
+                                    )
+                                self._decode_traversal_descriptor(
+                                    mTopkIdxs,
+                                    traversal_descriptor,
                                     token_idx,
                                     batch_idx,
-                                    trace_token_idx,
-                                    trace_batch_idx,
-                                    rank,
-                                    TRACE_ROLE_DESC_BQ,
-                                    Int32(TRACE_ISSUE_SLOTS - 1),
-                                    TRACE_STREAM_DONE,
+                                    topk,
+                                    logical_tile,
                                 )
+                                if tidx == Int32(
+                                    self.DESCRIPTOR_WARP * 32
+                                ):
+                                    self._record_trace(
+                                        trace_buffer,
+                                        token_idx,
+                                        batch_idx,
+                                        trace_token_idx,
+                                        trace_batch_idx,
+                                        rank,
+                                        TRACE_ROLE_DESC_BQ,
+                                        traversal_seq,
+                                        TRACE_DESC_END,
+                                    )
+                                with cute.arch.elect_one():
+                                    self._pair_arrive(
+                                        descriptor_consensus_mbars_ptr
+                                        + descriptor_slot,
+                                        peer_rank,
+                                    )
                                 cute.arch.sync_warp()
-                                done_published = cutlass.Boolean(True)
+                                consensus_pending = (
+                                    cutlass.Boolean(True)
+                                )
                                 progressed = cutlass.Boolean(True)
+                            else:
+                                if not done_published:
+                                    with cute.arch.elect_one():
+                                        self._publish_issued_stream_done(
+                                            token_idx,
+                                            committed_count,
+                                            issued_stream_state,
+                                            issued_stream_done_ack_mbars_ptr,
+                                            peer_rank,
+                                        )
+                                    self._record_trace(
+                                        trace_buffer,
+                                        token_idx,
+                                        batch_idx,
+                                        trace_token_idx,
+                                        trace_batch_idx,
+                                        rank,
+                                        TRACE_ROLE_DESC_BQ,
+                                        Int32(TRACE_ISSUE_SLOTS - 1),
+                                        TRACE_STREAM_DONE,
+                                    )
+                                    cute.arch.sync_warp()
+                                    done_published = cutlass.Boolean(True)
+                                    progressed = cutlass.Boolean(True)
 
                 engine_active = cutlass.Boolean(True)
                 if done_published:
