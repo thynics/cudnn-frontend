@@ -12848,45 +12848,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
             if cutlass.const_expr(mTopkLength is not None):
                 if cutlass.const_expr(is_first):
-                    if idx >= 0:
-                        if idx < topk:
-                            if topk_idx >= 0:
-                                self._copy_kv_row(
-                                    mKV,
-                                    topk_idx,
-                                    batch_idx,
-                                    tile_sK,
-                                    local_tidx,
-                                    async_copy_atom,
-                                    async_thr_copy,
-                                )
-                            else:
-                                self._zero_kv_row(tile_sK, local_tidx)
-                        else:
-                            self._zero_kv_row(tile_sK, local_tidx)
-                    else:
-                        self._zero_kv_row(tile_sK, local_tidx)
-                else:
-                    if idx >= 0:
-                        if idx < topk:
-                            if topk_idx >= 0:
-                                self._copy_kv_row(
-                                    mKV,
-                                    topk_idx,
-                                    batch_idx,
-                                    tile_sK,
-                                    local_tidx,
-                                    async_copy_atom,
-                                    async_thr_copy,
-                                )
-                            else:
-                                self._zero_kv_row(tile_sK, local_tidx)
-                        else:
-                            self._zero_kv_row(tile_sK, local_tidx)
-                    else:
-                        self._zero_kv_row(tile_sK, local_tidx)
-            else:
-                if idx >= 0:
                     if idx < topk:
                         if topk_idx >= 0:
                             self._copy_kv_row(
@@ -12900,6 +12861,33 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             )
                         else:
                             self._zero_kv_row(tile_sK, local_tidx)
+                    else:
+                        self._zero_kv_row(tile_sK, local_tidx)
+                else:
+                    if topk_idx >= 0:
+                        self._copy_kv_row(
+                            mKV,
+                            topk_idx,
+                            batch_idx,
+                            tile_sK,
+                            local_tidx,
+                            async_copy_atom,
+                            async_thr_copy,
+                        )
+                    else:
+                        self._zero_kv_row(tile_sK, local_tidx)
+            else:
+                if idx < topk:
+                    if topk_idx >= 0:
+                        self._copy_kv_row(
+                            mKV,
+                            topk_idx,
+                            batch_idx,
+                            tile_sK,
+                            local_tidx,
+                            async_copy_atom,
+                            async_thr_copy,
+                        )
                     else:
                         self._zero_kv_row(tile_sK, local_tidx)
                 else:
