@@ -1513,18 +1513,14 @@ class FlashAttentionDSABackwardSm100:
             mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
 
             # dKV0
-            # Wait for the reduce warps to finish the T2R of dKV2/dKV3 from
-            # the previous iteration before overwriting their TMEM columns:
-            # dKV0 aliases dKV2 and dKV1 aliases dKV3, and the producer_acquire
-            # above only orders against the consumer_release from two
-            # generations back (the dKV4 generation), not against the dKV2/dKV3
-            # reads of the previous generation.
+            # In the 576/512 path, dKV0/dKV1 alias the previous iteration's
+            # dKV2/dKV3 and both columns must be ordered before either MMA.
+            # The 512/512 path places dKV2 in the otherwise-unused dQ4 slot,
+            # so only dKV1/dKV3 alias; its wait stays immediately before dKV1
+            # below to preserve dKV0 overlap.
             if cutlass.const_expr(not self.same_hdim_kv):
                 if not is_first_mma:
                     self.t2r_dKV23_done_barrier.arrive_and_wait()
-            if cutlass.const_expr(self.same_hdim_kv):
-                if not is_first_mma:
-                    self.t2r_dKV4_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1537,6 +1533,9 @@ class FlashAttentionDSABackwardSm100:
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             # dKV1
+            if cutlass.const_expr(self.same_hdim_kv):
+                if not is_first_mma:
+                    self.t2r_dKV4_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1665,12 +1664,12 @@ class FlashAttentionDSABackwardSm100:
             load_mma_K_consumer_state.advance()
 
             # Gemm dKV = dO @ P part2
-            # Wait for reduce warps to finish T2R of the TMEM columns that
-            # dKV2/dKV3 overwrite: dKV4 (not same_hdim) or dKV0/dKV1 (same_hdim).
+            # The 576/512 dKV2 MMA aliases dKV4 and must wait before the pair.
+            # In the 512/512 path dKV2 has a dedicated TMEM slot; only dKV3
+            # aliases dKV1, so its wait is delayed until immediately before
+            # the dKV3 MMA below.
             if cutlass.const_expr(not self.same_hdim_kv):
                 self.t2r_dKV4_done_barrier.arrive_and_wait()
-            else:
-                self.t2r_dKV01_done_barrier.arrive_and_wait()
             mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
             # dKV2
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -1685,6 +1684,8 @@ class FlashAttentionDSABackwardSm100:
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             # dKV3
+            if cutlass.const_expr(self.same_hdim_kv):
+                self.t2r_dKV01_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -2203,15 +2204,23 @@ class FlashAttentionDSABackwardSm100:
 
             mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
 
-            # Split T2R and atomic_add: load dKV0/dKV1 from TMEM to registers,
-            # then signal MMA warp that TMEM is free to overwrite
-            # (dKV4 if not same_hdim_kv, dKV2/dKV3 if same_hdim_kv).
-            rdKV0 = self.t2r_dKV(tdKVtdKV0)
-            rdKV1 = self.t2r_dKV(tdKVtdKV1)
-            cute.arch.fence_view_async_tmem_load()
-            self.t2r_dKV01_done_barrier.arrive_and_wait()
-            self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-            self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+            if cutlass.const_expr(self.same_hdim_kv):
+                # D512 places dKV0 and dKV2 in disjoint TMEM columns. Only
+                # dKV1 aliases dKV3, so stage that fragment before releasing
+                # the alias barrier and drain dKV0 directly from its safe slot.
+                rdKV1 = self.t2r_dKV(tdKVtdKV1)
+                cute.arch.fence_view_async_tmem_load()
+                self.t2r_dKV01_done_barrier.arrive_and_wait()
+                self.store_dKV(mdKV_acc, tdKVtdKV0, rTopkIdx, 0)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+            else:
+                # D576 aliases both columns, so both fragments must be staged.
+                rdKV0 = self.t2r_dKV(tdKVtdKV0)
+                rdKV1 = self.t2r_dKV(tdKVtdKV1)
+                cute.arch.fence_view_async_tmem_load()
+                self.t2r_dKV01_done_barrier.arrive_and_wait()
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
 
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
@@ -2233,13 +2242,12 @@ class FlashAttentionDSABackwardSm100:
             mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
 
             if cutlass.const_expr(self.same_hdim_kv):
-                # Split T2R and atomic_add: load dKV2/dKV3 from TMEM to registers,
-                # then signal MMA warp that TMEM is free for next tile's dKV0/dKV1.
-                rdKV2 = self.t2r_dKV(tdKVtdKV2)
+                # dKV2 lives in the otherwise-unused dQ4 TMEM slot in D512;
+                # only dKV3 aliases the next tile's dKV1.
                 rdKV3 = self.t2r_dKV(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV4_done_barrier.arrive_and_wait()
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
+                self.store_dKV(mdKV_acc, tdKVtdKV2, rTopkIdx, 2)
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             else:
                 # T2R dKV2/dKV3 into registers, then signal the MMA warp that
