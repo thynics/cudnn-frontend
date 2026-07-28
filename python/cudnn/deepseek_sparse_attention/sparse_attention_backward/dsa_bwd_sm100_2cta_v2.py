@@ -10947,6 +10947,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # QT/dOT TMA atoms to [D128, H64] quadrant slabs.
     DKV_MMA_TILER = (256, 64, 64)
     H_PASSES = 2
+    PDS_BLOCK_ELEMENTS = 2_048
+    PDS_BLOCK_BYTES = 4_096
 
     # 64-column-aligned TMEM map (the layout the v1 CG2 T2R code ran with).
     TMEM_S_OFFSET = 0
@@ -11109,6 +11111,69 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 stride=(self.D_TILE_CTA, 1),
             ),
         )
+
+    @cute.jit
+    def _dkv_partition_coord_v2(
+        self,
+        local_n: Int32,
+        local_h: Int32,
+    ):
+        """Exact inverse of the non-broadcast K64 dKV partition-B modes."""
+
+        return (
+            (local_n, local_h % Int32(16)),
+            Int32(0),
+            local_h // Int32(16),
+        )
+
+    @cute.jit
+    def _reorder_remote_dkv_b_v2(
+        self,
+        raw_block_ptr: cute.Pointer,
+        final_block: cute.Tensor,
+        mtx: Int32,
+    ) -> None:
+        """In-place canonical-to-swizzled reorder after one DSM landing."""
+
+        raw_block = cute.make_tensor(
+            raw_block_ptr,
+            cute.make_layout(
+                (self.PDS_BLOCK_ELEMENTS,),
+                stride=(1,),
+            ),
+        )
+        values = cute.make_rmem_tensor(
+            (
+                self.PDS_BLOCK_ELEMENTS // self.MATH_THREADS,
+            ),
+            self.element_dtype,
+        )
+        for slot in cutlass.range_constexpr(
+            self.PDS_BLOCK_ELEMENTS // self.MATH_THREADS
+        ):
+            canonical_index = (
+                mtx + Int32(slot * self.MATH_THREADS)
+            )
+            values[slot] = raw_block[canonical_index]
+
+        # All canonical bytes must be captured before any aliased swizzled
+        # destination write begins.
+        self.math_barrier.arrive_and_wait()
+
+        for slot in cutlass.range_constexpr(
+            self.PDS_BLOCK_ELEMENTS // self.MATH_THREADS
+        ):
+            canonical_index = (
+                mtx + Int32(slot * self.MATH_THREADS)
+            )
+            local_n = canonical_index // Int32(self.H_TILE_CTA)
+            local_h = canonical_index % Int32(self.H_TILE_CTA)
+            final_block[
+                self._dkv_partition_coord_v2(local_n, local_h)
+            ] = values[slot]
+
+        cute.arch.fence_view_async_shared()
+        self.math_barrier.arrive_and_wait()
 
     @cute.jit
     def _split_wg_t1d_v2(
@@ -11544,46 +11609,40 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             score_store_domain,
             swizzle=score_store_layout.inner,
         )
-        # Coordinate views of the 4 KiB blocks for scalar publication.
-        p_block_coords = (
-            cute.composition(
-                p_blocks[0][None, None, None, 0],
-                cute.make_layout(
-                    (self.N_TILE_CTA, self.H_TILE_CTA),
-                ),
-            ),
-            cute.composition(
-                p_blocks[1][None, None, None, 0],
-                cute.make_layout(
-                    (self.N_TILE_CTA, self.H_TILE_CTA),
-                ),
-            ),
+        # Exact nested K64 B stages plus canonical DSM exchange views.
+        p_block_stages = (
+            p_blocks[0][None, None, None, 0],
+            p_blocks[1][None, None, None, 0],
         )
-        p_xchg_coords = cute.composition(
-            p_xchg[None, None, None, 0],
-            cute.make_layout(
-                (self.N_TILE_CTA, self.H_TILE_CTA),
-            ),
+        ds_block_stages = (
+            ds_blocks[0][None, None, None, 0],
+            ds_blocks[1][None, None, None, 0],
         )
-        ds_block_coords = (
-            cute.composition(
-                ds_blocks[0][None, None, None, 0],
-                cute.make_layout(
-                    (self.N_TILE_CTA, self.H_TILE_CTA),
-                ),
-            ),
-            cute.composition(
-                ds_blocks[1][None, None, None, 0],
-                cute.make_layout(
-                    (self.N_TILE_CTA, self.H_TILE_CTA),
-                ),
-            ),
+        assert (
+            cute.size(p_block_stages[0], mode=[0, 0])
+            == self.N_TILE_CTA
         )
-        ds_xchg_coords = cute.composition(
-            ds_xchg[None, None, None, 0],
-            cute.make_layout(
-                (self.N_TILE_CTA, self.H_TILE_CTA),
-            ),
+        assert cute.size(p_block_stages[0], mode=[0, 1]) == 16
+        assert cute.size(p_block_stages[0], mode=[1]) == 1
+        assert cute.size(p_block_stages[0], mode=[2]) == 4
+        assert cute.size(p_block_stages[0]) == self.PDS_BLOCK_ELEMENTS
+        p_block_raw_ptrs = (
+            storage.p_block_0.data_ptr(),
+            storage.p_block_1.data_ptr(),
+        )
+        ds_block_raw_ptrs = (
+            storage.ds_block_0.data_ptr(),
+            storage.ds_block_1.data_ptr(),
+        )
+        flat_pds_block_layout = cute.make_layout(
+            (self.PDS_BLOCK_ELEMENTS,),
+            stride=(1,),
+        )
+        p_xchg_raw = storage.p_xchg.get_tensor(
+            flat_pds_block_layout
+        )
+        ds_xchg_raw = storage.ds_xchg.get_tensor(
+            flat_pds_block_layout
         )
         softmax_stats = storage.stats.get_tensor(
             cute.make_layout(
@@ -12068,6 +12127,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 score_coordinates.shape,
                 self.element_dtype,
             )
+            landing_phase = Int32(0)
 
             for loop_iter in cutlass.range(tile_count):
                 pipe_s_done.consumer_wait(s_state)
@@ -12136,40 +12196,34 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     h_in_half = g_h % Int32(self.H_TILE_CTA)
                     n_in_half = g_n % Int32(self.N_TILE_CTA)
                     n_half = g_n // Int32(self.N_TILE_CTA)
+                    dkv_partition_coord = (
+                        self._dkv_partition_coord_v2(
+                            n_in_half,
+                            h_in_half,
+                        )
+                    )
                     if n_half == rank:
                         if rank == Int32(0):
-                            _store_shared_bf16_at_v2(
-                                p_block_coords[0],
-                                (n_in_half, h_in_half),
-                                r_p[local_n],
-                            )
-                            _store_shared_bf16_at_v2(
-                                ds_block_coords[0],
-                                (n_in_half, h_in_half),
-                                r_ds[local_n],
-                            )
+                            p_block_stages[0][
+                                dkv_partition_coord
+                            ] = r_p[local_n]
+                            ds_block_stages[0][
+                                dkv_partition_coord
+                            ] = r_ds[local_n]
                         else:
-                            _store_shared_bf16_at_v2(
-                                p_block_coords[1],
-                                (n_in_half, h_in_half),
-                                r_p[local_n],
-                            )
-                            _store_shared_bf16_at_v2(
-                                ds_block_coords[1],
-                                (n_in_half, h_in_half),
-                                r_ds[local_n],
-                            )
+                            p_block_stages[1][
+                                dkv_partition_coord
+                            ] = r_p[local_n]
+                            ds_block_stages[1][
+                                dkv_partition_coord
+                            ] = r_ds[local_n]
                     else:
-                        _store_shared_bf16_at_v2(
-                            p_xchg_coords,
-                            (n_in_half, h_in_half),
-                            r_p[local_n],
+                        xchg_index = (
+                            n_in_half * Int32(self.H_TILE_CTA)
+                            + h_in_half
                         )
-                        _store_shared_bf16_at_v2(
-                            ds_xchg_coords,
-                            (n_in_half, h_in_half),
-                            r_ds[local_n],
-                        )
+                        p_xchg_raw[xchg_index] = r_p[local_n]
+                        ds_xchg_raw[xchg_index] = r_ds[local_n]
 
                 cute.arch.fence_view_async_shared()
                 self.math_barrier.arrive_and_wait()
@@ -12179,48 +12233,85 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # block field for my head half (same struct offset).
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         landing_mbars,
-                        4096,
+                        self.PDS_BLOCK_BYTES,
                         peer_cta_rank_in_cluster=peer_rank,
                     )
                     if rank == Int32(0):
                         _cpasync_bulk_s2cluster(
-                            p_xchg.iterator,
-                            p_blocks[0].iterator,
+                            p_xchg_raw.iterator,
+                            p_block_raw_ptrs[0],
                             landing_mbars,
-                            4096,
+                            self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
                     else:
                         _cpasync_bulk_s2cluster(
-                            p_xchg.iterator,
-                            p_blocks[1].iterator,
+                            p_xchg_raw.iterator,
+                            p_block_raw_ptrs[1],
                             landing_mbars,
-                            4096,
+                            self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         landing_mbars + 1,
-                        4096,
+                        self.PDS_BLOCK_BYTES,
                         peer_cta_rank_in_cluster=peer_rank,
                     )
                     if rank == Int32(0):
                         _cpasync_bulk_s2cluster(
-                            ds_xchg.iterator,
-                            ds_blocks[0].iterator,
+                            ds_xchg_raw.iterator,
+                            ds_block_raw_ptrs[0],
                             landing_mbars + 1,
-                            4096,
+                            self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
                     else:
                         _cpasync_bulk_s2cluster(
-                            ds_xchg.iterator,
-                            ds_blocks[1].iterator,
+                            ds_xchg_raw.iterator,
+                            ds_block_raw_ptrs[1],
                             landing_mbars + 1,
-                            4096,
+                            self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
+
+                # The DSM payload is canonical N32xH64.  Wait for both local
+                # landings, then convert each aliased block in place to the
+                # exact nested/swizzled CG2-B layout.
+                if mtx == Int32(0):
+                    _mbarrier_wait_acquire_cluster(
+                        landing_mbars,
+                        landing_phase,
+                    )
+                    _mbarrier_wait_acquire_cluster(
+                        landing_mbars + 1,
+                        landing_phase,
+                    )
+                self.math_barrier.arrive_and_wait()
+                if rank == Int32(0):
+                    self._reorder_remote_dkv_b_v2(
+                        p_block_raw_ptrs[1],
+                        p_block_stages[1],
+                        mtx,
+                    )
+                    self._reorder_remote_dkv_b_v2(
+                        ds_block_raw_ptrs[1],
+                        ds_block_stages[1],
+                        mtx,
+                    )
+                else:
+                    self._reorder_remote_dkv_b_v2(
+                        p_block_raw_ptrs[0],
+                        p_block_stages[0],
+                        mtx,
+                    )
+                    self._reorder_remote_dkv_b_v2(
+                        ds_block_raw_ptrs[0],
+                        ds_block_stages[0],
+                        mtx,
+                    )
                 pipe_pds.producer_commit(pds_state)
                 pds_state.advance()
+                landing_phase = Int32(1) - landing_phase
             if tile_count > Int32(0):
                 pipe_pds.producer_tail(pds_state)
 
