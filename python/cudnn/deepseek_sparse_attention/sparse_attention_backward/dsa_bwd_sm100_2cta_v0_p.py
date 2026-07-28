@@ -4937,15 +4937,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         first_bv_slot: Int32,
         refill_count: Int32,
         raw_slots: cute.Tensor,
-        resident_q: cute.Tensor,
         dkv_a_layout: cute.ComposedLayout,
+        tma_atom_qt: cute.CopyAtom,
+        rank_g_qt: cute.Tensor,
+        block_coord_vmnk,
+        a_cta_layout: cute.Layout,
         grad_q_source_mbars: cute.Pointer,
         do_empty_pipeline,
         first_do_ready: cutlass.Boolean,
         q_full_pipeline,
+        grad_a_stage_bytes: cutlass.Constexpr[int],
         issue_seq: Int32,
         rank: Int32,
-        peer_rank: Int32,
         tidx: Int32,
         token_idx: Int32,
         batch_idx: Int32,
@@ -4953,7 +4956,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         trace_token_idx: Int32,
         trace_batch_idx: Int32,
     ) -> None:
-        """Materialize the two resident-Q rounds into reusable BV slots."""
+        """Launch both Q refills before completing either TMA transaction."""
 
         first_do_phase = (
             refill_count // Int32(self.ROUND_STAGES)
@@ -5042,31 +5045,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             self.OP_MAIN_OFFSET_BYTES,
             dkv_a_layout,
         )
-        self._route_resident_q_round(
-            0,
-            issue_seq,
-            resident_q,
-            first_bq_q,
-            grad_q_source_mbars + first_bv_slot,
-            rank,
-            peer_rank,
+        first_t_qt_smem, t_qt_gmem = cpasync.tma_partition(
+            tma_atom_qt,
+            block_coord_vmnk[2],
+            a_cta_layout,
+            cute.group_modes(first_bq_q, 0, 3),
+            cute.group_modes(rank_g_qt, 0, 3),
         )
+        t_qt_gmem = t_qt_gmem[None, None, 0]
         with cute.arch.elect_one():
-            q_full_pipeline.producer_commit(first_q_state)
-            do_empty_pipeline.consumer_release(first_do_state)
-        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
-            self._record_trace(
-                trace_buffer,
-                token_idx,
-                batch_idx,
-                trace_token_idx,
-                trace_batch_idx,
-                rank,
-                TRACE_ROLE_DESC_BQ,
-                issue_seq,
-                TRACE_BQ_LOAD_END,
-                0,
+            cute.arch.mbarrier_init(
+                grad_q_source_mbars + first_bv_slot,
+                1,
             )
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                grad_q_source_mbars + first_bv_slot,
+                grad_a_stage_bytes,
+            )
+        cute.copy(
+            tma_atom_qt,
+            t_qt_gmem[None, 0],
+            first_t_qt_smem[None],
+            tma_bar_ptr=grad_q_source_mbars + first_bv_slot,
+        )
+
+        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
             self._record_trace(
                 trace_buffer,
                 token_idx,
@@ -5121,15 +5124,61 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             self.OP_MAIN_OFFSET_BYTES,
             dkv_a_layout,
         )
-        self._route_resident_q_round(
-            1,
-            issue_seq,
-            resident_q,
-            second_bq_q,
-            grad_q_source_mbars + second_bv_slot,
-            rank,
-            peer_rank,
+        second_t_qt_smem, second_t_qt_gmem = cpasync.tma_partition(
+            tma_atom_qt,
+            block_coord_vmnk[2],
+            a_cta_layout,
+            cute.group_modes(second_bq_q, 0, 3),
+            cute.group_modes(rank_g_qt, 0, 3),
         )
+        second_t_qt_gmem = second_t_qt_gmem[None, None, 0]
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_init(
+                grad_q_source_mbars + second_bv_slot,
+                1,
+            )
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                grad_q_source_mbars + second_bv_slot,
+                grad_a_stage_bytes,
+            )
+        cute.copy(
+            tma_atom_qt,
+            second_t_qt_gmem[None, 1],
+            second_t_qt_smem[None],
+            tma_bar_ptr=grad_q_source_mbars + second_bv_slot,
+        )
+
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_wait(
+                grad_q_source_mbars + first_bv_slot,
+                Int32(0),
+            )
+        cute.arch.sync_warp()
+        cute.arch.fence_view_async_shared()
+        with cute.arch.elect_one():
+            q_full_pipeline.producer_commit(first_q_state)
+            do_empty_pipeline.consumer_release(first_do_state)
+        if tidx == Int32(self.DESCRIPTOR_WARP * 32):
+            self._record_trace(
+                trace_buffer,
+                token_idx,
+                batch_idx,
+                trace_token_idx,
+                trace_batch_idx,
+                rank,
+                TRACE_ROLE_DESC_BQ,
+                issue_seq,
+                TRACE_BQ_LOAD_END,
+                0,
+            )
+
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_wait(
+                grad_q_source_mbars + second_bv_slot,
+                Int32(0),
+            )
+        cute.arch.sync_warp()
+        cute.arch.fence_view_async_shared()
         with cute.arch.elect_one():
             q_full_pipeline.producer_commit(second_q_state)
             do_empty_pipeline.consumer_release(second_do_state)
@@ -6697,10 +6746,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
 
         Q is loaded once into a resident H-owned image. F and BV are filled
         by four 128-bit gather warps plus a CTA-local TMA coordinator and are
-        published only after their 160-thread source join. BQ routes resident
-        Q into the D-owned BV main region after dV completes. P/dS
-        math/exchange and dKV reduction are numerical; final dQ uses the
-        drained operand-main TMA epilogue.
+        published only after their 160-thread source join. BQ reloads both
+        transposed-Q rounds by paired TMA after dV makes their destinations
+        operand-safe. P/dS math/exchange and dKV reduction are numerical;
+        final dQ uses the drained operand-main TMA epilogue.
         """
 
         physical_x, _, batch_idx = cute.arch.block_idx()
@@ -6726,8 +6775,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
 
         _ = problem_shape
         _ = mQ
-        _ = tma_atom_qt
-        _ = tma_tensor_qt
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -7389,11 +7436,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         rank_g_q = rank_score_mma.partition_A(g_q)
         rank_g_do = rank_dp_mma.partition_A(g_do)
 
+        g_qt = cute.local_tile(
+            tma_tensor_qt,
+            cute.select(self.DKV_MMA_TILER, mode=[0, 2]),
+            (None, None, (token_idx, batch_idx)),
+        )
         g_dot = cute.local_tile(
             tma_tensor_dot,
             cute.select(self.DKV_MMA_TILER, mode=[0, 2]),
             (None, None, (token_idx, batch_idx)),
         )
+        rank_g_qt = rank_dkv_mma.partition_A(g_qt)
         rank_g_dot = rank_dkv_mma.partition_A(g_dot)
 
         kv_copy_atom = cute.make_copy_atom(
@@ -7429,6 +7482,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             cpasync.prefetch_descriptor(tma_atom_do)
             cpasync.prefetch_descriptor(tma_atom_dot)
         elif warp_idx == self.DESCRIPTOR_WARP:
+            cpasync.prefetch_descriptor(tma_atom_qt)
             cpasync.prefetch_descriptor(tma_atom_dq_epi)
 
         if cutlass.const_expr(self.DIAGNOSTIC_OPERAND_ONLY):
@@ -7784,15 +7838,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                             % Int32(self.OP_STAGES),
                             refill_count,
                             raw_slots,
-                            resident_q,
                             dkv_a_layout,
+                            tma_atom_qt,
+                            rank_g_qt,
+                            block_coord_vmnk,
+                            a_cta_layout,
                             grad_q_source_mbars_ptr,
                             do_empty_pipeline,
                             do_ready,
                             q_full_pipeline,
+                            grad_a_stage_bytes,
                             refill_issue_seq,
                             rank,
-                            peer_rank,
                             tidx,
                             token_idx,
                             batch_idx,
