@@ -3643,10 +3643,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     DESCRIPTOR_EXECUTE_WORD = ISSUED_TILE_CONTEXT_WORDS
     ISSUED_CTX_RING_BYTES = CONTEXT_STAGES * ISSUED_TILE_CONTEXT_BYTES
     REDUCER_CTX_RING_BYTES = REDUCER_STAGES * REDUCER_CONTEXT_BYTES
+    LOAD_CTX_RING_BYTES = CONTEXT_STAGES * N_TILE * 4
     ISSUED_STREAM_STATE_BYTES = 16
     FIXED_METADATA_BYTES = (
         ISSUED_CTX_RING_BYTES
         + REDUCER_CTX_RING_BYTES
+        + LOAD_CTX_RING_BYTES
         + ISSUED_STREAM_STATE_BYTES
     )
 
@@ -3676,7 +3678,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     STATS_WORDS = (
         SOFTMAX_SUM_ODO_STATS_WORD + SOFTMAX_STATS_HEADS
     )
-    EXPECTED_SHARED_STORAGE_BYTES = 207_872
+    EXPECTED_SHARED_STORAGE_BYTES = 208_384
 
     # DEVELOPMENT-ONLY diagnostics. These are deliberately not
     # exposed by the public interface and must be removed before integration.
@@ -3737,7 +3739,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         assert self.MAIN_PAYLOAD_BYTES == 200 * 1024
         assert self.ISSUED_CTX_RING_BYTES == 544
         assert self.REDUCER_CTX_RING_BYTES == 576
-        assert self.FIXED_METADATA_BYTES == 1_136
+        assert self.FIXED_METADATA_BYTES == 1_648
         assert self.CONTEXT_STAGES == 2
         assert self.REDUCER_STAGES == 2
         assert (
@@ -3777,10 +3779,35 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         )
 
     @cute.jit
+    def _snapshot_load_context(
+        self,
+        issue_seq: Int32,
+        issued_ctx: cute.Tensor,
+        load_ctx: cute.Tensor,
+        ctx_reader_done_mbars: cute.Pointer,
+        tidx: Int32,
+    ) -> None:
+        """Snapshot loader-owned KV indices and release its IssuedCtx credit."""
+
+        slot = issue_seq % Int32(self.CONTEXT_STAGES)
+        if tidx < Int32(self.N_TILE):
+            load_ctx[tidx, slot] = issued_ctx[
+                self.CTX_KV_BASE_WORD + tidx,
+                slot,
+            ]
+        cute.arch.fence_view_async_shared()
+        self.load_start_barrier.arrive_and_wait()
+        cute.arch.fence_view_async_shared()
+        if tidx == Int32(self.LOAD_COORDINATOR_WARP * 32):
+            cute.arch.mbarrier_arrive(
+                ctx_reader_done_mbars + slot
+            )
+
+    @cute.jit
     def _gather_score_kv_chunk(
         self,
         mKV: cute.Tensor,
-        issued_ctx: cute.Tensor,
+        load_ctx: cute.Tensor,
         destination: cute.Tensor,
         batch_idx: Int32,
         issue_seq: Int32,
@@ -3803,10 +3830,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         for row_iteration in cutlass.range_constexpr(rows_per_group):
             local_n = row_iteration * self.KV_NUM_GROUPS + group_index
             logical_n = rank * self.N_TILE_CTA + local_n
-            kv_index = issued_ctx[
-                self.CTX_KV_BASE_WORD + logical_n,
-                context_slot,
-            ]
+            kv_index = load_ctx[logical_n, context_slot]
             if kv_index >= 0:
                 self._copy_sparse_k_d128_row(
                     mKV,
@@ -3830,7 +3854,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
     def _gather_grad_k_round(
         self,
         mKV: cute.Tensor,
-        issued_ctx: cute.Tensor,
+        load_ctx: cute.Tensor,
         destination: cute.Tensor,
         batch_idx: Int32,
         issue_seq: Int32,
@@ -3859,10 +3883,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         context_slot = issue_seq % Int32(self.CONTEXT_STAGES)
         for row_iteration in cutlass.range_constexpr(rows_per_group):
             logical_n = row_iteration * self.KV_NUM_GROUPS + group_index
-            kv_index = issued_ctx[
-                self.CTX_KV_BASE_WORD + logical_n,
-                context_slot,
-            ]
+            kv_index = load_ctx[logical_n, context_slot]
             if kv_index >= 0:
                 self._copy_sparse_k_d128_row(
                     mKV,
@@ -4288,7 +4309,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         block_coord_vmnk,
         a_cta_layout: cute.Layout,
         mKV: cute.Tensor,
-        issued_ctx: cute.Tensor,
+        load_ctx: cute.Tensor,
         batch_idx: Int32,
         issue_seq: Int32,
         chunk: cutlass.Constexpr[int],
@@ -4411,7 +4432,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         if warp_idx <= self.GATHER_WARPS[-1]:
             self._gather_score_kv_chunk(
                 mKV,
-                issued_ctx,
+                load_ctx,
                 f_kv,
                 batch_idx,
                 issue_seq,
@@ -4481,7 +4502,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         block_coord_vmnk,
         a_cta_layout: cute.Layout,
         mKV: cute.Tensor,
-        issued_ctx: cute.Tensor,
+        load_ctx: cute.Tensor,
         batch_idx: Int32,
         issue_seq: Int32,
         round_index: cutlass.Constexpr[int],
@@ -4583,7 +4604,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
         if warp_idx <= self.GATHER_WARPS[-1]:
             self._gather_grad_k_round(
                 mKV,
-                issued_ctx,
+                load_ctx,
                 bv_k,
                 batch_idx,
                 issue_seq,
@@ -5804,6 +5825,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 ],
                 16,
             ]
+            # The load roles snapshot only the 64 sparse KV indices they
+            # consume.  IssuedCtx can then detach as soon as math has read its
+            # masks, while F/BV continue from this loader-owned ring.
+            load_ctx_ring: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int32,
+                    self.CONTEXT_STAGES * self.N_TILE,
+                ],
+                16,
+            ]
             reducer_ctx_ring: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Int32,
@@ -6202,6 +6233,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 stride=(1, self.ISSUED_TILE_CONTEXT_WORDS),
             )
         )
+        load_ctx_ring = storage.load_ctx_ring.get_tensor(
+            cute.make_layout(
+                (self.N_TILE, self.CONTEXT_STAGES),
+                stride=(1, self.N_TILE),
+            )
+        )
         reducer_ctx_ring = storage.reducer_ctx_ring.get_tensor(
             cute.make_layout(
                 (
@@ -6498,6 +6535,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                 reducer_word,
                 reducer_slot,
             ] = Int32(0)
+        if tidx < Int32(self.CONTEXT_STAGES * self.N_TILE):
+            load_context_slot = tidx // Int32(self.N_TILE)
+            load_context_word = tidx % Int32(self.N_TILE)
+            load_ctx_ring[
+                load_context_word,
+                load_context_slot,
+            ] = Int32(-1)
         if tidx < Int32(
             self.ISSUED_STREAM_STATE_BYTES // 4
         ):
@@ -6861,6 +6905,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
             )
             issue_seq = Int32(0)
             if first_valid:
+                self._snapshot_load_context(
+                    Int32(0),
+                    issued_ctx_ring,
+                    load_ctx_ring,
+                    ctx_reader_done_mbars_ptr,
+                    tidx,
+                )
                 for chunk in cutlass.range_constexpr(self.K_CHUNKS):
                     producer_state = self._load_f_task(
                         raw_slots,
@@ -6873,7 +6924,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         block_coord_vmnk,
                         a_cta_layout,
                         mKV,
-                        issued_ctx_ring,
+                        load_ctx_ring,
                         batch_idx,
                         Int32(0),
                         chunk,
@@ -6902,6 +6953,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                         issued_stream_state,
                         issued_stream_done_ack_mbars_ptr,
                     )
+                    if has_next:
+                        self._snapshot_load_context(
+                            next_seq,
+                            issued_ctx_ring,
+                            load_ctx_ring,
+                            ctx_reader_done_mbars_ptr,
+                            tidx,
+                        )
                     for local_task in cutlass.range_constexpr(
                         self.K_CHUNKS + self.D_ROUNDS
                     ):
@@ -6920,7 +6979,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                                     block_coord_vmnk,
                                     a_cta_layout,
                                     mKV,
-                                    issued_ctx_ring,
+                                    load_ctx_ring,
                                     batch_idx,
                                     next_seq,
                                     local_task,
@@ -6952,7 +7011,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                                 block_coord_vmnk,
                                 a_cta_layout,
                                 mKV,
-                                issued_ctx_ring,
+                                load_ctx_ring,
                                 batch_idx,
                                 issue_seq,
                                 round_index,
@@ -6970,16 +7029,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV0(
                                 trace_buffer,
                                 trace_token_idx,
                                 trace_batch_idx,
-                            )
-                    if warp_idx == self.LOAD_COORDINATOR_WARP:
-                        with cute.arch.elect_one():
-                            context_slot = (
-                                issue_seq
-                                % Int32(self.CONTEXT_STAGES)
-                            )
-                            cute.arch.mbarrier_arrive(
-                                ctx_reader_done_mbars_ptr
-                                + context_slot
                             )
                     issue_seq += Int32(1)
                     active = has_next
