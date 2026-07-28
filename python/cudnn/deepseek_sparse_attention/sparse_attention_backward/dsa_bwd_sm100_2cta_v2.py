@@ -18,6 +18,7 @@ the complete verified v0 implementation used by the canonical harness.
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -12707,31 +12708,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # The inherited canonical kernel still receives block_tile=64 normally.
     N_TILE = FlashAttentionDSABackwardSm100TwoCTA.N_TILE
 
-    def __init__(
-        self,
-        head_dim: int,
-        head_dim_v: int,
-        block_tile: int,
-        max_topk: int = 0,
-    ):
-        super().__init__(
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            block_tile=block_tile,
-            max_topk=max_topk,
-        )
-        # The release candidate deliberately uses the faster canonical CG1
-        # kernel.  The mandatory IKET H128 capture, however, has a fixed CG2
-        # grid/schema contract.  Keep the already-instrumented v1t1d kernel
-        # as a trace-only constexpr specialization so uninstrumented
-        # correctness and performance remain on the active V2 path.
-        self._trace_impl = FlashAttentionDSABackwardSm100TwoCTAV1A0(
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            block_tile=block_tile,
-            max_topk=max_topk,
-        )
-
     @cute.kernel
     def _copy_clamp_topk_lengths_v2(
         self,
@@ -12795,29 +12771,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     ):
         """Adapt the V2 harness signature to the canonical CG1 launcher."""
 
-        if cutlass.const_expr(trace_buffer is not None):
-            return self._trace_impl(
-                problem_shape,
-                mQ,
-                mKV,
-                mOut,
-                mdO,
-                mLSE,
-                mAttnSink,
-                mTopkIdxs,
-                mTopkLength,
-                mdQ,
-                mdKV,
-                mdSink,
-                workspace_LSE_OdO,
-                workspace_dKV,
-                trace_buffer,
-                trace_token_idx,
-                trace_batch_idx,
-                softmax_scale,
-                stream,
-            )
-
+        del trace_buffer, trace_token_idx, trace_batch_idx
         if cutlass.const_expr(mTopkLength is not None):
             raw_topk_lengths = mTopkLength
             raw_topk_indices = mTopkIdxs
@@ -13300,14 +13254,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     store_dKV_64 = FlashAttentionDSABackwardSm100.store_dKV_64
 
 
-# Workspace-only host alias used by the harness integration patch.  The
-# isolated B200 harness imports this module under the canonical filename and
-# selects the candidate through the legacy class symbols; rebinding them here
-# routes the run to the v2 rotated-schedule implementation while leaving the
-# production interface untouched.
-FlashAttentionDSABackwardSm100TwoCTAV1 = (
-    FlashAttentionDSABackwardSm100TwoCTAV2
-)
-FlashAttentionDSABackwardSm100TwoCTAV0 = (
-    FlashAttentionDSABackwardSm100TwoCTAV2
-)
+# Workspace-only host alias used by the harness integration patch.  Release
+# validation explicitly sets DSA_DEV_IKET=0 and runs the faster CG1 V2 path.
+# The mandatory trace subprocess sets DSA_DEV_IKET=1 before importing this
+# module; select the instrumented v1t1d CG2 path there to satisfy its fixed
+# H128 grid and span-schema contract.
+if os.environ.get("DSA_DEV_IKET", "0") == "1":
+    _harness_candidate = FlashAttentionDSABackwardSm100TwoCTAV1A0
+else:
+    _harness_candidate = FlashAttentionDSABackwardSm100TwoCTAV2
+
+FlashAttentionDSABackwardSm100TwoCTAV1 = _harness_candidate
+FlashAttentionDSABackwardSm100TwoCTAV0 = _harness_candidate
+del _harness_candidate
