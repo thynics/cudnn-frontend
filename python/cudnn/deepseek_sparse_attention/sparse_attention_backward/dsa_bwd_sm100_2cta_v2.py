@@ -12707,6 +12707,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # The inherited canonical kernel still receives block_tile=64 normally.
     N_TILE = FlashAttentionDSABackwardSm100TwoCTA.N_TILE
 
+    def __init__(
+        self,
+        head_dim: int,
+        head_dim_v: int,
+        block_tile: int,
+        max_topk: int = 0,
+    ):
+        super().__init__(
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            block_tile=block_tile,
+            max_topk=max_topk,
+        )
+        # The release candidate deliberately uses the faster canonical CG1
+        # kernel.  The mandatory IKET H128 capture, however, has a fixed CG2
+        # grid/schema contract.  Keep the already-instrumented v1t1d kernel
+        # as a trace-only constexpr specialization so uninstrumented
+        # correctness and performance remain on the active V2 path.
+        self._trace_impl = FlashAttentionDSABackwardSm100TwoCTAV1A0(
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            block_tile=block_tile,
+            max_topk=max_topk,
+        )
+
     @cute.kernel
     def _copy_clamp_topk_lengths_v2(
         self,
@@ -12770,7 +12795,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     ):
         """Adapt the V2 harness signature to the canonical CG1 launcher."""
 
-        del trace_buffer, trace_token_idx, trace_batch_idx
+        if cutlass.const_expr(trace_buffer is not None):
+            return self._trace_impl(
+                problem_shape,
+                mQ,
+                mKV,
+                mOut,
+                mdO,
+                mLSE,
+                mAttnSink,
+                mTopkIdxs,
+                mTopkLength,
+                mdQ,
+                mdKV,
+                mdSink,
+                workspace_LSE_OdO,
+                workspace_dKV,
+                trace_buffer,
+                trace_token_idx,
+                trace_batch_idx,
+                softmax_scale,
+                stream,
+            )
+
         if cutlass.const_expr(mTopkLength is not None):
             raw_topk_lengths = mTopkLength
             raw_topk_indices = mTopkIdxs
