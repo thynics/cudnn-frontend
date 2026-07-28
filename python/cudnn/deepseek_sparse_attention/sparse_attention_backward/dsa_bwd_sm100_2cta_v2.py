@@ -11081,12 +11081,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.struct.MemRange[element_dtype, 8192],
                 1024,
             ]
-            p_block_0: cute.struct.Align[
-                cute.struct.MemRange[element_dtype, 2048],
-                1024,
-            ]
-            p_block_1: cute.struct.Align[
-                cute.struct.MemRange[element_dtype, 2048],
+            p_blocks: cute.struct.Align[
+                cute.struct.MemRange[element_dtype, 4096],
                 1024,
             ]
             p_xchg: cute.struct.Align[
@@ -11097,12 +11093,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.struct.MemRange[element_dtype, 4096],
                 1024,
             ]
-            ds_block_0: cute.struct.Align[
-                cute.struct.MemRange[element_dtype, 2048],
-                1024,
-            ]
-            ds_block_1: cute.struct.Align[
-                cute.struct.MemRange[element_dtype, 2048],
+            ds_blocks: cute.struct.Align[
+                cute.struct.MemRange[element_dtype, 4096],
                 1024,
             ]
             ds_xchg: cute.struct.Align[
@@ -11141,20 +11133,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 (self.N_TILE, self.D_TILE_CTA),
                 stride=(self.D_TILE_CTA, 1),
             ),
-        )
-
-    @cute.jit
-    def _dkv_partition_coord_v2(
-        self,
-        local_n: Int32,
-        local_h: Int32,
-    ):
-        """Map a logical N32xH64 value into the exact CG2-B stage layout."""
-
-        return (
-            (local_n, local_h % Int32(16)),
-            Int32(0),
-            local_h // Int32(16),
         )
 
     @cute.jit
@@ -11542,33 +11520,43 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 swizzle=dkv_a_layout_staged.inner,
             ),
         )
+        p_blocks_raw = storage.p_blocks.data_ptr()
+        ds_blocks_raw = storage.ds_blocks.data_ptr()
         p_blocks = (
-            storage.p_block_0.get_tensor(
+            cute.make_tensor(
+                cute.recast_ptr(
+                    p_blocks_raw,
+                    dkv_b_layout_staged.inner,
+                    dtype=self.element_dtype,
+                ),
                 dkv_b_layout_staged.outer,
-                swizzle=dkv_b_layout_staged.inner,
             ),
-            storage.p_block_1.get_tensor(
+            cute.make_tensor(
+                cute.recast_ptr(
+                    p_blocks_raw + self.PDS_BLOCK_ELEMENTS,
+                    dkv_b_layout_staged.inner,
+                    dtype=self.element_dtype,
+                ),
                 dkv_b_layout_staged.outer,
-                swizzle=dkv_b_layout_staged.inner,
             ),
-        )
-        p_xchg = storage.p_xchg.get_tensor(
-            dkv_b_layout_staged.outer,
-            swizzle=dkv_b_layout_staged.inner,
         )
         ds_blocks = (
-            storage.ds_block_0.get_tensor(
+            cute.make_tensor(
+                cute.recast_ptr(
+                    ds_blocks_raw,
+                    dkv_b_layout_staged.inner,
+                    dtype=self.element_dtype,
+                ),
                 dkv_b_layout_staged.outer,
-                swizzle=dkv_b_layout_staged.inner,
             ),
-            storage.ds_block_1.get_tensor(
+            cute.make_tensor(
+                cute.recast_ptr(
+                    ds_blocks_raw + self.PDS_BLOCK_ELEMENTS,
+                    dkv_b_layout_staged.inner,
+                    dtype=self.element_dtype,
+                ),
                 dkv_b_layout_staged.outer,
-                swizzle=dkv_b_layout_staged.inner,
             ),
-        )
-        ds_xchg = storage.ds_xchg.get_tensor(
-            dkv_b_layout_staged.outer,
-            swizzle=dkv_b_layout_staged.inner,
         )
         ds_image = storage.ds_image.get_tensor(
             dq_b_layout_staged.outer,
@@ -11589,6 +11577,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         assert (
             score_store_layout.inner
             == dq_b_layout_staged.inner
+        )
+        assert (
+            score_store_layout.inner
+            == dkv_b_layout_staged.inner
         )
         score_store_domain = cute.make_layout(
             (
@@ -11615,31 +11607,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # Preserve the exact nested/swizzled K64 partition-B byte image.
         # A raw 4 KiB DSM copy is then layout-preserving because every block
         # has the same type and alignment at source and destination.
-        p_block_stages = (
-            p_blocks[0][None, None, None, 0],
-            p_blocks[1][None, None, None, 0],
-        )
-        ds_block_stages = (
-            ds_blocks[0][None, None, None, 0],
-            ds_blocks[1][None, None, None, 0],
-        )
-        p_xchg_stage = p_xchg[None, None, None, 0]
-        ds_xchg_stage = ds_xchg[None, None, None, 0]
+        p_block_stage = p_blocks[0][None, None, None, 0]
         assert (
-            cute.size(p_block_stages[0], mode=[0, 0])
+            cute.size(p_block_stage, mode=[0, 0])
             == self.N_TILE_CTA
         )
-        assert cute.size(p_block_stages[0], mode=[0, 1]) == 16
-        assert cute.size(p_block_stages[0], mode=[1]) == 1
-        assert cute.size(p_block_stages[0], mode=[2]) == 4
-        assert cute.size(p_block_stages[0]) == self.PDS_BLOCK_ELEMENTS
+        assert cute.size(p_block_stage, mode=[0, 1]) == 16
+        assert cute.size(p_block_stage, mode=[1]) == 1
+        assert cute.size(p_block_stage, mode=[2]) == 4
+        assert cute.size(p_block_stage) == self.PDS_BLOCK_ELEMENTS
         p_block_raw_ptrs = (
-            storage.p_block_0.data_ptr(),
-            storage.p_block_1.data_ptr(),
+            p_blocks_raw,
+            p_blocks_raw + self.PDS_BLOCK_ELEMENTS,
         )
         ds_block_raw_ptrs = (
-            storage.ds_block_0.data_ptr(),
-            storage.ds_block_1.data_ptr(),
+            ds_blocks_raw,
+            ds_blocks_raw + self.PDS_BLOCK_ELEMENTS,
         )
         flat_pds_block_layout = cute.make_layout(
             (self.PDS_BLOCK_ELEMENTS,),
@@ -12136,6 +12119,89 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             assert cute.size(t_rs_ds, mode=[4]) == 1
             t_rs_ds_tile = t_rs_ds[None, None, None, None, 0]
+            # The score R2S image is h + n*H64 under the same swizzle as
+            # each K64 dKV B block. Two consecutive blocks form its N64
+            # domain; the two-warp N owner can therefore write either its
+            # local final block or a virtual, pre-swizzled xchg image with
+            # the same stmatrix copy used for dQ's whole dS image.
+            n_owner = cute.arch.make_warp_uniform(
+                mtx // Int32(self.H_TILE_CTA)
+            )
+            owns_n = n_owner == rank
+            aligned_p_blocks_ptr = cute.make_ptr(
+                self.element_dtype,
+                p_blocks[0].iterator.toint(),
+                p_blocks[0].memspace,
+                assumed_align=16,
+            )
+            aligned_ds_blocks_ptr = cute.make_ptr(
+                self.element_dtype,
+                ds_blocks[0].iterator.toint(),
+                ds_blocks[0].memspace,
+                assumed_align=16,
+            )
+            p_local_store = cute.make_tensor(
+                cute.recast_ptr(
+                    aligned_p_blocks_ptr,
+                    score_store_layout.inner,
+                    dtype=self.element_dtype,
+                ),
+                score_store_domain,
+            )
+            ds_local_store = cute.make_tensor(
+                cute.recast_ptr(
+                    aligned_ds_blocks_ptr,
+                    score_store_layout.inner,
+                    dtype=self.element_dtype,
+                ),
+                score_store_domain,
+            )
+            p_xchg_store = cute.make_tensor(
+                cute.recast_ptr(
+                    p_xchg_raw.iterator
+                    - n_owner * self.PDS_BLOCK_ELEMENTS,
+                    score_store_layout.inner,
+                    dtype=self.element_dtype,
+                ),
+                score_store_domain,
+            )
+            ds_xchg_store = cute.make_tensor(
+                cute.recast_ptr(
+                    ds_xchg_raw.iterator
+                    - n_owner * self.PDS_BLOCK_ELEMENTS,
+                    score_store_layout.inner,
+                    dtype=self.element_dtype,
+                ),
+                score_store_domain,
+            )
+            t_rs_p_local = thread_copy_r2s.partition_D(
+                p_local_store
+            )
+            t_rs_ds_local = thread_copy_r2s.partition_D(
+                ds_local_store
+            )
+            t_rs_p_xchg = thread_copy_r2s.partition_D(
+                p_xchg_store
+            )
+            t_rs_ds_xchg = thread_copy_r2s.partition_D(
+                ds_xchg_store
+            )
+            assert cute.size(t_rs_p_local, mode=[4]) == 1
+            assert cute.size(t_rs_ds_local, mode=[4]) == 1
+            assert cute.size(t_rs_p_xchg, mode=[4]) == 1
+            assert cute.size(t_rs_ds_xchg, mode=[4]) == 1
+            t_rs_p_local_tile = t_rs_p_local[
+                None, None, None, None, 0
+            ]
+            t_rs_ds_local_tile = t_rs_ds_local[
+                None, None, None, None, 0
+            ]
+            t_rs_p_xchg_tile = t_rs_p_xchg[
+                None, None, None, None, 0
+            ]
+            t_rs_ds_xchg_tile = t_rs_ds_xchg[
+                None, None, None, None, 0
+            ]
             r_score = cute.make_rmem_tensor(
                 score_coordinates.shape,
                 self.acc_dtype,
@@ -12230,8 +12296,38 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
                 pipe_pds.producer_acquire(pds_state)
 
-                # Whole-image dS store (dQ B operand).
+                # Publish P/dS with stmatrix. Each pair of warps owns one
+                # N32 half, so this branch is warp-uniform.
+                r_p_store = thread_copy_r2s.retile(r_p)
                 r_ds_store = thread_copy_r2s.retile(r_ds)
+                assert t_rs_p_local_tile.shape == r_p_store.shape
+                assert t_rs_ds_local_tile.shape == r_ds_store.shape
+                assert t_rs_p_xchg_tile.shape == r_p_store.shape
+                assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
+                if owns_n:
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_p_store,
+                        t_rs_p_local_tile,
+                    )
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_ds_store,
+                        t_rs_ds_local_tile,
+                    )
+                else:
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_p_store,
+                        t_rs_p_xchg_tile,
+                    )
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_ds_store,
+                        t_rs_ds_xchg_tile,
+                    )
+
+                # Whole-image dS store for the dQ B operand.
                 assert t_rs_ds_tile.shape == r_ds_store.shape
                 cute.copy(
                     tiled_copy_r2s,
@@ -12239,47 +12335,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     t_rs_ds_tile,
                 )
 
-                # Half-block publication: own N-half into the global-h
-                # block, peer N-half into the xchg staging (bulk-DSM
-                # source).  Coordinates come from the T2R identity map.
                 # No validity mask (baseline-identical invariant pair):
                 # invalid columns see S=dP=0 from zero-filled K rows, so
                 # P/dS stay finite; dQ is protected by zero-filled K_dQ
                 # rows and dKV garbage columns are dropped by the drain
                 # predicates (global_n < topk, kv_index >= 0).
-                for local_n in cutlass.range_constexpr(
-                    self.N_TILE_CTA
-                ):
-                    logical = score_coordinates[local_n]
-                    g_h = Int32(cute.get(logical, mode=[0]))
-                    g_n = Int32(cute.get(logical, mode=[1]))
-                    h_in_half = g_h % Int32(self.H_TILE_CTA)
-                    n_in_half = g_n % Int32(self.N_TILE_CTA)
-                    n_half = g_n // Int32(self.N_TILE_CTA)
-                    dkv_partition_coord = (
-                        self._dkv_partition_coord_v2(
-                            n_in_half,
-                            h_in_half,
-                        )
-                    )
-                    if n_half == rank:
-                        if rank == Int32(0):
-                            p_block_stages[0][
-                                dkv_partition_coord
-                            ] = r_p[local_n]
-                            ds_block_stages[0][
-                                dkv_partition_coord
-                            ] = r_ds[local_n]
-                        else:
-                            p_block_stages[1][
-                                dkv_partition_coord
-                            ] = r_p[local_n]
-                            ds_block_stages[1][
-                                dkv_partition_coord
-                            ] = r_ds[local_n]
-                    else:
-                        p_xchg_stage[dkv_partition_coord] = r_p[local_n]
-                        ds_xchg_stage[dkv_partition_coord] = r_ds[local_n]
 
                 cute.arch.fence_view_async_shared()
                 self.math_barrier.arrive_and_wait()
