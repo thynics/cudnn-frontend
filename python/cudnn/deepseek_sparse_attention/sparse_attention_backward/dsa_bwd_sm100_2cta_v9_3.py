@@ -12710,10 +12710,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 ),
                 score_store_domain,
             )
+            # v9.3 fix: the runtime n_owner bias degrades the DSL's
+            # alignment inference to element width (16-bit), which the
+            # 128-bit stmatrix store atom rejects at build time.  The
+            # bias is n_owner * 4096 B off a 1024-aligned field, so a
+            # 16-byte assumed alignment is provable -- declare it the
+            # same way the local-block pointers do.
+            aligned_p_xchg_ptr = cute.make_ptr(
+                self.element_dtype,
+                p_xchg_raw.iterator.toint()
+                - n_owner * Int32(self.PDS_BLOCK_BYTES),
+                p_xchg_raw.memspace,
+                assumed_align=16,
+            )
+            aligned_ds_xchg_ptr = cute.make_ptr(
+                self.element_dtype,
+                ds_xchg_raw.iterator.toint()
+                - n_owner * Int32(self.PDS_BLOCK_BYTES),
+                ds_xchg_raw.memspace,
+                assumed_align=16,
+            )
             p_xchg_store = cute.make_tensor(
                 cute.recast_ptr(
-                    p_xchg_raw.iterator
-                    - n_owner * self.PDS_BLOCK_ELEMENTS,
+                    aligned_p_xchg_ptr,
                     score_store_layout.inner,
                     dtype=self.element_dtype,
                 ),
@@ -12721,8 +12740,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             ds_xchg_store = cute.make_tensor(
                 cute.recast_ptr(
-                    ds_xchg_raw.iterator
-                    - n_owner * self.PDS_BLOCK_ELEMENTS,
+                    aligned_ds_xchg_ptr,
                     score_store_layout.inner,
                     dtype=self.element_dtype,
                 ),
