@@ -10908,6 +10908,64 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         return SharedStorage
 
 
+@dsl_user_op
+def _store_shared_seq_v4(
+    counter: cute.Pointer,
+    value: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Release-store a monotonic tile sequence number to CTA shared."""
+
+    counter_i32 = counter.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [counter_i32, Int32(value).ir_value(loc=loc, ip=ip)],
+        "st.release.cta.shared.u32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _wait_shared_seq_v4(
+    counter: cute.Pointer,
+    target: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Spin until the shared sequence number reaches ``target``.
+
+    A monotonic counter has no phase parity, so the producer may run any
+    number of generations ahead of the waiter (a count-1 mbarrier here
+    deadlocks once the producer leads by two: the parity aliases back).
+    """
+
+    counter_i32 = counter.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [counter_i32, Int32(target).ir_value(loc=loc, ip=ip)],
+        (
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            ".reg .u32 v;\n\t"
+            "SEQ_WAIT_LOOP:\n\t"
+            "ld.acquire.cta.shared.u32 v, [$0];\n\t"
+            "setp.ge.u32 p, v, $1;\n\t"
+            "@!p bra SEQ_WAIT_LOOP;\n\t"
+            "}"
+        ),
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 @cute.jit
 def _store_shared_bf16_at_v2(
     tensor: cute.Tensor,
@@ -11086,7 +11144,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             round_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            khot_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            khot_seq: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -11523,7 +11581,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         landing_mbars = storage.landing_mbars.data_ptr()
         relay_mbars = storage.relay_mbars.data_ptr()
         round_tma_mbars = storage.round_tma_mbars.data_ptr()
-        khot_mbar = storage.khot_mbar.data_ptr()
+        khot_seq = cute.recast_ptr(
+            storage.khot_seq.data_ptr(),
+            dtype=cutlass.Int32,
+        )
         # Raw pointers used inside role branches must be extracted here:
         # the struct instance itself cannot cross a dynamic-if region.
         stationary_q_raw = storage.stationary_q.data_ptr()
@@ -11970,7 +12031,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(relay_mbars + 1, 2)
             cute.arch.mbarrier_init(round_tma_mbars, 1)
             cute.arch.mbarrier_init(round_tma_mbars + 1, 1)
-            cute.arch.mbarrier_init(khot_mbar, 1)
+            _store_shared_seq_v4(khot_seq, Int32(0))
         cute.arch.fence_view_async_shared()
         self.cta_barrier.arrive_and_wait()
 
@@ -12095,7 +12156,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # 1 KiB rows (measured cold-line ROUTE_K was 4.6 us/tile).
                 self.gather_barrier.arrive_and_wait()
                 if tidx == Int32(0):
-                    cute.arch.mbarrier_arrive(khot_mbar)
+                    _store_shared_seq_v4(
+                        khot_seq,
+                        loop_iter + Int32(1),
+                    )
                 pipe_kscore.producer_commit(gather_state)
                 gather_state.advance()
                 _iket.range_end(
@@ -12794,7 +12858,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             tma_phase_0 = Int32(0)
             tma_phase_1 = Int32(0)
-            khot_phase = Int32(0)
             if tile_count > Int32(0):
                 load_qdo_token = _iket.range_start(
                     "LOAD_QDO",
@@ -12856,8 +12919,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "ROUTE_K(i)",
                         loop_iter,
                     )
-                    cute.arch.mbarrier_wait(khot_mbar, khot_phase)
-                    khot_phase = Int32(1) - khot_phase
+                    _wait_shared_seq_v4(
+                        khot_seq,
+                        loop_iter + Int32(1),
+                    )
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
                     pipe_round.producer_acquire(round_acq)
