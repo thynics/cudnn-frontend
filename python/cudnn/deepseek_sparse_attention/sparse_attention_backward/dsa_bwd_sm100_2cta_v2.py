@@ -10950,18 +10950,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
       shadow (rotated schedule), keeping the tensor cores gap-free.
     """
 
-    THREADS_PER_CTA = 640
+    THREADS_PER_CTA = 512
 
-    # Warp roles (5 warps per named group where applicable).
+    # Design-specified 16-warp role partition.
     GATHER_WARPS = 4
     MATH_WARP_BEGIN = 4
     MATH_WARPS = 4
     REDUCE_WARP_BEGIN = 8
-    REDUCE_WARPS = 8
-    MMA_WARP = 16
-    LOAD_WARP = 17
-    RELAY_WARP = 18
-    IDLE_WARP = 19
+    REDUCE_WARPS = 4
+    MMA_WARP = 12
+    LOAD_WARP = 13
+    RELAY_WARP = 14
+    IDLE_WARP = 15
 
     GATHER_THREADS = GATHER_WARPS * 32
     MATH_THREAD_BEGIN = MATH_WARP_BEGIN * 32
@@ -13553,11 +13553,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     ) -> pipeline.PipelineState:
         """Drain one rank-owned dKV slot: T2R, release, vector atomics.
 
-        Adapted from the verified v1 reducer: two warp groups share the
-        ROW_MAJOR rows, the butterfly-shuffle network rebuilds contiguous
-        FP32x4 D vectors, and each CTA covers only its own D quarters so
-        the pair issues exactly half the baseline's atomic traffic with
-        disjoint addresses.  KV indices are re-read from GMEM (L2-hot).
+        Adapted from the verified v1 reducer: the design's four reducer
+        warps each read the complete rank-owned TMEM partition, the
+        butterfly-shuffle network rebuilds contiguous FP32x4 D vectors,
+        and each CTA covers only its own D quarters so the pair issues
+        exactly half the baseline's atomic traffic with disjoint
+        addresses. KV indices are re-read from GMEM (L2-hot).
         """
 
         packed_issue = (
@@ -13582,19 +13583,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dkv_tmem_load,
             t_dkv_slot,
         )
-        dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
-        wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
+        assert self.REDUCE_THREADS == self.MATH_THREADS_PER_CTA
+        dp_idx = rtx
         thread_t2r = tiled_t2r.get_slice(dp_idx)
-        thread_source = self._split_wg_t1d_v2(
-            thread_t2r.partition_S(t_dkv_slot),
-            wg_idx,
-            2,
-        )
-        thread_coordinates = self._split_wg_t1d_v2(
-            thread_t2r.partition_D(rank_coordinates),
-            wg_idx,
-            2,
-        )
+        thread_source = thread_t2r.partition_S(t_dkv_slot)
+        thread_coordinates = thread_t2r.partition_D(rank_coordinates)
         thread_values = cute.make_rmem_tensor(
             thread_coordinates.shape,
             self.acc_dtype,
@@ -13608,7 +13601,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             packed_issue,
         )
 
-        assert cute.size(thread_values) == self.N_TILE // 2
+        assert cute.size(thread_values) == self.N_TILE
         reduce_atomic_token = _iket.range_start(
             "REDUCE_ATOMIC(i,r)",
             packed_issue,
@@ -13616,7 +13609,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         lane_in_quad = rtx % Int32(4)
         tile_base = tile_index * Int32(self.N_TILE)
         for vector_index in cutlass.range_constexpr(
-            self.N_TILE // 8
+            self.N_TILE // 4
         ):
             value_base = vector_index * 4
             value_0 = thread_values[value_base]
