@@ -11297,9 +11297,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         ds_fragment: cute.Tensor,
         accumulate: cutlass.Boolean,
         round_pipelines,
-        round_consumer_states,
         issue_seq: Int32,
-    ):
+    ) -> None:
         """Issue both persistent dQ rounds back-to-back (v1_deep_p lesson).
 
         Round r consumes the round-region generation holding K_dQ(r); each
@@ -11317,7 +11316,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 packed_issue,
             )
             round_pipeline = round_pipelines[round_index]
-            round_consumer_state = round_consumer_states[round_index]
+            round_consumer_state = pipeline.PipelineState(
+                self.ROUND_STAGES,
+                issue_seq,
+                Int32(0),
+                issue_seq & Int32(1),
+            )
             round_pipeline.consumer_wait(round_consumer_state)
             _iket.range_end(
                 wait_dq_token,
@@ -11359,8 +11363,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             cute.arch.fence_view_async_tmem_store()
             round_pipeline.consumer_release(round_consumer_state)
-            round_consumer_state.advance()
-        return round_consumer_states
 
     @cute.jit
     def _tma_store_dq_staging_v2(
@@ -12256,29 +12258,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Producer,
                 1,
             )
-            kdq_publish_states = (
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-            )
-            # P0/P1 consume the wrap credits E8/E9. Producer phase 1 makes
-            # tile 0's initially-empty credit pass immediately; each advance
-            # then waits for the predecessor's real release phase (0, 1, ...).
-            kdq_credit_states = (
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-            )
             for loop_iter in cutlass.range(tile_count):
                 tile_index = tile_count - Int32(1) - loop_iter
                 load_k_token = _iket.range_start(
@@ -12320,15 +12299,30 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     self.D_ROUNDS
                 ):
                     kdq_pipeline = round_pipelines[round_index]
-                    publish_state = kdq_publish_states[round_index]
-                    credit_state = kdq_credit_states[round_index]
+                    # Every round pipeline is one-stage. Reconstruct both
+                    # states from the tile ordinal instead of carrying
+                    # PipelineState SSA values out of this nested region.
+                    producer_phase = (
+                        Int32(1) ^ (loop_iter & Int32(1))
+                    )
+                    publish_state = pipeline.PipelineState(
+                        self.ROUND_STAGES,
+                        loop_iter,
+                        Int32(0),
+                        producer_phase,
+                    )
+                    credit_state = pipeline.PipelineState(
+                        self.ROUND_STAGES,
+                        loop_iter,
+                        Int32(0),
+                        producer_phase,
+                    )
                     # A/B wrap edge: P0 <- P8 and P1 <- P9. Use the public
                     # acquire API with an independent state; publish state
                     # must remain aligned exclusively with P0/P1 full/empty.
                     round_pipelines[
                         round_index + self.ROUND_GENS_PER_TILE - 2
                     ].producer_acquire(credit_state)
-                    credit_state.advance()
                     self._fill_kdq_v2(
                         mKV,
                         mTopkIdxs,
@@ -12351,18 +12345,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # No elect_one: P0/P1 use gather_group's full 128-thread
                     # arrival contract in each CTA.
                     kdq_pipeline.producer_commit(publish_state)
-                    publish_state.advance()
                 _iket.range_end(
                     route_k_token,
                     loop_iter,
                 )
             if tile_count > Int32(0):
                 pipe_kscore.producer_tail(gather_state)
+                round_tail_state = pipeline.PipelineState(
+                    self.ROUND_STAGES,
+                    tile_count,
+                    Int32(0),
+                    Int32(1) ^ (tile_count & Int32(1)),
+                )
                 for round_index in cutlass.range_constexpr(
                     self.D_ROUNDS
                 ):
                     round_pipelines[round_index].producer_tail(
-                        kdq_publish_states[round_index]
+                        round_tail_state
                     )
 
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
@@ -12912,48 +12911,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Consumer,
                     1,
                 )
-                round_cons = (
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    ),
-                )
                 p_cons = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer,
                     1,
@@ -12997,7 +12954,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     if has_prev:
                         dq_acc = loop_iter != Int32(1)
                         (
-                            round_cons,
                             dkv_prod,
                             p_cons,
                             ds_cons,
@@ -13021,7 +12977,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 relay_phase,
                                 relay_mbars,
                                 round_pipelines,
-                                round_cons,
                                 pipe_p,
                                 p_cons,
                                 pipe_ds,
@@ -13048,7 +13003,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
                     if has_prev:
                         (
-                            round_cons,
                             dkv_prod,
                             p_cons,
                             ds_cons,
@@ -13063,7 +13017,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 ds_fragments[0],
                                 ds_fragments[1],
                                 round_pipelines,
-                                round_cons,
                                 pipe_p,
                                 p_cons,
                                 pipe_ds,
@@ -13083,7 +13036,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
                     dq_acc = tile_count != Int32(1)
                     (
-                        round_cons,
                         dkv_prod,
                         p_cons,
                         ds_cons,
@@ -13107,7 +13059,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             relay_phase,
                             relay_mbars,
                             round_pipelines,
-                            round_cons,
                             pipe_p,
                             p_cons,
                             pipe_ds,
@@ -13118,7 +13069,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         )
                     )
                     (
-                        round_cons,
                         dkv_prod,
                         p_cons,
                         ds_cons,
@@ -13133,7 +13083,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             ds_fragments[0],
                             ds_fragments[1],
                             round_pipelines,
-                            round_cons,
                             pipe_p,
                             p_cons,
                             pipe_ds,
@@ -13158,78 +13107,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx == Int32(self.LOAD_WARP):
             # --- load: stationary TMA once, then P2..P9 per tile.
             _iket.mark("ROLE_KV_LOAD", rank)
-            round_publish_states = (
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                ),
-            )
-            # P2..P9 consume E0..E7 from the same tile. Consumer phase 0
-            # forces tile 0 to wait for a real predecessor release; each
-            # subsequent advance follows that predecessor's alternating
-            # release phase. These states never publish and are never tailed.
-            round_credit_states = (
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.ROUND_STAGES,
-                ),
-                pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    self.ROUND_STAGES,
-                ),
-            )
             tma_phase = Int32(0)
             if tile_count > Int32(0):
                 load_qdo_token = _iket.range_start(
@@ -13307,12 +13184,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 round_pipeline = round_pipelines[
                                     generation
                                 ]
-                                publish_state = round_publish_states[
-                                    generation - 2
-                                ]
-                                credit_state = round_credit_states[
-                                    generation - 2
-                                ]
+                                # P2..P9 publish with the producer phase for
+                                # this tile, while their same-tile credits
+                                # wait for E0..E7's post-release phase.
+                                publish_state = pipeline.PipelineState(
+                                    self.ROUND_STAGES,
+                                    loop_iter,
+                                    Int32(0),
+                                    Int32(1)
+                                    ^ (loop_iter & Int32(1)),
+                                )
+                                credit_state = pipeline.PipelineState(
+                                    self.ROUND_STAGES,
+                                    loop_iter,
+                                    Int32(0),
+                                    loop_iter & Int32(1),
+                                )
                                 # P_g may reuse A/B only after P_(g-2)'s
                                 # UMMA-backed empty barrier completes for
                                 # this tile. Public producer_acquire consumes
@@ -13321,7 +13208,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 round_pipelines[
                                     generation - 2
                                 ].producer_acquire(credit_state)
-                                credit_state.advance()
                                 with cute.arch.elect_one():
                                     cute.arch.mbarrier_arrive_and_expect_tx(
                                         round_tma_mbar,
@@ -13388,17 +13274,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     round_pipeline.producer_commit(
                                         publish_state
                                     )
-                                publish_state.advance()
                         _iket.range_end(
                             mat_qdo_token,
                             packed_mat_qdo,
                         )
+                round_tail_state = pipeline.PipelineState(
+                    self.ROUND_STAGES,
+                    tile_count,
+                    Int32(0),
+                    Int32(1) ^ (tile_count & Int32(1)),
+                )
                 for generation in cutlass.range_constexpr(
                     2,
                     self.ROUND_GENS_PER_TILE,
                 ):
                     round_pipelines[generation].producer_tail(
-                        round_publish_states[generation - 2]
+                        round_tail_state
                     )
 
         elif warp_idx == Int32(self.RELAY_WARP):
@@ -13532,7 +13423,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         relay_phase: Int32,
         relay_mbars: cute.Pointer,
         round_pipelines,
-        round_consumer_states,
         p_pipeline,
         p_consumer_state: pipeline.PipelineState,
         ds_pipeline,
@@ -13551,7 +13441,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         # dQ both rounds back-to-back; releases free the round buffers for
         # the quadrant refills.
-        round_consumer_states = self._issue_dq_rounds_v2(
+        self._issue_dq_rounds_v2(
             dq_tiled_mma,
             t_dq_0,
             t_dq_1,
@@ -13560,7 +13450,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dq_ds_fragment,
             dq_accumulate,
             round_pipelines,
-            round_consumer_states,
             issue_seq,
         )
 
@@ -13577,7 +13466,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dkv_done_pipeline.producer_acquire(dkv_producer_state)
         for generation in cutlass.range_constexpr(2, 6):
             round_pipeline = round_pipelines[generation]
-            round_consumer_state = round_consumer_states[generation]
+            round_consumer_state = pipeline.PipelineState(
+                self.ROUND_STAGES,
+                issue_seq,
+                Int32(0),
+                issue_seq & Int32(1),
+            )
             round_pipeline.consumer_wait(round_consumer_state)
             dkv_issue_token = _iket.range_start(
                 "dVdK_ISSUE(i,r,p)",
@@ -13620,13 +13514,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 packed_issue + Int32(generation - 2),
             )
             round_pipeline.consumer_release(round_consumer_state)
-            round_consumer_state.advance()
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_producer_state)
         dkv_producer_state.advance()
 
         return (
-            round_consumer_states,
             dkv_producer_state,
             p_consumer_state,
             ds_consumer_state,
@@ -13644,7 +13536,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         ds_fragment_0: cute.Tensor,
         ds_fragment_1: cute.Tensor,
         round_pipelines,
-        round_consumer_states,
         p_pipeline,
         p_consumer_state: pipeline.PipelineState,
         ds_pipeline,
@@ -13661,7 +13552,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dkv_done_pipeline.producer_acquire(dkv_producer_state)
         for generation in cutlass.range_constexpr(6, 10):
             round_pipeline = round_pipelines[generation]
-            round_consumer_state = round_consumer_states[generation]
+            round_consumer_state = pipeline.PipelineState(
+                self.ROUND_STAGES,
+                issue_seq,
+                Int32(0),
+                issue_seq & Int32(1),
+            )
             round_pipeline.consumer_wait(round_consumer_state)
             dkv_issue_token = _iket.range_start(
                 "dVdK_ISSUE(i,r,p)",
@@ -13704,7 +13600,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 packed_issue + Int32(generation - 6),
             )
             round_pipeline.consumer_release(round_consumer_state)
-            round_consumer_state.advance()
             if cutlass.const_expr(generation == 7):
                 # The final dV pass is issued, so P and its landing block can
                 # recycle while the two final dK passes still consume dS.
@@ -13717,7 +13612,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         ds_consumer_state.advance()
 
         return (
-            round_consumer_states,
             dkv_producer_state,
             p_consumer_state,
             ds_consumer_state,
