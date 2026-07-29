@@ -11524,6 +11524,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         relay_mbars = storage.relay_mbars.data_ptr()
         round_tma_mbars = storage.round_tma_mbars.data_ptr()
         khot_mbar = storage.khot_mbar.data_ptr()
+        # Raw pointers used inside role branches must be extracted here:
+        # the struct instance itself cannot cross a dynamic-if region.
+        stationary_q_raw = storage.stationary_q.data_ptr()
+        stationary_do_raw = storage.stationary_do.data_ptr()
+        round_buf_a_raw = storage.round_buf_a.data_ptr()
+        round_buf_b_raw = storage.round_buf_b.data_ptr()
 
         # ------------------------------------------------------------------
         # SMEM tensor views.
@@ -12927,9 +12933,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 ):
                                     with cute.arch.elect_one():
                                         _cpasync_bulk_s2cluster(
-                                            storage.stationary_do.data_ptr()
+                                            stationary_do_raw
                                             + 4096 * (4 * grad_round),
-                                            storage.round_buf_a.data_ptr(),
+                                            round_buf_a_raw,
                                             round_tma_mbars,
                                             grad_a_stage_bytes,
                                             rank,
@@ -12952,9 +12958,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 ):
                                     with cute.arch.elect_one():
                                         _cpasync_bulk_s2cluster(
-                                            storage.stationary_do.data_ptr()
+                                            stationary_do_raw
                                             + 4096 * (4 * grad_round + 2),
-                                            storage.round_buf_b.data_ptr(),
+                                            round_buf_b_raw,
                                             round_tma_mbars + 1,
                                             grad_a_stage_bytes,
                                             rank,
@@ -12978,9 +12984,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 ):
                                     with cute.arch.elect_one():
                                         _cpasync_bulk_s2cluster(
-                                            storage.stationary_q.data_ptr()
+                                            stationary_q_raw
                                             + 4096 * (4 * grad_round),
-                                            storage.round_buf_a.data_ptr(),
+                                            round_buf_a_raw,
                                             round_tma_mbars,
                                             grad_a_stage_bytes,
                                             rank,
@@ -13003,9 +13009,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 ):
                                     with cute.arch.elect_one():
                                         _cpasync_bulk_s2cluster(
-                                            storage.stationary_q.data_ptr()
+                                            stationary_q_raw
                                             + 4096 * (4 * grad_round + 2),
-                                            storage.round_buf_b.data_ptr(),
+                                            round_buf_b_raw,
                                             round_tma_mbars + 1,
                                             grad_a_stage_bytes,
                                             rank,
