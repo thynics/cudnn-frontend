@@ -12851,58 +12851,51 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "ROUTE_K(i)",
                         loop_iter,
                     )
-                    # Keep the two independent K_dQ generations in flight.
-                    # Publishing A after wait_group(1) lets the leader start
-                    # dQ(r0) while B drains, without changing FIFO order.
-                    round_prod_a = round_prod.clone()
-                    pipe_round.producer_acquire(round_prod_a)
-                    self._fill_kdq_v2(
-                        mKV,
-                        mTopkIdxs,
-                        self._kd_round_rows_v2(round_kd[0]),
-                        token_idx,
-                        batch_idx,
-                        tile_index,
-                        topk,
-                        0,
-                        rank,
-                        lane_idx,
-                        kv_copy_atom,
-                        kv_thread_copy,
-                    )
-                    cute.arch.cp_async_commit_group()
-                    round_prod.advance()
-
-                    round_prod_b = round_prod.clone()
-                    pipe_round.producer_acquire(round_prod_b)
-                    self._fill_kdq_v2(
-                        mKV,
-                        mTopkIdxs,
-                        self._kd_round_rows_v2(round_kd[1]),
-                        token_idx,
-                        batch_idx,
-                        tile_index,
-                        topk,
-                        1,
-                        rank,
-                        lane_idx,
-                        kv_copy_atom,
-                        kv_thread_copy,
-                    )
-                    cute.arch.cp_async_commit_group()
-                    round_prod.advance()
-
-                    cute.arch.cp_async_wait_group(1)
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        pipe_round.producer_commit(round_prod_a)
-
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        pipe_round.producer_commit(round_prod_b)
+                    for round_index in cutlass.range_constexpr(
+                        self.D_ROUNDS
+                    ):
+                        pipe_round.producer_acquire(round_prod)
+                        if cutlass.const_expr(round_index == 0):
+                            self._fill_kdq_v2(
+                                mKV,
+                                mTopkIdxs,
+                                self._kd_round_rows_v2(
+                                    round_kd[0]
+                                ),
+                                token_idx,
+                                batch_idx,
+                                tile_index,
+                                topk,
+                                0,
+                                rank,
+                                lane_idx,
+                                kv_copy_atom,
+                                kv_thread_copy,
+                            )
+                        else:
+                            self._fill_kdq_v2(
+                                mKV,
+                                mTopkIdxs,
+                                self._kd_round_rows_v2(
+                                    round_kd[1]
+                                ),
+                                token_idx,
+                                batch_idx,
+                                tile_index,
+                                topk,
+                                1,
+                                rank,
+                                lane_idx,
+                                kv_copy_atom,
+                                kv_thread_copy,
+                            )
+                        cute.arch.cp_async_commit_group()
+                        cute.arch.cp_async_wait_group(0)
+                        cute.arch.fence_view_async_shared()
+                        cute.arch.sync_warp()
+                        with cute.arch.elect_one():
+                            pipe_round.producer_commit(round_prod)
+                        round_prod.advance()
                     _iket.range_end(
                         route_k_token,
                         loop_iter,
