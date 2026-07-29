@@ -13136,23 +13136,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         mma = tiled_mma.with_()
         mma.set(tcgen05.Field.ACCUMULATE, False)
         k_blocks_per_chunk = cute.size(a_fragment, mode=[2])
-        a_flat = cute.group_modes(a_fragment, 2, 4)
-        b_flat = cute.group_modes(b_fragment, 2, 4)
-        # Baseline-shaped runtime issue loop (unroll=4): the fully unrolled
-        # 32-atom body bloated the leader warp past its register budget and
-        # tripled the per-atom issue cost.
-        for flat_k_block in cutlass.range(
-            self.K_CHUNKS * k_blocks_per_chunk,
-            unroll=4,
-        ):
-            cute.gemm(
-                mma,
-                accumulator,
-                a_flat[None, None, flat_k_block],
-                b_flat[None, None, flat_k_block],
-                accumulator,
-            )
-            mma.set(tcgen05.Field.ACCUMULATE, True)
+        # Baseline-shaped runtime issue loops (unroll=4, flat k-mode runtime
+        # index only): the fully unrolled 32-atom body bloated the leader
+        # warp past its register budget and tripled the per-atom issue cost.
+        for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+            for k_block in cutlass.range(
+                0,
+                k_blocks_per_chunk,
+                unroll=4,
+            ):
+                cute.gemm(
+                    mma,
+                    accumulator,
+                    a_fragment[None, None, k_block, chunk],
+                    b_fragment[None, None, k_block, chunk],
+                    accumulator,
+                )
+                mma.set(tcgen05.Field.ACCUMULATE, True)
         _iket.range_end(
             mma_issue_token,
             issue_seq,
