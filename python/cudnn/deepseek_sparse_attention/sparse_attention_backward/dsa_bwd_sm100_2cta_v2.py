@@ -11009,6 +11009,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             barrier_id=3,
             num_threads=self.MATH_THREADS,
         )
+        self.dq_epilogue_r2s_barrier = pipeline.NamedBarrier(
+            barrier_id=4,
+            num_threads=self.MATH_THREADS,
+        )
         self.cta_barrier = pipeline.NamedBarrier(
             barrier_id=2,
             num_threads=self.THREADS_PER_CTA,
@@ -11059,6 +11063,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             round_tma_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            dq_epilogue_source_done_mbar: cutlass.Int64
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -11350,40 +11355,169 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         return round_consumer_state
 
     @cute.jit
-    def _zero_dq_v2(
+    def _tma_store_dq_staging_v2(
         self,
-        rank_coordinates: cute.Tensor,
-        mdQ: cute.Tensor,
+        s_dq_epi: cute.Tensor,
+        tma_atom_dq_epi: cute.CopyAtom,
+        tma_tensor_dq_epi: cute.Tensor,
+        dq_source_done_mbar,
         round_index: cutlass.Constexpr[int],
+        rank: Int32,
         token_idx: Int32,
         batch_idx: Int32,
-        tidx: Int32,
+        local_tidx: Int32,
     ) -> None:
-        """Write the required all-zero dQ result when no tile is issued."""
+        """TMA-store one complete rank-owned H128 x D128 dQ slab."""
 
-        if tidx < Int32(self.MATH_THREADS_PER_CTA):
-            linear_index = tidx
-            while linear_index < cute.size(rank_coordinates):
-                coordinate = cute.idx2crd(
-                    linear_index,
-                    rank_coordinates.shape,
+        cute.arch.fence_view_async_shared()
+        self.dq_epilogue_r2s_barrier.arrive_and_wait()
+
+        g_dq_tiles = cute.local_tile(
+            tma_tensor_dq_epi,
+            (
+                self.H_TILE_CLUSTER,
+                self.D_TILE_CTA,
+            ),
+            (None, None, (token_idx, batch_idx)),
+        )
+        global_d_tile = Int32(round_index * 2) + rank
+        g_dq_tile = g_dq_tiles[
+            None,
+            None,
+            0,
+            global_d_tile,
+        ]
+        t_smem, t_gmem = cpasync.tma_partition(
+            tma_atom_dq_epi,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(s_dq_epi, 0, 2),
+            cute.group_modes(g_dq_tile, 0, 2),
+        )
+
+        if local_tidx < Int32(32):
+            cute.arch.fence_view_async_shared()
+            cute.copy(tma_atom_dq_epi, t_smem, t_gmem)
+            cute.arch.cp_async_bulk_commit_group()
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(
+                    dq_source_done_mbar
                 )
-                logical_coordinate = rank_coordinates[coordinate]
-                d_in_round = Int32(
-                    cute.get(logical_coordinate, mode=[0])
+
+        # The same 32 KiB score-stage alias is reused by the next round.
+        # Wait for the async proxy to finish reading it before overwriting.
+        cute.arch.mbarrier_wait(
+            dq_source_done_mbar,
+            Int32(round_index % 2),
+        )
+
+    @cute.jit
+    def _store_dq_round_tma_v2(
+        self,
+        t_dq: cute.Tensor,
+        dq_tmem_load: cute.CopyAtom,
+        rank_coordinates: cute.Tensor,
+        s_dq_epi: cute.Tensor,
+        tma_atom_dq_epi: cute.CopyAtom,
+        tma_tensor_dq_epi: cute.Tensor,
+        dq_source_done_mbar,
+        round_index: cutlass.Constexpr[int],
+        rank: Int32,
+        token_idx: Int32,
+        batch_idx: Int32,
+        local_tidx: Int32,
+    ) -> None:
+        """Stage one final dQ round from TMEM, then TMA-store it."""
+
+        tiled_t2r = tcgen05.make_tmem_copy(
+            dq_tmem_load,
+            t_dq,
+        )
+        thread_t2r = tiled_t2r.get_slice(local_tidx)
+        thread_source = thread_t2r.partition_S(t_dq)
+        thread_coordinates = thread_t2r.partition_D(
+            rank_coordinates
+        )
+        thread_values = cute.make_rmem_tensor(
+            thread_coordinates.shape,
+            self.acc_dtype,
+        )
+        cute.copy(tiled_t2r, thread_source, thread_values)
+        cute.arch.fence_view_async_tmem_load()
+
+        for value_index in cutlass.range_constexpr(
+            cute.size(thread_values)
+        ):
+            d_in_cluster = Int32(
+                cute.get(
+                    thread_coordinates[value_index],
+                    mode=[0],
                 )
-                head = Int32(
-                    cute.get(logical_coordinate, mode=[1])
+            )
+            head = Int32(
+                cute.get(
+                    thread_coordinates[value_index],
+                    mode=[1],
                 )
-                mdQ[
-                    Int32(round_index * self.D_TILE_CLUSTER)
-                    + d_in_round,
-                    head,
-                    (token_idx, batch_idx),
-                ] = self.element_dtype(0.0)
-                linear_index += Int32(
-                    self.MATH_THREADS_PER_CTA
-                )
+            )
+            local_d = (
+                d_in_cluster
+                - rank * Int32(self.D_TILE_CTA)
+            )
+            s_dq_epi[
+                head,
+                local_d,
+            ] = self.element_dtype(thread_values[value_index])
+
+        self._tma_store_dq_staging_v2(
+            s_dq_epi,
+            tma_atom_dq_epi,
+            tma_tensor_dq_epi,
+            dq_source_done_mbar,
+            round_index,
+            rank,
+            token_idx,
+            batch_idx,
+            local_tidx,
+        )
+
+    @cute.jit
+    def _zero_dq_round_tma_v2(
+        self,
+        s_dq_epi: cute.Tensor,
+        tma_atom_dq_epi: cute.CopyAtom,
+        tma_tensor_dq_epi: cute.Tensor,
+        dq_source_done_mbar,
+        round_index: cutlass.Constexpr[int],
+        rank: Int32,
+        token_idx: Int32,
+        batch_idx: Int32,
+        local_tidx: Int32,
+    ) -> None:
+        """Stage and TMA-store one all-zero dQ slab for T=0."""
+
+        linear_index = local_tidx
+        while (
+            linear_index
+            < self.H_TILE_CLUSTER * self.D_TILE_CTA
+        ):
+            head = linear_index // Int32(self.D_TILE_CTA)
+            local_d = linear_index % Int32(self.D_TILE_CTA)
+            s_dq_epi[head, local_d] = self.element_dtype(0.0)
+            linear_index += Int32(self.MATH_THREADS)
+
+        self._tma_store_dq_staging_v2(
+            s_dq_epi,
+            tma_atom_dq_epi,
+            tma_tensor_dq_epi,
+            dq_source_done_mbar,
+            round_index,
+            rank,
+            token_idx,
+            batch_idx,
+            local_tidx,
+        )
 
     @cute.kernel
     def kernel(
@@ -11442,9 +11576,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         _ = problem_shape
         _ = mQ
         _ = mdO
-        _ = tma_atom_dq_epi
-        _ = tma_tensor_dq_epi
-        _ = dq_epi_layout_staged
         _ = trace_buffer
         _ = trace_token_idx
         _ = trace_batch_idx
@@ -11467,6 +11598,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cpasync.prefetch_descriptor(tma_atom_do)
             cpasync.prefetch_descriptor(tma_atom_qt)
             cpasync.prefetch_descriptor(tma_atom_dot)
+            cpasync.prefetch_descriptor(tma_atom_dq_epi)
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -11477,6 +11609,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         landing_mbars = storage.landing_mbars.data_ptr()
         relay_mbars = storage.relay_mbars.data_ptr()
         round_tma_mbar = storage.round_tma_mbar.data_ptr()
+        dq_epilogue_source_done_mbar = (
+            storage.dq_epilogue_source_done_mbar.ptr
+        )
 
         # ------------------------------------------------------------------
         # SMEM tensor views.
@@ -11501,6 +11636,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             score_b_layout_staged.outer,
             swizzle=score_b_layout_staged.inner,
         )
+        dq_epi_bytes = cute.size_in_bytes(
+            self.element_dtype,
+            dq_epi_layout_staged,
+        )
+        assert dq_epi_bytes <= 32 * 1024
+        # The score-K stage is dead after the final dP release. Reinterpret
+        # the same 32 KiB allocation as the design-specified dQ TMA staging.
+        s_dq_epi = storage.score_kv.get_tensor(
+            dq_epi_layout_staged.outer,
+            swizzle=dq_epi_layout_staged.inner,
+        )[None, None, 0]
         round_kd = (
             storage.round_buf_a.get_tensor(
                 dq_a_layout_staged.outer,
@@ -11923,6 +12069,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(relay_mbars, 2)
             cute.arch.mbarrier_init(relay_mbars + 1, 2)
             cute.arch.mbarrier_init(round_tma_mbar, 1)
+            cute.arch.mbarrier_init(
+                dq_epilogue_source_done_mbar,
+                1,
+            )
         cute.arch.fence_view_async_shared()
         self.cta_barrier.arrive_and_wait()
 
@@ -12481,12 +12631,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     "DQ_EPI(r)",
                     Int32(0),
                 )
-                self._store_dq_from_tmem(
+                self._store_dq_round_tma_v2(
                     t_dq[0],
                     dq_tmem_load,
                     rank_dq_coordinates,
-                    mdQ,
+                    s_dq_epi,
+                    tma_atom_dq_epi,
+                    tma_tensor_dq_epi,
+                    dq_epilogue_source_done_mbar,
                     0,
+                    rank,
                     token_idx,
                     batch_idx,
                     mtx,
@@ -12499,12 +12653,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     "DQ_EPI(r)",
                     Int32(1),
                 )
-                self._store_dq_from_tmem(
+                self._store_dq_round_tma_v2(
                     t_dq[1],
                     dq_tmem_load,
                     rank_dq_coordinates,
-                    mdQ,
+                    s_dq_epi,
+                    tma_atom_dq_epi,
+                    tma_tensor_dq_epi,
+                    dq_epilogue_source_done_mbar,
                     1,
+                    rank,
                     token_idx,
                     batch_idx,
                     mtx,
@@ -12516,18 +12674,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipe_dq_done.consumer_release(dq_done_state)
                 dq_done_state.advance()
             else:
-                self._zero_dq_v2(
-                    rank_dq_coordinates,
-                    mdQ,
+                self._zero_dq_round_tma_v2(
+                    s_dq_epi,
+                    tma_atom_dq_epi,
+                    tma_tensor_dq_epi,
+                    dq_epilogue_source_done_mbar,
                     0,
+                    rank,
                     token_idx,
                     batch_idx,
                     mtx,
                 )
-                self._zero_dq_v2(
-                    rank_dq_coordinates,
-                    mdQ,
+                self._zero_dq_round_tma_v2(
+                    s_dq_epi,
+                    tma_atom_dq_epi,
+                    tma_tensor_dq_epi,
+                    dq_epilogue_source_done_mbar,
                     1,
+                    rank,
                     token_idx,
                     batch_idx,
                     mtx,
