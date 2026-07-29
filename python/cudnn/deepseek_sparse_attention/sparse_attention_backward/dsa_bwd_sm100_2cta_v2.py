@@ -11053,13 +11053,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            # Raw barriers outside typed pipelines. The round TMA A/B
-            # barriers each advance once per paired quadrant refill.
+            # Raw single-phase-per-tile barriers.
             stationary_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             stationary_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            round_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            round_tma_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -11477,7 +11476,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         stationary_ready_mbar = storage.stationary_ready_mbar.data_ptr()
         landing_mbars = storage.landing_mbars.data_ptr()
         relay_mbars = storage.relay_mbars.data_ptr()
-        round_tma_mbars = storage.round_tma_mbars.data_ptr()
+        round_tma_mbar = storage.round_tma_mbar.data_ptr()
 
         # ------------------------------------------------------------------
         # SMEM tensor views.
@@ -11923,8 +11922,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(landing_mbars + 1, 1)
             cute.arch.mbarrier_init(relay_mbars, 2)
             cute.arch.mbarrier_init(relay_mbars + 1, 2)
-            cute.arch.mbarrier_init(round_tma_mbars, 1)
-            cute.arch.mbarrier_init(round_tma_mbars + 1, 1)
+            cute.arch.mbarrier_init(round_tma_mbar, 1)
         cute.arch.fence_view_async_shared()
         self.cta_barrier.arrive_and_wait()
 
@@ -12799,8 +12797,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Producer,
                 self.ROUND_STAGES,
             )
-            tma_phase_a = Int32(0)
-            tma_phase_b = Int32(0)
+            tma_phase = Int32(0)
             if tile_count > Int32(0):
                 load_qdo_token = _iket.range_start(
                     "LOAD_QDO",
@@ -12920,87 +12917,79 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             )
                         )
                         for tensor_kind in cutlass.range_constexpr(2):
-                            # The two physical round stages are independent.
-                            # Acquire both empty generations, issue the h0/h1
-                            # TMA pair to separate raw barriers, then publish
-                            # the full generations in consumer order.
-                            round_prod_a = round_prod.clone()
-                            pipe_round.producer_acquire(round_prod_a)
-                            round_prod.advance()
-                            round_prod_b = round_prod.clone()
-                            pipe_round.producer_acquire(round_prod_b)
-                            round_prod.advance()
-
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive_and_expect_tx(
-                                    round_tma_mbars,
-                                    grad_a_stage_bytes,
+                            for h_half in cutlass.range_constexpr(
+                                self.H_PASSES
+                            ):
+                                pipe_round.producer_acquire(
+                                    round_prod
                                 )
-                                cute.arch.mbarrier_arrive_and_expect_tx(
-                                    round_tma_mbars + 1,
-                                    grad_a_stage_bytes,
+                                with cute.arch.elect_one():
+                                    cute.arch.mbarrier_arrive_and_expect_tx(
+                                        round_tma_mbar,
+                                        grad_a_stage_bytes,
+                                    )
+                                if cutlass.const_expr(
+                                    tensor_kind == 0
+                                ):
+                                    if cutlass.const_expr(
+                                        h_half == 0
+                                    ):
+                                        cute.copy(
+                                            tma_atom_dot,
+                                            t_dot_gmem[
+                                                None,
+                                                grad_round,
+                                                0,
+                                            ],
+                                            t_dot_smem_a[None, 0],
+                                            tma_bar_ptr=round_tma_mbar,
+                                        )
+                                    else:
+                                        cute.copy(
+                                            tma_atom_dot,
+                                            t_dot_gmem[
+                                                None,
+                                                grad_round,
+                                                1,
+                                            ],
+                                            t_dot_smem_b[None, 0],
+                                            tma_bar_ptr=round_tma_mbar,
+                                        )
+                                else:
+                                    if cutlass.const_expr(
+                                        h_half == 0
+                                    ):
+                                        cute.copy(
+                                            tma_atom_qt,
+                                            t_qt_gmem[
+                                                None,
+                                                grad_round,
+                                                0,
+                                            ],
+                                            t_qt_smem_a[None, 0],
+                                            tma_bar_ptr=round_tma_mbar,
+                                        )
+                                    else:
+                                        cute.copy(
+                                            tma_atom_qt,
+                                            t_qt_gmem[
+                                                None,
+                                                grad_round,
+                                                1,
+                                            ],
+                                            t_qt_smem_b[None, 0],
+                                            tma_bar_ptr=round_tma_mbar,
+                                        )
+                                cute.arch.mbarrier_wait(
+                                    round_tma_mbar,
+                                    tma_phase,
                                 )
-                            if cutlass.const_expr(tensor_kind == 0):
-                                cute.copy(
-                                    tma_atom_dot,
-                                    t_dot_gmem[
-                                        None,
-                                        grad_round,
-                                        0,
-                                    ],
-                                    t_dot_smem_a[None, 0],
-                                    tma_bar_ptr=round_tma_mbars,
-                                )
-                                cute.copy(
-                                    tma_atom_dot,
-                                    t_dot_gmem[
-                                        None,
-                                        grad_round,
-                                        1,
-                                    ],
-                                    t_dot_smem_b[None, 0],
-                                    tma_bar_ptr=round_tma_mbars + 1,
-                                )
-                            else:
-                                cute.copy(
-                                    tma_atom_qt,
-                                    t_qt_gmem[
-                                        None,
-                                        grad_round,
-                                        0,
-                                    ],
-                                    t_qt_smem_a[None, 0],
-                                    tma_bar_ptr=round_tma_mbars,
-                                )
-                                cute.copy(
-                                    tma_atom_qt,
-                                    t_qt_gmem[
-                                        None,
-                                        grad_round,
-                                        1,
-                                    ],
-                                    t_qt_smem_b[None, 0],
-                                    tma_bar_ptr=round_tma_mbars + 1,
-                                )
-
-                            cute.arch.mbarrier_wait(
-                                round_tma_mbars,
-                                tma_phase_a,
-                            )
-                            tma_phase_a = Int32(1) - tma_phase_a
-                            with cute.arch.elect_one():
-                                pipe_round.producer_commit(
-                                    round_prod_a
-                                )
-                            cute.arch.mbarrier_wait(
-                                round_tma_mbars + 1,
-                                tma_phase_b,
-                            )
-                            tma_phase_b = Int32(1) - tma_phase_b
-                            with cute.arch.elect_one():
-                                pipe_round.producer_commit(
-                                    round_prod_b
-                                )
+                                tma_phase = Int32(1) - tma_phase
+                                with cute.arch.elect_one():
+                                    pipe_round.producer_commit(
+                                        round_prod
+                                    )
+                                round_prod.advance()
                         _iket.range_end(
                             mat_qdo_token,
                             packed_mat_qdo,
