@@ -12444,12 +12444,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # to reduce.  Pool stays the launch allocation (640*96 =
             # 61,440), exact balance:
             #   dec supply: 8 warps * (96-48) * 32            = 12,288
-            #   inc demand: 4*(144-96)*32 + 8*(120-96)*32     = 12,288
-            #   totals: 256*48 + 128*144 + 256*120 = 61,440 = 640*96.
+            #   inc demand: 4*(136-96)*32 + 8*(124-96)*32     = 12,288
+            #   totals: 256*48 + 128*136 + 256*124 = 61,440 = 640*96.
+            # (v11 probe 2: 144/120 left 23 residual spills in the drain
+            # -- no .128 vectors, but six 64-bit address temporaries and
+            # scalar stragglers; math held 63/14 with room, so shift four
+            # more registers to the reducer.)
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
-                cute.arch.setmaxregister_increase(144)
+                cute.arch.setmaxregister_increase(136)
             else:
-                cute.arch.setmaxregister_increase(120)
+                cute.arch.setmaxregister_increase(124)
 
         # ==================================================================
         # Role bodies.
