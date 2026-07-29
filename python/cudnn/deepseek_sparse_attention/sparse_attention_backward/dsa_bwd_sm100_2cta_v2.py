@@ -11287,82 +11287,92 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
-    def _issue_dq_rounds_v2(
+    def _issue_dkv_generation_v2(
+        self,
+        dkv_tiled_mma: cute.TiledMma,
+        t_dkv: cute.Tensor,
+        a_fragment: cute.Tensor,
+        b_fragment: cute.Tensor,
+        accumulate: cutlass.Constexpr[bool],
+        round_pipeline,
+        round_consumer_state: pipeline.PipelineState,
+        issue_payload: Int32,
+    ) -> None:
+        """Wait, issue, and release one independent dV/dK generation."""
+
+        round_pipeline.consumer_wait(round_consumer_state)
+        dkv_issue_token = _iket.range_start(
+            "dVdK_ISSUE(i,r,p)",
+            issue_payload,
+        )
+        self._issue_dkv_pass_v2(
+            dkv_tiled_mma,
+            t_dkv,
+            a_fragment,
+            b_fragment,
+            accumulate,
+        )
+        _iket.range_end(
+            dkv_issue_token,
+            issue_payload,
+        )
+        round_pipeline.consumer_release(round_consumer_state)
+
+    @cute.jit
+    def _issue_dq_round_v2(
         self,
         dq_tiled_mma: cute.TiledMma,
-        t_dq_0: cute.Tensor,
-        t_dq_1: cute.Tensor,
-        kd_fragment_a: cute.Tensor,
-        kd_fragment_b: cute.Tensor,
+        t_dq: cute.Tensor,
+        kd_fragment: cute.Tensor,
         ds_fragment: cute.Tensor,
         accumulate: cutlass.Boolean,
-        round_pipelines,
+        round_pipeline,
+        round_consumer_state: pipeline.PipelineState,
         issue_seq: Int32,
+        round_index: cutlass.Constexpr[int],
     ) -> None:
-        """Issue both persistent dQ rounds back-to-back (v1_deep_p lesson).
+        """Issue one persistent dQ round on its one-stage generation.
 
         Round r consumes the round-region generation holding K_dQ(r); each
         generation is released immediately after its issue so the load warp
         can begin the dO quadrant refills.
         """
 
-        for round_index in cutlass.range_constexpr(self.D_ROUNDS):
-            packed_issue = (
-                issue_seq * Int32(self.D_ROUNDS)
-                + Int32(round_index)
+        packed_issue = (
+            issue_seq * Int32(self.D_ROUNDS) + Int32(round_index)
+        )
+        wait_dq_token = _iket.range_start(
+            "WAIT_dQ(i,r)",
+            packed_issue,
+        )
+        round_pipeline.consumer_wait(round_consumer_state)
+        _iket.range_end(
+            wait_dq_token,
+            packed_issue,
+        )
+        dq_issue_token = _iket.range_start(
+            "dQ_ISSUE(i,r)",
+            packed_issue,
+        )
+        mma = dq_tiled_mma.with_()
+        mma.set(tcgen05.Field.ACCUMULATE, accumulate)
+        for k_block in cutlass.range_constexpr(
+            cute.size(kd_fragment, mode=[2])
+        ):
+            cute.gemm(
+                mma,
+                t_dq,
+                kd_fragment[None, None, k_block, 0],
+                ds_fragment[None, None, k_block, 0],
+                t_dq,
             )
-            wait_dq_token = _iket.range_start(
-                "WAIT_dQ(i,r)",
-                packed_issue,
-            )
-            round_pipeline = round_pipelines[round_index]
-            round_consumer_state = pipeline.PipelineState(
-                self.ROUND_STAGES,
-                issue_seq,
-                Int32(0),
-                issue_seq & Int32(1),
-            )
-            round_pipeline.consumer_wait(round_consumer_state)
-            _iket.range_end(
-                wait_dq_token,
-                packed_issue,
-            )
-            dq_issue_token = _iket.range_start(
-                "dQ_ISSUE(i,r)",
-                packed_issue,
-            )
-            mma = dq_tiled_mma.with_()
-            mma.set(tcgen05.Field.ACCUMULATE, accumulate)
-            if cutlass.const_expr(round_index == 0):
-                for k_block in cutlass.range_constexpr(
-                    cute.size(kd_fragment_a, mode=[2])
-                ):
-                    cute.gemm(
-                        mma,
-                        t_dq_0,
-                        kd_fragment_a[None, None, k_block, 0],
-                        ds_fragment[None, None, k_block, 0],
-                        t_dq_0,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-            else:
-                for k_block in cutlass.range_constexpr(
-                    cute.size(kd_fragment_b, mode=[2])
-                ):
-                    cute.gemm(
-                        mma,
-                        t_dq_1,
-                        kd_fragment_b[None, None, k_block, 0],
-                        ds_fragment[None, None, k_block, 0],
-                        t_dq_1,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-            _iket.range_end(
-                dq_issue_token,
-                packed_issue,
-            )
-            cute.arch.fence_view_async_tmem_store()
-            round_pipeline.consumer_release(round_consumer_state)
+            mma.set(tcgen05.Field.ACCUMULATE, True)
+        _iket.range_end(
+            dq_issue_token,
+            packed_issue,
+        )
+        cute.arch.fence_view_async_tmem_store()
+        round_pipeline.consumer_release(round_consumer_state)
 
     @cute.jit
     def _tma_store_dq_staging_v2(
@@ -12031,90 +12041,88 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         round_mbars = storage.round_mbars.data_ptr()
         # P0/P1 are committed by every gather thread. P2..P9 are committed
-        # by W13's elected lane. Each logical generation has its own full /
-        # empty pair; physical A/B reuse is chained through the predecessor
-        # pipeline's UMMA-completed empty barrier at production time.
-        round_pipelines = (
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=gather_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=gather_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars + 2,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=load_elect_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars + 4,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=load_elect_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars + 6,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=load_elect_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars + 8,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=load_elect_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars + 10,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=load_elect_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars + 12,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=load_elect_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars + 14,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=load_elect_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars + 16,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
-            pipeline.PipelineAsyncUmma.create(
-                num_stages=self.ROUND_STAGES,
-                producer_group=load_elect_group,
-                consumer_group=leader_group,
-                barrier_storage=round_mbars + 18,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            ),
+        # by W13's elected lane. Keep all ten one-stage objects explicit:
+        # each logical generation owns exactly one full/empty pair, and no
+        # tuple of structured pipeline objects crosses a JIT helper boundary.
+        pipe_round_0 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=gather_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_round_1 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=gather_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars + 2,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_round_2 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=load_elect_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars + 4,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_round_3 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=load_elect_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars + 6,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_round_4 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=load_elect_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars + 8,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_round_5 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=load_elect_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars + 10,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_round_6 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=load_elect_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars + 12,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_round_7 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=load_elect_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars + 14,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_round_8 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=load_elect_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars + 16,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_round_9 = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.ROUND_STAGES,
+            producer_group=load_elect_group,
+            consumer_group=leader_group,
+            barrier_storage=round_mbars + 18,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
         pipe_p = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
@@ -12295,34 +12303,38 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     "ROUTE_K(i)",
                     loop_iter,
                 )
+                # Both gather generations use the same one-stage tile phase;
+                # acquire/commit read this state but never advance it.
+                producer_phase = (
+                    Int32(1) ^ (loop_iter & Int32(1))
+                )
+                publish_state = pipeline.PipelineState(
+                    self.ROUND_STAGES,
+                    loop_iter,
+                    Int32(0),
+                    producer_phase,
+                )
+                credit_state = pipeline.PipelineState(
+                    self.ROUND_STAGES,
+                    loop_iter,
+                    Int32(0),
+                    producer_phase,
+                )
                 for round_index in cutlass.range_constexpr(
                     self.D_ROUNDS
                 ):
-                    kdq_pipeline = round_pipelines[round_index]
-                    # Every round pipeline is one-stage. Reconstruct both
-                    # states from the tile ordinal instead of carrying
-                    # PipelineState SSA values out of this nested region.
-                    producer_phase = (
-                        Int32(1) ^ (loop_iter & Int32(1))
-                    )
-                    publish_state = pipeline.PipelineState(
-                        self.ROUND_STAGES,
-                        loop_iter,
-                        Int32(0),
-                        producer_phase,
-                    )
-                    credit_state = pipeline.PipelineState(
-                        self.ROUND_STAGES,
-                        loop_iter,
-                        Int32(0),
-                        producer_phase,
-                    )
+                    if cutlass.const_expr(round_index == 0):
+                        kdq_pipeline = pipe_round_0
+                        wrap_credit_pipeline = pipe_round_8
+                    else:
+                        kdq_pipeline = pipe_round_1
+                        wrap_credit_pipeline = pipe_round_9
                     # A/B wrap edge: P0 <- P8 and P1 <- P9. Use the public
                     # acquire API with an independent state; publish state
                     # must remain aligned exclusively with P0/P1 full/empty.
-                    round_pipelines[
-                        round_index + self.ROUND_GENS_PER_TILE - 2
-                    ].producer_acquire(credit_state)
+                    wrap_credit_pipeline.producer_acquire(
+                        credit_state
+                    )
                     self._fill_kdq_v2(
                         mKV,
                         mTopkIdxs,
@@ -12360,9 +12372,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 for round_index in cutlass.range_constexpr(
                     self.D_ROUNDS
                 ):
-                    round_pipelines[round_index].producer_tail(
-                        round_tail_state
-                    )
+                    if cutlass.const_expr(round_index == 0):
+                        pipe_round_0.producer_tail(round_tail_state)
+                    else:
+                        pipe_round_1.producer_tail(round_tail_state)
 
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
             # --- math: stats, per-tile softmax + publication, dQ epilogue.
@@ -12976,7 +12989,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 dq_acc,
                                 relay_phase,
                                 relay_mbars,
-                                round_pipelines,
+                                pipe_round_0,
+                                pipe_round_1,
+                                pipe_round_2,
+                                pipe_round_3,
+                                pipe_round_4,
+                                pipe_round_5,
                                 pipe_p,
                                 p_cons,
                                 pipe_ds,
@@ -13016,7 +13034,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 p_fragments[1],
                                 ds_fragments[0],
                                 ds_fragments[1],
-                                round_pipelines,
+                                pipe_round_6,
+                                pipe_round_7,
+                                pipe_round_8,
+                                pipe_round_9,
                                 pipe_p,
                                 p_cons,
                                 pipe_ds,
@@ -13058,7 +13079,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             dq_acc,
                             relay_phase,
                             relay_mbars,
-                            round_pipelines,
+                            pipe_round_0,
+                            pipe_round_1,
+                            pipe_round_2,
+                            pipe_round_3,
+                            pipe_round_4,
+                            pipe_round_5,
                             pipe_p,
                             p_cons,
                             pipe_ds,
@@ -13082,7 +13108,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             p_fragments[1],
                             ds_fragments[0],
                             ds_fragments[1],
-                            round_pipelines,
+                            pipe_round_6,
+                            pipe_round_7,
+                            pipe_round_8,
+                            pipe_round_9,
                             pipe_p,
                             p_cons,
                             pipe_ds,
@@ -13156,6 +13185,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_index = (
                         tile_count - Int32(1) - loop_iter
                     )
+                    # P2..P9 share this tile's publish and predecessor-credit
+                    # phases. Pipeline operations read but do not advance
+                    # either state.
+                    publish_state = pipeline.PipelineState(
+                        self.ROUND_STAGES,
+                        loop_iter,
+                        Int32(0),
+                        Int32(1) ^ (loop_iter & Int32(1)),
+                    )
+                    credit_state = pipeline.PipelineState(
+                        self.ROUND_STAGES,
+                        loop_iter,
+                        Int32(0),
+                        loop_iter & Int32(1),
+                    )
                     # P2..P9: quadrant TMA fills, buf alternation matches
                     # the fixed generation order.
                     for grad_round in cutlass.range_constexpr(
@@ -13181,33 +13225,50 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     + tensor_kind * 2
                                     + h_half
                                 )
-                                round_pipeline = round_pipelines[
-                                    generation
-                                ]
-                                # P2..P9 publish with the producer phase for
-                                # this tile, while their same-tile credits
-                                # wait for E0..E7's post-release phase.
-                                publish_state = pipeline.PipelineState(
-                                    self.ROUND_STAGES,
-                                    loop_iter,
-                                    Int32(0),
-                                    Int32(1)
-                                    ^ (loop_iter & Int32(1)),
-                                )
-                                credit_state = pipeline.PipelineState(
-                                    self.ROUND_STAGES,
-                                    loop_iter,
-                                    Int32(0),
-                                    loop_iter & Int32(1),
-                                )
+                                if cutlass.const_expr(generation == 2):
+                                    round_pipeline = pipe_round_2
+                                    credit_pipeline = pipe_round_0
+                                elif cutlass.const_expr(
+                                    generation == 3
+                                ):
+                                    round_pipeline = pipe_round_3
+                                    credit_pipeline = pipe_round_1
+                                elif cutlass.const_expr(
+                                    generation == 4
+                                ):
+                                    round_pipeline = pipe_round_4
+                                    credit_pipeline = pipe_round_2
+                                elif cutlass.const_expr(
+                                    generation == 5
+                                ):
+                                    round_pipeline = pipe_round_5
+                                    credit_pipeline = pipe_round_3
+                                elif cutlass.const_expr(
+                                    generation == 6
+                                ):
+                                    round_pipeline = pipe_round_6
+                                    credit_pipeline = pipe_round_4
+                                elif cutlass.const_expr(
+                                    generation == 7
+                                ):
+                                    round_pipeline = pipe_round_7
+                                    credit_pipeline = pipe_round_5
+                                elif cutlass.const_expr(
+                                    generation == 8
+                                ):
+                                    round_pipeline = pipe_round_8
+                                    credit_pipeline = pipe_round_6
+                                else:
+                                    round_pipeline = pipe_round_9
+                                    credit_pipeline = pipe_round_7
                                 # P_g may reuse A/B only after P_(g-2)'s
                                 # UMMA-backed empty barrier completes for
                                 # this tile. Public producer_acquire consumes
                                 # that predecessor credit without coupling it
                                 # to P_g's independent publish state.
-                                round_pipelines[
-                                    generation - 2
-                                ].producer_acquire(credit_state)
+                                credit_pipeline.producer_acquire(
+                                    credit_state
+                                )
                                 with cute.arch.elect_one():
                                     cute.arch.mbarrier_arrive_and_expect_tx(
                                         round_tma_mbar,
@@ -13284,13 +13345,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     Int32(0),
                     Int32(1) ^ (tile_count & Int32(1)),
                 )
-                for generation in cutlass.range_constexpr(
-                    2,
-                    self.ROUND_GENS_PER_TILE,
-                ):
-                    round_pipelines[generation].producer_tail(
-                        round_tail_state
-                    )
+                pipe_round_2.producer_tail(round_tail_state)
+                pipe_round_3.producer_tail(round_tail_state)
+                pipe_round_4.producer_tail(round_tail_state)
+                pipe_round_5.producer_tail(round_tail_state)
+                pipe_round_6.producer_tail(round_tail_state)
+                pipe_round_7.producer_tail(round_tail_state)
+                pipe_round_8.producer_tail(round_tail_state)
+                pipe_round_9.producer_tail(round_tail_state)
 
         elif warp_idx == Int32(self.RELAY_WARP):
             # --- relay: convert DSM landings into leader-visible arrives.
@@ -13422,7 +13484,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dq_accumulate: cutlass.Boolean,
         relay_phase: Int32,
         relay_mbars: cute.Pointer,
-        round_pipelines,
+        pipe_round_0,
+        pipe_round_1,
+        pipe_round_2,
+        pipe_round_3,
+        pipe_round_4,
+        pipe_round_5,
         p_pipeline,
         p_consumer_state: pipeline.PipelineState,
         ds_pipeline,
@@ -13441,16 +13508,33 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         # dQ both rounds back-to-back; releases free the round buffers for
         # the quadrant refills.
-        self._issue_dq_rounds_v2(
+        round_consumer_state = pipeline.PipelineState(
+            self.ROUND_STAGES,
+            issue_seq,
+            Int32(0),
+            issue_seq & Int32(1),
+        )
+        self._issue_dq_round_v2(
             dq_tiled_mma,
             t_dq_0,
-            t_dq_1,
             dq_kd_fragment_a,
+            dq_ds_fragment,
+            dq_accumulate,
+            pipe_round_0,
+            round_consumer_state,
+            issue_seq,
+            0,
+        )
+        self._issue_dq_round_v2(
+            dq_tiled_mma,
+            t_dq_1,
             dq_kd_fragment_b,
             dq_ds_fragment,
             dq_accumulate,
-            round_pipelines,
+            pipe_round_1,
+            round_consumer_state,
             issue_seq,
+            1,
         )
 
         # Both CTAs' landing blocks confirmed (relay converts the DSM
@@ -13464,56 +13548,46 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # Round 0: dV(h0), dV(h1) overwrite+accumulate, then dK(h0), dK(h1).
         packed_issue = issue_seq * Int32(self.D_ROUNDS * 4)
         dkv_done_pipeline.producer_acquire(dkv_producer_state)
-        for generation in cutlass.range_constexpr(2, 6):
-            round_pipeline = round_pipelines[generation]
-            round_consumer_state = pipeline.PipelineState(
-                self.ROUND_STAGES,
-                issue_seq,
-                Int32(0),
-                issue_seq & Int32(1),
-            )
-            round_pipeline.consumer_wait(round_consumer_state)
-            dkv_issue_token = _iket.range_start(
-                "dVdK_ISSUE(i,r,p)",
-                packed_issue + Int32(generation - 2),
-            )
-            if cutlass.const_expr(generation == 2):
-                self._issue_dkv_pass_v2(
-                    dkv_tiled_mma,
-                    t_dkv_0,
-                    quad_fragment_a,
-                    p_fragment_0,
-                    False,
-                )
-            elif cutlass.const_expr(generation == 3):
-                self._issue_dkv_pass_v2(
-                    dkv_tiled_mma,
-                    t_dkv_0,
-                    quad_fragment_b,
-                    p_fragment_1,
-                    True,
-                )
-            elif cutlass.const_expr(generation == 4):
-                self._issue_dkv_pass_v2(
-                    dkv_tiled_mma,
-                    t_dkv_0,
-                    quad_fragment_a,
-                    ds_fragment_0,
-                    True,
-                )
-            else:
-                self._issue_dkv_pass_v2(
-                    dkv_tiled_mma,
-                    t_dkv_0,
-                    quad_fragment_b,
-                    ds_fragment_1,
-                    True,
-                )
-            _iket.range_end(
-                dkv_issue_token,
-                packed_issue + Int32(generation - 2),
-            )
-            round_pipeline.consumer_release(round_consumer_state)
+        self._issue_dkv_generation_v2(
+            dkv_tiled_mma,
+            t_dkv_0,
+            quad_fragment_a,
+            p_fragment_0,
+            False,
+            pipe_round_2,
+            round_consumer_state,
+            packed_issue,
+        )
+        self._issue_dkv_generation_v2(
+            dkv_tiled_mma,
+            t_dkv_0,
+            quad_fragment_b,
+            p_fragment_1,
+            True,
+            pipe_round_3,
+            round_consumer_state,
+            packed_issue + Int32(1),
+        )
+        self._issue_dkv_generation_v2(
+            dkv_tiled_mma,
+            t_dkv_0,
+            quad_fragment_a,
+            ds_fragment_0,
+            True,
+            pipe_round_4,
+            round_consumer_state,
+            packed_issue + Int32(2),
+        )
+        self._issue_dkv_generation_v2(
+            dkv_tiled_mma,
+            t_dkv_0,
+            quad_fragment_b,
+            ds_fragment_1,
+            True,
+            pipe_round_5,
+            round_consumer_state,
+            packed_issue + Int32(3),
+        )
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_producer_state)
         dkv_producer_state.advance()
@@ -13535,7 +13609,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         p_fragment_1: cute.Tensor,
         ds_fragment_0: cute.Tensor,
         ds_fragment_1: cute.Tensor,
-        round_pipelines,
+        pipe_round_6,
+        pipe_round_7,
+        pipe_round_8,
+        pipe_round_9,
         p_pipeline,
         p_consumer_state: pipeline.PipelineState,
         ds_pipeline,
@@ -13550,61 +13627,56 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             issue_seq * Int32(self.D_ROUNDS * 4) + Int32(4)
         )
         dkv_done_pipeline.producer_acquire(dkv_producer_state)
-        for generation in cutlass.range_constexpr(6, 10):
-            round_pipeline = round_pipelines[generation]
-            round_consumer_state = pipeline.PipelineState(
-                self.ROUND_STAGES,
-                issue_seq,
-                Int32(0),
-                issue_seq & Int32(1),
-            )
-            round_pipeline.consumer_wait(round_consumer_state)
-            dkv_issue_token = _iket.range_start(
-                "dVdK_ISSUE(i,r,p)",
-                packed_issue + Int32(generation - 6),
-            )
-            if cutlass.const_expr(generation == 6):
-                self._issue_dkv_pass_v2(
-                    dkv_tiled_mma,
-                    t_dkv_1,
-                    quad_fragment_a,
-                    p_fragment_0,
-                    False,
-                )
-            elif cutlass.const_expr(generation == 7):
-                self._issue_dkv_pass_v2(
-                    dkv_tiled_mma,
-                    t_dkv_1,
-                    quad_fragment_b,
-                    p_fragment_1,
-                    True,
-                )
-            elif cutlass.const_expr(generation == 8):
-                self._issue_dkv_pass_v2(
-                    dkv_tiled_mma,
-                    t_dkv_1,
-                    quad_fragment_a,
-                    ds_fragment_0,
-                    True,
-                )
-            else:
-                self._issue_dkv_pass_v2(
-                    dkv_tiled_mma,
-                    t_dkv_1,
-                    quad_fragment_b,
-                    ds_fragment_1,
-                    True,
-                )
-            _iket.range_end(
-                dkv_issue_token,
-                packed_issue + Int32(generation - 6),
-            )
-            round_pipeline.consumer_release(round_consumer_state)
-            if cutlass.const_expr(generation == 7):
-                # The final dV pass is issued, so P and its landing block can
-                # recycle while the two final dK passes still consume dS.
-                p_pipeline.consumer_release(p_consumer_state)
-                p_consumer_state.advance()
+        round_consumer_state = pipeline.PipelineState(
+            self.ROUND_STAGES,
+            issue_seq,
+            Int32(0),
+            issue_seq & Int32(1),
+        )
+        self._issue_dkv_generation_v2(
+            dkv_tiled_mma,
+            t_dkv_1,
+            quad_fragment_a,
+            p_fragment_0,
+            False,
+            pipe_round_6,
+            round_consumer_state,
+            packed_issue,
+        )
+        self._issue_dkv_generation_v2(
+            dkv_tiled_mma,
+            t_dkv_1,
+            quad_fragment_b,
+            p_fragment_1,
+            True,
+            pipe_round_7,
+            round_consumer_state,
+            packed_issue + Int32(1),
+        )
+        # The final dV pass is issued, so P and its landing block can recycle
+        # while the two final dK passes still consume dS.
+        p_pipeline.consumer_release(p_consumer_state)
+        p_consumer_state.advance()
+        self._issue_dkv_generation_v2(
+            dkv_tiled_mma,
+            t_dkv_1,
+            quad_fragment_a,
+            ds_fragment_0,
+            True,
+            pipe_round_8,
+            round_consumer_state,
+            packed_issue + Int32(2),
+        )
+        self._issue_dkv_generation_v2(
+            dkv_tiled_mma,
+            t_dkv_1,
+            quad_fragment_b,
+            ds_fragment_1,
+            True,
+            pipe_round_9,
+            round_consumer_state,
+            packed_issue + Int32(3),
+        )
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_producer_state)
         dkv_producer_state.advance()
