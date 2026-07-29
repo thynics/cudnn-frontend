@@ -11242,7 +11242,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # descriptors and context-ring slots, so the total traversal length does
     # not consume additional shared storage. Publish the supported bound for
     # experiment routers instead of inheriting their legacy 2048-element cap.
-    MAX_TOPK = 4096
+    MAX_TOPK = 8192
 
     THREADS_PER_CTA = 640
 
