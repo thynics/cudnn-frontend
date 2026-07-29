@@ -13636,13 +13636,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
         wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
+        # Baseline slices the fragment-C TMEM tensor down to its atom core
+        # before building the tmem copy (dsa_bwd_sm100.py L1903-1907); the
+        # full-rank tensor makes the tiler rank exceed the 2-D identity.
+        t_dkv_core = t_dkv_slot[(None, None), 0, 0]
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
             self.acc_dtype,
         )
         tiled_t2r = tcgen05.make_tmem_copy(
             tmem_load_atom,
-            t_dkv_slot,
+            t_dkv_core,
         )
         thread_t2r = tiled_t2r.get_slice(dp_idx)
         c_dkv = cute.make_identity_tensor(
@@ -13654,7 +13658,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             wg_idx,
         )
         thread_source = self.split_wg(
-            thread_t2r.partition_S(t_dkv_slot),
+            thread_t2r.partition_S(t_dkv_core),
             2,
             wg_idx,
         )
