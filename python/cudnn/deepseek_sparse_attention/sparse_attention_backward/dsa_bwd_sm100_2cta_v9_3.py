@@ -10998,7 +10998,7 @@ def _store_shared_bf16_at_v2(
 class FlashAttentionDSABackwardSm100TwoCTAV2(
     FlashAttentionDSABackwardSm100TwoCTA
 ):
-    """v9.3+v9.4: stmatrix publish fix + v7-shape drain on the v8 base.
+    """v9.3: stmatrix publish fix on the v8 base (v9.4 drain fold reverted).
 
     v9's two terminal levers (credit-gated peer push; CONFIG B bulk-
     reduce drain) were both condemned by hardware economics (24.63 /
@@ -14272,22 +14272,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             packed_issue + Int32(1),
         )
 
+        # v9.4 REVERTED: the intended per-row address sharing was already
+        # performed by the compiler across the fully-unrolled v8 loops
+        # (straight-line CSE); the hand-fused interleave changed liveness
+        # and REGRESSED the static address-op count 80 -> 96 at the SASS
+        # precheck.  The v8 split-by-slot shape below is the
+        # hardware-validated one.
         assert cute.size(thread_values_0) == self.N_TILE // 2
-        # v9.4: the v8 split-by-slot loops recomputed the per-row address
-        # chain once per slot (measured ~19% per-burst overhead vs the
-        # baseline reducer).  This restores the v7-proven interleaved
-        # shape: ONE address computation per row, both panels' 16-byte
-        # atomics back-to-back.  The two REDUCE_ATOMIC spans now bracket
-        # row HALVES (this thread's rows 0-3, then 4-7) instead of slots,
-        # keeping the two-payloads-per-tile trace contract; the (i,r)
-        # index no longer means "round" for this span family.
-        sub_tile_idx_0 = rank
-        sub_tile_idx_1 = Int32(2) + rank
         reduce_atomic_token = _iket.range_start(
             "REDUCE_ATOMIC(i,r)",
             packed_issue,
         )
-        for i in cutlass.range_constexpr(4):
+        sub_tile_idx_0 = rank
+        sub_tile_idx_1 = Int32(2) + rank
+        for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
             rdkv_frg_0 = cute.make_rmem_tensor(
                 (4,),
@@ -14297,14 +14295,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             rdkv_frg_0[1] = thread_values_0[coord_base + 2]
             rdkv_frg_0[2] = thread_values_0[coord_base + 16]
             rdkv_frg_0[3] = thread_values_0[coord_base + 18]
-            rdkv_frg_1 = cute.make_rmem_tensor(
-                (4,),
-                self.acc_dtype,
-            )
-            rdkv_frg_1[0] = thread_values_1[coord_base]
-            rdkv_frg_1[1] = thread_values_1[coord_base + 2]
-            rdkv_frg_1[2] = thread_values_1[coord_base + 16]
-            rdkv_frg_1[3] = thread_values_1[coord_base + 18]
 
             kv_index = r_topk[i]
             if kv_index >= Int32(0):
@@ -14320,13 +14310,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.arch.atomic_add(
                     target_frg_0.iterator.llvm_ptr,
                     rdkv_frg_0.load(),
-                )
-                tile_row_1 = tile_row[None, sub_tile_idx_1]
-                tile_row_1 = cute.flat_divide(tile_row_1, (4,))
-                target_frg_1 = tile_row_1[None, dp_idx // 4]
-                cute.arch.atomic_add(
-                    target_frg_1.iterator.llvm_ptr,
-                    rdkv_frg_1.load(),
                 )
         _iket.range_end(
             reduce_atomic_token,
@@ -14336,17 +14319,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             "REDUCE_ATOMIC(i,r)",
             packed_issue + Int32(1),
         )
-        for i_off in cutlass.range_constexpr(4):
-            i = i_off + 4
+        for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
-            rdkv_frg_0 = cute.make_rmem_tensor(
-                (4,),
-                self.acc_dtype,
-            )
-            rdkv_frg_0[0] = thread_values_0[coord_base]
-            rdkv_frg_0[1] = thread_values_0[coord_base + 2]
-            rdkv_frg_0[2] = thread_values_0[coord_base + 16]
-            rdkv_frg_0[3] = thread_values_0[coord_base + 18]
             rdkv_frg_1 = cute.make_rmem_tensor(
                 (4,),
                 self.acc_dtype,
@@ -14364,13 +14338,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     (0, batch_idx),
                 ]
                 tile_row = cute.flat_divide(dkv_row, (128,))
-                tile_row_0 = tile_row[None, sub_tile_idx_0]
-                tile_row_0 = cute.flat_divide(tile_row_0, (4,))
-                target_frg_0 = tile_row_0[None, dp_idx // 4]
-                cute.arch.atomic_add(
-                    target_frg_0.iterator.llvm_ptr,
-                    rdkv_frg_0.load(),
-                )
                 tile_row_1 = tile_row[None, sub_tile_idx_1]
                 tile_row_1 = cute.flat_divide(tile_row_1, (4,))
                 target_frg_1 = tile_row_1[None, dp_idx // 4]
