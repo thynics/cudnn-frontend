@@ -149,6 +149,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
 
     DKV_MMA_TILER = (D_TILE_CLUSTER, N_TILE, H_TILE_CLUSTER)
     DQ_MMA_TILER = (D_TILE_CLUSTER, H_TILE_CLUSTER, N_TILE)
+    GRAD_TMA_CTA_GROUP = tcgen05.CtaGroup.ONE
 
     CLUSTER_SHAPE_MNK = (2, 1, 1)
     MATH_THREADS_PER_CTA = 128
@@ -511,8 +512,9 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             self.QUADRANT_ELEMENTS
         )
 
-        # Q and dO are regular score-A tensors.  Completion is CTA-local
-        # while the subsequent MMA remains a genuine CG2 instruction.
+        # Stationary Q/dO are rank-owned and loaded once per CTA. Concrete
+        # subclasses choose the streamed-gradient TMA group statically; V2
+        # overrides it to CG2 without changing dormant V0/V1 experiments.
         stationary_a_layout = cute.select(
             stationary_a_layout_staged,
             mode=[0, 1, 2],
@@ -521,18 +523,18 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             score_a_layout_staged,
             mode=[0, 1, 2],
         )
-        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(
+        stationary_tma_load_op = cpasync.CopyBulkTensorTileG2SOp(
             tcgen05.CtaGroup.ONE
         )
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
+            stationary_tma_load_op,
             mQ,
             stationary_a_layout,
             stationary_tiler,
             stationary_tiled_mma,
         )
         tma_atom_do, tma_tensor_do = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
+            stationary_tma_load_op,
             mdO,
             stationary_a_layout,
             stationary_tiler,
@@ -546,8 +548,11 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             dkv_a_layout_staged,
             mode=[0, 1, 2],
         )
+        grad_tma_load_op = cpasync.CopyBulkTensorTileG2SOp(
+            self.GRAD_TMA_CTA_GROUP
+        )
         tma_atom_qt, tma_tensor_qt = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
+            grad_tma_load_op,
             mQT,
             grad_a_layout,
             self.DKV_MMA_TILER,
@@ -555,7 +560,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             cluster_layout_vmnk.shape,
         )
         tma_atom_dot, tma_tensor_dot = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
+            grad_tma_load_op,
             mdOT,
             grad_a_layout,
             self.DKV_MMA_TILER,
@@ -10974,6 +10979,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # This single override retargets every base-provided dkv layout and the
     # QT/dOT TMA atoms to [D128, H64] quadrant slabs.
     DKV_MMA_TILER = (256, 64, 64)
+    GRAD_TMA_CTA_GROUP = tcgen05.CtaGroup.TWO
     H_PASSES = 2
     PDS_BLOCK_ELEMENTS = 2_048
     PDS_BLOCK_BYTES = 4_096
@@ -11054,7 +11060,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             s_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            # Ten one-stage PipelineAsyncUmma instances, two mbarriers each.
+            # Two async-gather plus eight TMA→UMMA one-stage pipelines,
+            # with one full/empty pair per logical generation.
             round_mbars: cute.struct.MemRange[
                 cutlass.Int64,
                 round_mbar_count,
@@ -11068,7 +11075,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             stationary_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            round_tma_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             dq_epilogue_source_done_mbar: cutlass.Int64
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
@@ -11628,7 +11634,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         stationary_ready_mbar = storage.stationary_ready_mbar.data_ptr()
         landing_mbars = storage.landing_mbars.data_ptr()
         relay_mbars = storage.relay_mbars.data_ptr()
-        round_tma_mbar = storage.round_tma_mbar.data_ptr()
         dq_epilogue_source_done_mbar = (
             storage.dq_epilogue_source_done_mbar.ptr
         )
@@ -11915,6 +11920,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 (0, 0, None, 0),
             ).shape
         )
+        assert cute.size(a_cta_layout) == 2
         t_qt_smem_a, t_qt_gmem = cpasync.tma_partition(
             tma_atom_qt,
             block_coord_vmnk[2],
@@ -11994,6 +12000,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # Pipelines.
         # ------------------------------------------------------------------
         atom_thr_size = cute.size(score_tiled_mma.thr_id.shape)
+        assert atom_thr_size == 2
+        assert grad_a_stage_bytes == 16_384
         leader_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             1,
@@ -12010,11 +12018,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             pipeline.Agent.Thread,
             atom_thr_size * self.REDUCE_THREADS,
         )
-        load_elect_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread,
-            atom_thr_size,
-        )
-
         pipe_s_done = pipeline.PipelineUmmaAsync.create(
             num_stages=1,
             producer_group=leader_group,
@@ -12040,10 +12043,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             defer_sync=True,
         )
         round_mbars = storage.round_mbars.data_ptr()
-        # P0/P1 are committed by every gather thread. P2..P9 are committed
-        # by W13's elected lane. Keep all ten one-stage objects explicit:
-        # each logical generation owns exactly one full/empty pair, and no
-        # tuple of structured pipeline objects crosses a JIT helper boundary.
+        # P0/P1 are async-thread gathers. P2..P9 are genuine CG2 TMA→UMMA
+        # generations: producer_acquire arms the transaction barrier and the
+        # collective TMA completes it directly. Keep all ten one-stage
+        # objects explicit so each logical generation owns one full/empty
+        # pair and no structured tuple crosses a JIT helper boundary.
         pipe_round_0 = pipeline.PipelineAsyncUmma.create(
             num_stages=self.ROUND_STAGES,
             producer_group=gather_group,
@@ -12060,66 +12064,74 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipe_round_2 = pipeline.PipelineAsyncUmma.create(
+        pipe_round_2 = pipeline.PipelineTmaUmma.create(
             num_stages=self.ROUND_STAGES,
-            producer_group=load_elect_group,
+            producer_group=leader_group,
             consumer_group=leader_group,
+            tx_count=grad_a_stage_bytes * atom_thr_size,
             barrier_storage=round_mbars + 4,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipe_round_3 = pipeline.PipelineAsyncUmma.create(
+        pipe_round_3 = pipeline.PipelineTmaUmma.create(
             num_stages=self.ROUND_STAGES,
-            producer_group=load_elect_group,
+            producer_group=leader_group,
             consumer_group=leader_group,
+            tx_count=grad_a_stage_bytes * atom_thr_size,
             barrier_storage=round_mbars + 6,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipe_round_4 = pipeline.PipelineAsyncUmma.create(
+        pipe_round_4 = pipeline.PipelineTmaUmma.create(
             num_stages=self.ROUND_STAGES,
-            producer_group=load_elect_group,
+            producer_group=leader_group,
             consumer_group=leader_group,
+            tx_count=grad_a_stage_bytes * atom_thr_size,
             barrier_storage=round_mbars + 8,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipe_round_5 = pipeline.PipelineAsyncUmma.create(
+        pipe_round_5 = pipeline.PipelineTmaUmma.create(
             num_stages=self.ROUND_STAGES,
-            producer_group=load_elect_group,
+            producer_group=leader_group,
             consumer_group=leader_group,
+            tx_count=grad_a_stage_bytes * atom_thr_size,
             barrier_storage=round_mbars + 10,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipe_round_6 = pipeline.PipelineAsyncUmma.create(
+        pipe_round_6 = pipeline.PipelineTmaUmma.create(
             num_stages=self.ROUND_STAGES,
-            producer_group=load_elect_group,
+            producer_group=leader_group,
             consumer_group=leader_group,
+            tx_count=grad_a_stage_bytes * atom_thr_size,
             barrier_storage=round_mbars + 12,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipe_round_7 = pipeline.PipelineAsyncUmma.create(
+        pipe_round_7 = pipeline.PipelineTmaUmma.create(
             num_stages=self.ROUND_STAGES,
-            producer_group=load_elect_group,
+            producer_group=leader_group,
             consumer_group=leader_group,
+            tx_count=grad_a_stage_bytes * atom_thr_size,
             barrier_storage=round_mbars + 14,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipe_round_8 = pipeline.PipelineAsyncUmma.create(
+        pipe_round_8 = pipeline.PipelineTmaUmma.create(
             num_stages=self.ROUND_STAGES,
-            producer_group=load_elect_group,
+            producer_group=leader_group,
             consumer_group=leader_group,
+            tx_count=grad_a_stage_bytes * atom_thr_size,
             barrier_storage=round_mbars + 16,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipe_round_9 = pipeline.PipelineAsyncUmma.create(
+        pipe_round_9 = pipeline.PipelineTmaUmma.create(
             num_stages=self.ROUND_STAGES,
-            producer_group=load_elect_group,
+            producer_group=leader_group,
             consumer_group=leader_group,
+            tx_count=grad_a_stage_bytes * atom_thr_size,
             barrier_storage=round_mbars + 18,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
@@ -12165,7 +12177,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(landing_mbars + 1, 1)
             cute.arch.mbarrier_init(relay_mbars, 2)
             cute.arch.mbarrier_init(relay_mbars + 1, 2)
-            cute.arch.mbarrier_init(round_tma_mbar, 1)
             cute.arch.mbarrier_init(
                 dq_epilogue_source_done_mbar,
                 1,
@@ -12329,11 +12340,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     else:
                         kdq_pipeline = pipe_round_1
                         wrap_credit_pipeline = pipe_round_9
-                    # A/B wrap edge: P0 <- P8 and P1 <- P9. Use the public
-                    # acquire API with an independent state; publish state
-                    # must remain aligned exclusively with P0/P1 full/empty.
-                    wrap_credit_pipeline.producer_acquire(
-                        credit_state
+                    # A/B wrap edge: P0 <- P8 and P1 <- P9. Wait only on
+                    # the predecessor's public empty barrier. Calling a TMA
+                    # pipeline's producer_acquire here would also arm its
+                    # full transaction barrier and corrupt that generation.
+                    wrap_credit_barrier = (
+                        wrap_credit_pipeline.consumer_get_barrier(
+                            credit_state
+                        )
+                    )
+                    cute.arch.mbarrier_wait(
+                        wrap_credit_barrier,
+                        credit_state.phase,
                     )
                     self._fill_kdq_v2(
                         mKV,
@@ -13136,7 +13154,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx == Int32(self.LOAD_WARP):
             # --- load: stationary TMA once, then P2..P9 per tile.
             _iket.mark("ROLE_KV_LOAD", rank)
-            tma_phase = Int32(0)
             if tile_count > Int32(0):
                 load_qdo_token = _iket.range_start(
                     "LOAD_QDO",
@@ -13263,17 +13280,30 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     credit_pipeline = pipe_round_7
                                 # P_g may reuse A/B only after P_(g-2)'s
                                 # UMMA-backed empty barrier completes for
-                                # this tile. Public producer_acquire consumes
-                                # that predecessor credit without coupling it
-                                # to P_g's independent publish state.
-                                credit_pipeline.producer_acquire(
-                                    credit_state
-                                )
-                                with cute.arch.elect_one():
-                                    cute.arch.mbarrier_arrive_and_expect_tx(
-                                        round_tma_mbar,
-                                        grad_a_stage_bytes,
+                                # this tile. Read that public empty barrier
+                                # directly: predecessor producer_acquire is
+                                # not a credit-only operation for TMA pipes.
+                                credit_barrier = (
+                                    credit_pipeline.consumer_get_barrier(
+                                        credit_state
                                     )
+                                )
+                                cute.arch.mbarrier_wait(
+                                    credit_barrier,
+                                    credit_state.phase,
+                                )
+                                # Own acquire waits the previous tile's same
+                                # generation and arms a 2x16 KiB transaction
+                                # barrier on the leader CTA. The collective
+                                # CG2 TMA completes it directly.
+                                round_pipeline.producer_acquire(
+                                    publish_state
+                                )
+                                round_tma_barrier = (
+                                    round_pipeline.producer_get_barrier(
+                                        publish_state
+                                    )
+                                )
                                 if cutlass.const_expr(
                                     tensor_kind == 0
                                 ):
@@ -13288,7 +13318,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 0,
                                             ],
                                             t_dot_smem_a[None, 0],
-                                            tma_bar_ptr=round_tma_mbar,
+                                            tma_bar_ptr=round_tma_barrier,
                                         )
                                     else:
                                         cute.copy(
@@ -13299,7 +13329,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 1,
                                             ],
                                             t_dot_smem_b[None, 0],
-                                            tma_bar_ptr=round_tma_mbar,
+                                            tma_bar_ptr=round_tma_barrier,
                                         )
                                 else:
                                     if cutlass.const_expr(
@@ -13313,7 +13343,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 0,
                                             ],
                                             t_qt_smem_a[None, 0],
-                                            tma_bar_ptr=round_tma_mbar,
+                                            tma_bar_ptr=round_tma_barrier,
                                         )
                                     else:
                                         cute.copy(
@@ -13324,17 +13354,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 1,
                                             ],
                                             t_qt_smem_b[None, 0],
-                                            tma_bar_ptr=round_tma_mbar,
+                                            tma_bar_ptr=round_tma_barrier,
                                         )
-                                cute.arch.mbarrier_wait(
-                                    round_tma_mbar,
-                                    tma_phase,
-                                )
-                                tma_phase = Int32(1) - tma_phase
-                                with cute.arch.elect_one():
-                                    round_pipeline.producer_commit(
-                                        publish_state
-                                    )
                         _iket.range_end(
                             mat_qdo_token,
                             packed_mat_qdo,
@@ -13345,14 +13366,65 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     Int32(0),
                     Int32(1) ^ (tile_count & Int32(1)),
                 )
-                pipe_round_2.producer_tail(round_tail_state)
-                pipe_round_3.producer_tail(round_tail_state)
-                pipe_round_4.producer_tail(round_tail_state)
-                pipe_round_5.producer_tail(round_tail_state)
-                pipe_round_6.producer_tail(round_tail_state)
-                pipe_round_7.producer_tail(round_tail_state)
-                pipe_round_8.producer_tail(round_tail_state)
-                pipe_round_9.producer_tail(round_tail_state)
+                # Generic PipelineTmaUmma.producer_tail calls acquire, which
+                # would arm a full transaction with no matching final TMA.
+                # Tail only needs to observe the last consumer release.
+                round_tail_barrier_2 = (
+                    pipe_round_2.consumer_get_barrier(round_tail_state)
+                )
+                cute.arch.mbarrier_wait(
+                    round_tail_barrier_2,
+                    round_tail_state.phase,
+                )
+                round_tail_barrier_3 = (
+                    pipe_round_3.consumer_get_barrier(round_tail_state)
+                )
+                cute.arch.mbarrier_wait(
+                    round_tail_barrier_3,
+                    round_tail_state.phase,
+                )
+                round_tail_barrier_4 = (
+                    pipe_round_4.consumer_get_barrier(round_tail_state)
+                )
+                cute.arch.mbarrier_wait(
+                    round_tail_barrier_4,
+                    round_tail_state.phase,
+                )
+                round_tail_barrier_5 = (
+                    pipe_round_5.consumer_get_barrier(round_tail_state)
+                )
+                cute.arch.mbarrier_wait(
+                    round_tail_barrier_5,
+                    round_tail_state.phase,
+                )
+                round_tail_barrier_6 = (
+                    pipe_round_6.consumer_get_barrier(round_tail_state)
+                )
+                cute.arch.mbarrier_wait(
+                    round_tail_barrier_6,
+                    round_tail_state.phase,
+                )
+                round_tail_barrier_7 = (
+                    pipe_round_7.consumer_get_barrier(round_tail_state)
+                )
+                cute.arch.mbarrier_wait(
+                    round_tail_barrier_7,
+                    round_tail_state.phase,
+                )
+                round_tail_barrier_8 = (
+                    pipe_round_8.consumer_get_barrier(round_tail_state)
+                )
+                cute.arch.mbarrier_wait(
+                    round_tail_barrier_8,
+                    round_tail_state.phase,
+                )
+                round_tail_barrier_9 = (
+                    pipe_round_9.consumer_get_barrier(round_tail_state)
+                )
+                cute.arch.mbarrier_wait(
+                    round_tail_barrier_9,
+                    round_tail_state.phase,
+                )
 
         elif warp_idx == Int32(self.RELAY_WARP):
             # --- relay: convert DSM landings into leader-visible arrives.
