@@ -1,0 +1,869 @@
+{
+  "completed_at": "2026-07-29T00:20:50.213323+00:00",
+  "status": "pass",
+  "trace": {
+    "aggregate": "role_aggregated_h128_i1_i3.chrome.json",
+    "artifacts": {
+      "2cta": {
+        "decoded_json": "traces/2cta/iket/pid_0xa5f/iket.decoded_results.json",
+        "perfetto": "traces/2cta/iket_pid_0xa5f.pftrace"
+      },
+      "baseline": {
+        "decoded_json": "traces/baseline/iket/pid_0x9f4/iket.decoded_results.json",
+        "perfetto": "traces/baseline/iket_pid_0x9f4.pftrace"
+      }
+    },
+    "inputs": [
+      {
+        "capture_validation": {
+          "captured_ctas": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              1,
+              0
+            ]
+          ],
+          "cross_warp_range_count": 0,
+          "cta_lifetime_overlap_us": 154.24,
+          "cta_start_skew_us": 0.0,
+          "grid": [
+            1,
+            2,
+            1
+          ],
+          "malformed_range_count": 0,
+          "payload_mismatch_count": 0,
+          "per_cta_lifetimes": [
+            {
+              "cta": [
+                0,
+                0,
+                0
+              ],
+              "lifetime_envelope_us": 154.24,
+              "sm_ids": [
+                142
+              ],
+              "start_offset_us": 0.0,
+              "start_spread_us": 0.0,
+              "warp_count": 20
+            },
+            {
+              "cta": [
+                0,
+                1,
+                0
+              ],
+              "lifetime_envelope_us": 154.496,
+              "sm_ids": [
+                144
+              ],
+              "start_offset_us": 0.0,
+              "start_spread_us": 0.032,
+              "warp_count": 20
+            }
+          ],
+          "require_h128_standard": true,
+          "single_cluster_active": 0,
+          "warp_lifetime_count": 40,
+          "work_unit": "H128 / 2xH64 CTA"
+        },
+        "collapsed_ranges": 46,
+        "cycle_count": 3,
+        "cycle_start": 0,
+        "decoded_source": "traces/baseline/iket/pid_0x9f4/iket.decoded_results.json",
+        "discarded_outside_display_i": {
+          "P(tile)": 232,
+          "REDUCE_dKV(tile,part)": 928,
+          "S_dP(tile)": 58,
+          "WAIT_KV(tile)": 58,
+          "WAIT_P(tile)": 58,
+          "WAIT_S(tile)": 232,
+          "WAIT_dKV(tile,part)": 928,
+          "WAIT_dP(tile)": 232,
+          "WAIT_dS(tile)": 58,
+          "dQ_epilogue": 8,
+          "dS(tile)": 232,
+          "dV_dK_dQ(tile)": 58,
+          "load_KV(tile)": 232
+        },
+        "discarded_payload_mismatch": {},
+        "discarded_unmarked": {},
+        "display_i_end": 3,
+        "display_i_start": 1,
+        "f_load_wait_order": [
+          {
+            "consumer_wait_end_us": 2.016,
+            "cta": [
+              0,
+              0,
+              0
+            ],
+            "i": 1,
+            "issue_after_wait": true,
+            "issue_seq": 0,
+            "issue_start_minus_wait_end_us": 0.0,
+            "load_scope_end_us": 1.952,
+            "order_tolerance_us": 0.032,
+            "ordered": true,
+            "physical_tile": 31,
+            "sdp_issue_start_us": 2.016,
+            "strictly_ordered": true,
+            "wait_end_minus_load_end_us": 0.064
+          },
+          {
+            "consumer_wait_end_us": 1.984,
+            "cta": [
+              0,
+              1,
+              0
+            ],
+            "i": 1,
+            "issue_after_wait": true,
+            "issue_seq": 0,
+            "issue_start_minus_wait_end_us": 0.032,
+            "load_scope_end_us": 1.952,
+            "order_tolerance_us": 0.032,
+            "ordered": true,
+            "physical_tile": 31,
+            "sdp_issue_start_us": 2.016,
+            "strictly_ordered": true,
+            "wait_end_minus_load_end_us": 0.032
+          },
+          {
+            "consumer_wait_end_us": 5.728,
+            "cta": [
+              0,
+              0,
+              0
+            ],
+            "i": 2,
+            "issue_after_wait": true,
+            "issue_seq": 1,
+            "issue_start_minus_wait_end_us": 0.128,
+            "load_scope_end_us": 5.696,
+            "order_tolerance_us": 0.032,
+            "ordered": true,
+            "physical_tile": 30,
+            "sdp_issue_start_us": 5.856,
+            "strictly_ordered": true,
+            "wait_end_minus_load_end_us": 0.032
+          },
+          {
+            "consumer_wait_end_us": 5.696,
+            "cta": [
+              0,
+              1,
+              0
+            ],
+            "i": 2,
+            "issue_after_wait": true,
+            "issue_seq": 1,
+            "issue_start_minus_wait_end_us": 0.128,
+            "load_scope_end_us": 5.664,
+            "order_tolerance_us": 0.032,
+            "ordered": true,
+            "physical_tile": 30,
+            "sdp_issue_start_us": 5.824,
+            "strictly_ordered": true,
+            "wait_end_minus_load_end_us": 0.032
+          },
+          {
+            "consumer_wait_end_us": 10.272,
+            "cta": [
+              0,
+              0,
+              0
+            ],
+            "i": 3,
+            "issue_after_wait": true,
+            "issue_seq": 2,
+            "issue_start_minus_wait_end_us": 0.064,
+            "load_scope_end_us": 9.664,
+            "order_tolerance_us": 0.032,
+            "ordered": true,
+            "physical_tile": 29,
+            "sdp_issue_start_us": 10.336,
+            "strictly_ordered": true,
+            "wait_end_minus_load_end_us": 0.608
+          },
+          {
+            "consumer_wait_end_us": 10.24,
+            "cta": [
+              0,
+              1,
+              0
+            ],
+            "i": 3,
+            "issue_after_wait": true,
+            "issue_seq": 2,
+            "issue_start_minus_wait_end_us": 0.096,
+            "load_scope_end_us": 9.664,
+            "order_tolerance_us": 0.032,
+            "ordered": true,
+            "physical_tile": 29,
+            "sdp_issue_start_us": 10.336,
+            "strictly_ordered": true,
+            "wait_end_minus_load_end_us": 0.576
+          }
+        ],
+        "implementation": "baseline",
+        "input_ranges_in_window": 356,
+        "macro_atomic_overlap": null,
+        "nominal_next_cycle_anchor_us": 15.04,
+        "sdp_issue_derivation": [],
+        "selection_semantics": "Only events belonging to the selected i range are retained; their trailing work is kept through completion. Unindexed startup events are retained only before the next-cycle anchor.",
+        "startup_from_empty": true,
+        "tile_timing_semantics": "completion_us is the last annotated REDUCE range end for the selected H128 tile. It is a software trace boundary, not atomic retire, GMEM visibility, or strict stage recycle completion.",
+        "tile_timings": [
+          {
+            "complete": true,
+            "completion_us": 9.28,
+            "i": 1,
+            "inflight_latency_us": 8.256,
+            "load_start_us": 1.024
+          },
+          {
+            "complete": true,
+            "completion_cadence_us": 4.608,
+            "completion_us": 13.888,
+            "i": 2,
+            "inflight_latency_us": 11.04,
+            "load_start_us": 2.848
+          },
+          {
+            "complete": true,
+            "completion_cadence_us": 4.64,
+            "completion_us": 18.528,
+            "i": 3,
+            "inflight_latency_us": 12.064,
+            "load_start_us": 6.464
+          }
+        ],
+        "v2_native_provenance": null,
+        "window_us": 18.528
+      },
+      {
+        "capture_validation": {
+          "captured_ctas": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              1,
+              0,
+              0
+            ]
+          ],
+          "cross_warp_range_count": 0,
+          "cta_lifetime_overlap_us": 446.208,
+          "cta_start_skew_us": 0.0,
+          "grid": [
+            2,
+            1,
+            1
+          ],
+          "malformed_range_count": 0,
+          "payload_mismatch_count": 0,
+          "per_cta_lifetimes": [
+            {
+              "cta": [
+                0,
+                0,
+                0
+              ],
+              "lifetime_envelope_us": 446.208,
+              "sm_ids": [
+                142
+              ],
+              "start_offset_us": 0.0,
+              "start_spread_us": 0.032,
+              "warp_count": 20
+            },
+            {
+              "cta": [
+                1,
+                0,
+                0
+              ],
+              "lifetime_envelope_us": 446.208,
+              "sm_ids": [
+                143
+              ],
+              "start_offset_us": 0.0,
+              "start_spread_us": 0.032,
+              "warp_count": 20
+            }
+          ],
+          "require_h128_standard": true,
+          "role_partition": [
+            {
+              "cta": [
+                0,
+                0,
+                0
+              ],
+              "role_warp_ids": {
+                "KV_LOAD": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  17
+                ],
+                "MATH": [
+                  4,
+                  5,
+                  6,
+                  7
+                ],
+                "MMA": [
+                  16
+                ],
+                "REDUCE": [
+                  8,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13,
+                  14,
+                  15
+                ]
+              },
+              "unmarked_warp_ids": [
+                18,
+                19
+              ]
+            },
+            {
+              "cta": [
+                1,
+                0,
+                0
+              ],
+              "role_warp_ids": {
+                "KV_LOAD": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  17
+                ],
+                "MATH": [
+                  4,
+                  5,
+                  6,
+                  7
+                ],
+                "REDUCE": [
+                  8,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13,
+                  14,
+                  15
+                ]
+              },
+              "unmarked_warp_ids": [
+                16,
+                18,
+                19
+              ]
+            }
+          ],
+          "single_cluster_active": 0,
+          "v2_native_provenance": {
+            "marker": "V2_NATIVE_PROVENANCE",
+            "markers": [
+              {
+                "cta": [
+                  0,
+                  0,
+                  0
+                ],
+                "payload": 0,
+                "payload_validation": "matched_cta_rank",
+                "warp_id": 16
+              },
+              {
+                "cta": [
+                  1,
+                  0,
+                  0
+                ],
+                "payload": 1,
+                "payload_validation": "matched_cta_rank",
+                "warp_id": 16
+              }
+            ],
+            "proven": true,
+            "requirements": "warp16 in CTA0/CTA1; payload equals CTA rank when the decoder retains marker payloads; source-native 20-warp role layout",
+            "role_partition": [
+              {
+                "cta": [
+                  0,
+                  0,
+                  0
+                ],
+                "role_warp_ids": {
+                  "KV_LOAD": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    17
+                  ],
+                  "MATH": [
+                    4,
+                    5,
+                    6,
+                    7
+                  ],
+                  "MMA": [
+                    16
+                  ],
+                  "REDUCE": [
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15
+                  ]
+                },
+                "unmarked_warp_ids": [
+                  18,
+                  19
+                ]
+              },
+              {
+                "cta": [
+                  1,
+                  0,
+                  0
+                ],
+                "role_warp_ids": {
+                  "KV_LOAD": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    17
+                  ],
+                  "MATH": [
+                    4,
+                    5,
+                    6,
+                    7
+                  ],
+                  "REDUCE": [
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15
+                  ]
+                },
+                "unmarked_warp_ids": [
+                  16,
+                  18,
+                  19
+                ]
+              }
+            ]
+          },
+          "warp_lifetime_count": 40,
+          "work_unit": "H128 / one source-native V2 2-CTA cluster"
+        },
+        "collapsed_ranges": 110,
+        "cycle_count": 3,
+        "cycle_start": 0,
+        "decoded_source": "traces/2cta/iket/pid_0xa5f/iket.decoded_results.json",
+        "discarded_outside_display_i": {
+          "DQ_EPI(r)": 16,
+          "LOAD_K(i)": 232,
+          "MATH_PD(i,phase)": 464,
+          "MAT_QDO(m,r)": 116,
+          "REDUCE_ATOMIC(i,r)": 928,
+          "REDUCE_T2R(i,r)": 928,
+          "ROUTE_K(i)": 58,
+          "ROUTE_P(i)": 58,
+          "ROUTE_dS(i)": 58,
+          "S_ACQUIRE(i)": 29,
+          "S_ISSUE(i)": 29,
+          "S_PUBLISH(i)": 29,
+          "T2R_S(i)": 232,
+          "T2R_dP(i)": 232,
+          "TAIL": 1,
+          "WAIT_S(i)": 232,
+          "WAIT_dK(i,r)": 928,
+          "WAIT_dP(i)": 232,
+          "WAIT_dQ(i,r)": 58,
+          "dP_ACQUIRE(i)": 29,
+          "dP_ISSUE(i)": 29,
+          "dP_PUBLISH(i)": 29,
+          "dQ_ISSUE(i,r)": 58,
+          "dVdK_ISSUE(i,r,p)": 232
+        },
+        "discarded_payload_mismatch": {},
+        "discarded_unmarked": {},
+        "display_i_end": 3,
+        "display_i_start": 1,
+        "f_load_wait_order": [],
+        "implementation": "2cta",
+        "input_ranges_in_window": 544,
+        "macro_atomic_overlap": null,
+        "nominal_next_cycle_anchor_us": 50.976,
+        "sdp_issue_derivation": [],
+        "selection_semantics": "Only events belonging to the selected i range are retained; their trailing work is kept through completion. Unindexed startup events are retained only before the next-cycle anchor.",
+        "startup_from_empty": true,
+        "tile_timing_semantics": "completion_us is the last annotated REDUCE range end for the selected H128 tile. It is a software trace boundary, not atomic retire, GMEM visibility, or strict stage recycle completion.",
+        "tile_timings": [
+          {
+            "complete": true,
+            "completion_us": 41.984,
+            "i": 1,
+            "inflight_latency_us": 41.92,
+            "load_start_us": 0.064
+          },
+          {
+            "complete": true,
+            "completion_cadence_us": 11.744,
+            "completion_us": 53.728,
+            "i": 2,
+            "inflight_latency_us": 52.576,
+            "load_start_us": 1.152
+          },
+          {
+            "complete": true,
+            "completion_cadence_us": 12.96,
+            "completion_us": 66.688,
+            "i": 3,
+            "inflight_latency_us": 40.256,
+            "load_start_us": 26.432
+          }
+        ],
+        "trace_variant": "v2native",
+        "v2_native_provenance": {
+          "marker": "V2_NATIVE_PROVENANCE",
+          "markers": [
+            {
+              "cta": [
+                0,
+                0,
+                0
+              ],
+              "payload": 0,
+              "payload_validation": "matched_cta_rank",
+              "warp_id": 16
+            },
+            {
+              "cta": [
+                1,
+                0,
+                0
+              ],
+              "payload": 1,
+              "payload_validation": "matched_cta_rank",
+              "warp_id": 16
+            }
+          ],
+          "proven": true,
+          "requirements": "warp16 in CTA0/CTA1; payload equals CTA rank when the decoder retains marker payloads; source-native 20-warp role layout",
+          "role_partition": [
+            {
+              "cta": [
+                0,
+                0,
+                0
+              ],
+              "role_warp_ids": {
+                "KV_LOAD": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  17
+                ],
+                "MATH": [
+                  4,
+                  5,
+                  6,
+                  7
+                ],
+                "MMA": [
+                  16
+                ],
+                "REDUCE": [
+                  8,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13,
+                  14,
+                  15
+                ]
+              },
+              "unmarked_warp_ids": [
+                18,
+                19
+              ]
+            },
+            {
+              "cta": [
+                1,
+                0,
+                0
+              ],
+              "role_warp_ids": {
+                "KV_LOAD": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  17
+                ],
+                "MATH": [
+                  4,
+                  5,
+                  6,
+                  7
+                ],
+                "REDUCE": [
+                  8,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13,
+                  14,
+                  15
+                ]
+              },
+              "unmarked_warp_ids": [
+                16,
+                18,
+                19
+              ]
+            }
+          ]
+        },
+        "window_us": 66.688
+      }
+    ],
+    "selection": "empty-pipeline i=1..3 with complete annotated tails",
+    "semantics": "Each slice is the min(start)..max(end) envelope of ranges with the same role, aligned name, and payload. IKET timestamps are software annotation arrival times, not async completion times. When present, 2cta SDP_ISSUE(i,k) slices are explicitly marked as derived software issue intervals in their args. Tile completion_us is the last annotated REDUCE range end, not atomic retire, GMEM visibility, or strict stage recycle completion.",
+    "shared_svg": "role_aggregated_h128_i1_i3.shared.svg",
+    "status": "pass",
+    "svg": "role_aggregated_h128_i1_i3.svg",
+    "timeline": "role_aggregated_h128_i1_i3.timeline.json",
+    "validated_at": "2026-07-29T00:20:50.069450+00:00"
+  },
+  "validation": {
+    "contract": {
+      "benchmark": "H128 D512 topk2048, warmup=5, timed repeat=5, IKET off",
+      "correctness": "H128 D512 K256, four metadata patterns",
+      "performance_threshold": null
+    },
+    "correctness": {
+      "path": "/tmp/dsa-image-run.NsJ6t6Nf/repo/agents/dev_pipeline/trace_archive/20260729T001904Z_v2_v2/validation/correctness.json",
+      "patterns": [
+        "dense",
+        "lengths",
+        "holes",
+        "all_empty"
+      ],
+      "records": [
+        {
+          "d_sink": {
+            "actual_norm": 1.6355890035629272,
+            "cosine": 0.9999987483024597,
+            "expected_norm": 1.6356066465377808,
+            "max_abs": 0.0011278465390205383,
+            "mean_abs": 0.00012093943223590031
+          },
+          "dkv": {
+            "actual_norm": 290.8691101074219,
+            "cosine": 0.9999973177909851,
+            "expected_norm": 290.8677673339844,
+            "max_abs": 0.009689569473266602,
+            "mean_abs": 0.001034099725075066
+          },
+          "dq": {
+            "actual_norm": 222.096435546875,
+            "cosine": 0.9999974370002747,
+            "expected_norm": 222.09518432617188,
+            "max_abs": 0.0040819644927978516,
+            "mean_abs": 0.00018311128951609135
+          },
+          "length_max": 256,
+          "length_min": 256,
+          "pattern": "dense",
+          "topk": 256,
+          "valid_indices": 16384
+        },
+        {
+          "d_sink": {
+            "actual_norm": 100.57445526123047,
+            "cosine": 0.9999988675117493,
+            "expected_norm": 100.54689025878906,
+            "max_abs": 0.03729534149169922,
+            "mean_abs": 0.01157473586499691
+          },
+          "dkv": {
+            "actual_norm": 515.4526977539062,
+            "cosine": 0.9999969601631165,
+            "expected_norm": 515.447998046875,
+            "max_abs": 0.0728607177734375,
+            "mean_abs": 0.0014548634644597769
+          },
+          "dq": {
+            "actual_norm": 291.8371276855469,
+            "cosine": 0.9999963045120239,
+            "expected_norm": 291.84686279296875,
+            "max_abs": 0.011961579322814941,
+            "mean_abs": 0.00023946358123794198
+          },
+          "length_max": 256,
+          "length_min": 0,
+          "pattern": "lengths",
+          "topk": 256,
+          "valid_indices": 8064
+        },
+        {
+          "d_sink": {
+            "actual_norm": 2.6697983741760254,
+            "cosine": 0.9999991059303284,
+            "expected_norm": 2.6690540313720703,
+            "max_abs": 0.0016178786754608154,
+            "mean_abs": 0.00017466240387875587
+          },
+          "dkv": {
+            "actual_norm": 341.5067443847656,
+            "cosine": 0.9999972581863403,
+            "expected_norm": 341.505615234375,
+            "max_abs": 0.010862112045288086,
+            "mean_abs": 0.0012109483359381557
+          },
+          "dq": {
+            "actual_norm": 254.11907958984375,
+            "cosine": 0.9999973773956299,
+            "expected_norm": 254.11985778808594,
+            "max_abs": 0.004559874534606934,
+            "mean_abs": 0.00021063520398456603
+          },
+          "length_max": 256,
+          "length_min": 256,
+          "pattern": "holes",
+          "topk": 256,
+          "valid_indices": 11584
+        },
+        {
+          "d_sink": {
+            "actual_norm": 0.0,
+            "cosine": 1.0,
+            "expected_norm": 0.0,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          "dkv": {
+            "actual_norm": 0.0,
+            "cosine": 1.0,
+            "expected_norm": 0.0,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          "dq": {
+            "actual_norm": 0.0,
+            "cosine": 1.0,
+            "expected_norm": 0.0,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          "length_max": 256,
+          "length_min": 256,
+          "pattern": "all_empty",
+          "topk": 256,
+          "valid_indices": 0
+        }
+      ]
+    },
+    "performance": {
+      "2cta": {
+        "attn_sink": true,
+        "compute_capability": [
+          10,
+          0
+        ],
+        "dtype": "bfloat16",
+        "gpu": "NVIDIA B200",
+        "head_dim_qk": 512,
+        "head_dim_v": 512,
+        "implementation": "2cta",
+        "latency_ms": 17.892128,
+        "math_accumulation": "float32",
+        "nheads": 128,
+        "repeat": 5,
+        "repo": "/tmp/dsa-validation.SsPs6uix/repo",
+        "seed": 0,
+        "seqlen_kv": 4096,
+        "seqlen_q": 4096,
+        "status": "pass",
+        "tflops": 307.261279,
+        "topk": 2048,
+        "topk_length": 2048,
+        "torch_cuda_version": "13.0",
+        "torch_version": "2.13.0+cu130",
+        "trace_enabled": false,
+        "warmup": 5
+      },
+      "baseline": {
+        "attn_sink": true,
+        "compute_capability": [
+          10,
+          0
+        ],
+        "dtype": "bfloat16",
+        "gpu": "NVIDIA B200",
+        "head_dim_qk": 512,
+        "head_dim_v": 512,
+        "implementation": "baseline",
+        "latency_ms": 8.031686,
+        "math_accumulation": "float32",
+        "nheads": 128,
+        "repeat": 5,
+        "repo": "/tmp/dsa-validation.SsPs6uix/repo",
+        "seed": 0,
+        "seqlen_kv": 4096,
+        "seqlen_q": 4096,
+        "status": "pass",
+        "tflops": 684.483664,
+        "topk": 2048,
+        "topk_length": 2048,
+        "torch_cuda_version": "13.0",
+        "torch_version": "2.13.0+cu130",
+        "trace_enabled": false,
+        "warmup": 5
+      },
+      "two_cta_over_baseline": 2.227693
+    },
+    "status": "pass",
+    "validated_at": "2026-07-29T00:20:08.140451+00:00"
+  }
+}
