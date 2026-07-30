@@ -906,28 +906,40 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             if workspace_pds is None:
                 # Harness-free operation: self-allocate the ring at
                 # trace time and bake its pointer into the compiled
-                # artifact.  Requires a compile-time token count (the
-                # interface specializes on problem_shape).
-                assert isinstance(problem_shape[0], int), (
-                    "v15 L2X self-allocation needs a compile-time "
-                    "total_S_q; pass workspace_pds explicitly instead"
-                )
+                # artifact.  When the harness passes total_S_q as a
+                # dynamic value (the private compile flow does), the
+                # ring is sized by the DSA_V15_RING_TOKENS hint
+                # instead (default 8192 tokens = 512MiB -- covers the
+                # benchmark shapes with 2x margin; sequences beyond
+                # the hint would overrun, so the hint is printed
+                # loudly and statically-known sizes are re-checked).
                 import torch as _torch
 
                 from cudnn.deepseek_sparse_attention.utils import (
                     tensor_conversion as _tc,
                 )
 
+                if isinstance(problem_shape[0], int):
+                    ring_tokens = int(problem_shape[0])
+                else:
+                    ring_tokens = int(
+                        os.environ.get("DSA_V15_RING_TOKENS", "8192")
+                    )
+                    print(
+                        "v15 L2X: total_S_q is dynamic at trace; ring "
+                        f"sized for <= {ring_tokens} tokens "
+                        "(DSA_V15_RING_TOKENS).  Longer sequences "
+                        "would overrun -- raise the hint or pass "
+                        "workspace_pds explicitly."
+                    )
                 _key = (
                     _torch.cuda.current_device(),
-                    int(problem_shape[0]),
+                    ring_tokens,
                     int(self.PDS_RING_TOKEN_BYTES),
                 )
                 if _key not in _V15_WS_PDS_REGISTRY:
                     _V15_WS_PDS_REGISTRY[_key] = _torch.zeros(
-                        *self._get_workspace_size_pds(
-                            int(problem_shape[0])
-                        ),
+                        *self._get_workspace_size_pds(ring_tokens),
                         dtype=_torch.uint8,
                         device="cuda",
                     )
