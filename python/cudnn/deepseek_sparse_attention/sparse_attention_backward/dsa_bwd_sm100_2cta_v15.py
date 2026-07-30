@@ -885,16 +885,22 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             # the kernel launches grid z = batch -- batch > 1 would
             # alias one 64KB token ring across clusters.  The current
             # interface hardcodes batch_size = 1; keep this loud.
-            if problem_shape[3][1] != 1:
-                raise ValueError(
-                    "v15 L2X requires batch_size == 1 "
-                    "(per-token pds ring is not batch-indexed)"
-                )
-            if workspace_pds is None:
-                raise ValueError(
-                    "v15 L2X requires workspace_pds -- allocate per "
-                    "V15_RUNNER_NOTES.md or run with DSA_V15_L2X=0"
-                )
+            # NOTE: trace-time asserts, not raise -- the CuTe DSL
+            # rejects early exits (UNSUP_EARLY_EXIT) in the staged
+            # __call__ (v15_run1 stage-0 lesson).  The batch check only
+            # fires when the value is a compile-time Python int (the
+            # interface specializes on it); a symbolic batch skips it.
+            assert workspace_pds is not None, (
+                "v15 L2X requires workspace_pds -- allocate per "
+                "V15_RUNNER_NOTES.md or run with DSA_V15_L2X=0"
+            )
+            assert (
+                not isinstance(problem_shape[3][1], int)
+                or problem_shape[3][1] == 1
+            ), (
+                "v15 L2X requires batch_size == 1 "
+                "(per-token pds ring is not batch-indexed)"
+            )
             kernel_args = kernel_args + (workspace_pds,)
         self.kernel(*kernel_args).launch(
             grid=(
