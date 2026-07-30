@@ -896,8 +896,11 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             # __call__ (v15_run1 stage-0 lesson).  The batch check only
             # fires when the value is a compile-time Python int (the
             # interface specializes on it); a symbolic batch skips it.
+            # type-is (not isinstance): staged Integers pass
+            # isinstance(x, int) and comparing them yields a staged
+            # Boolean the assert cannot evaluate.
             assert (
-                not isinstance(problem_shape[3][1], int)
+                type(problem_shape[3][1]) is not int
                 or problem_shape[3][1] == 1
             ), (
                 "v15 L2X requires batch_size == 1 "
@@ -919,8 +922,13 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
                     tensor_conversion as _tc,
                 )
 
-                if isinstance(problem_shape[0], int):
-                    ring_tokens = int(problem_shape[0])
+                # DSL lesson #5: staged Integers PASS isinstance(x,
+                # int) (interop design), and int(staged) raises
+                # PHASE_DYNAMIC_INDEX -- so never touch problem_shape
+                # here.  Size purely by the hint; exact sizing is the
+                # explicit-workspace path's job.
+                if type(problem_shape[0]) is int:
+                    ring_tokens = problem_shape[0]
                 else:
                     ring_tokens = int(
                         os.environ.get("DSA_V15_RING_TOKENS", "8192")
