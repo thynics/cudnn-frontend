@@ -880,7 +880,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             stationary_tiled_mma,
             stationary_a_layout_staged,
         )
-        if getattr(self, "V15_L2X", False):
+        if cutlass.const_expr(getattr(self, "V15_L2X", False)):
             # Review fix #2: the L2X ring is indexed by token only, and
             # the kernel launches grid z = batch -- batch > 1 would
             # alias one 64KB token ring across clusters.  The current
