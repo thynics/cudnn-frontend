@@ -918,10 +918,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
                 # loudly and statically-known sizes are re-checked).
                 import torch as _torch
 
-                from cudnn.deepseek_sparse_attention.utils import (
-                    tensor_conversion as _tc,
-                )
-
                 # DSL lessons #5/#6: staged Integers PASS
                 # isinstance(x, int) and int(staged) raises
                 # PHASE_DYNAMIC_INDEX (use type-is); names born inside
@@ -962,10 +958,17 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
                         f"{_V15_WS_PDS_REGISTRY[_key].numel()} B "
                         "(trace-time, process-lifetime)"
                     )
-                workspace_pds = _tc.to_cute_tensor(
-                    _V15_WS_PDS_REGISTRY[_key]
-                )
-            kernel_args = kernel_args + (workspace_pds,)
+                # DSL lesson #7: pass the POINTER, not the captured
+                # tensor -- torch data_ptr() is a host int and lowers
+                # as an Int64 constant.
+                ws_pds_base_arg = _V15_WS_PDS_REGISTRY[
+                    _key
+                ].data_ptr()
+            else:
+                # Explicit workspace (a real traced argument): its
+                # address is a staged Int64 -- equally valid.
+                ws_pds_base_arg = workspace_pds.iterator.toint()
+            kernel_args = kernel_args + (ws_pds_base_arg,)
         self.kernel(*kernel_args).launch(
             grid=(
                 2 * problem_shape[0],
@@ -12313,7 +12316,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         trace_batch_idx: Int32,
         stationary_tiled_mma: cute.TiledMma,
         stationary_a_layout_staged: cute.ComposedLayout,
-        workspace_pds: Optional[cute.Tensor] = None,
+        workspace_pds_base: cutlass.Int64 = 0,
     ):
         """v2 rotated-schedule two-CTA backward (design: 优化设计文档_v2.md)."""
 
@@ -12540,13 +12543,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
             )
             # Per-token HBM ring base (byte address).  Blob layout:
-            # [depth 2][cta 2][kind 2: dS=0, P=1] x 8,192B.
-            assert workspace_pds is not None, (
-                "v15 L2X needs the workspace_pds ring; allocate per "
-                "V15_RUNNER_NOTES.md or run with DSA_V15_L2X=0"
-            )
+            # [depth 2][cta 2][kind 2: dS=0, P=1] x 8,192B.  The base
+            # arrives as a raw Int64: DSL lesson #7 -- a trace-time-
+            # captured cute.Tensor cannot lower as a kernel argument
+            # (runtime._Tensor -> Dynamic Expression fails); pointers
+            # travel as scalars, tensors only as compile args.
             ws_pds_token_base = (
-                workspace_pds.iterator.toint()
+                cutlass.Int64(workspace_pds_base)
                 + cutlass.Int64(token_idx)
                 * cutlass.Int64(self.PDS_RING_TOKEN_BYTES)
             )
