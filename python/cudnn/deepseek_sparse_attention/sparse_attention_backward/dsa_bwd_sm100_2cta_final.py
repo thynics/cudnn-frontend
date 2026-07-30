@@ -944,6 +944,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(FlashAttentionDSABackwardSm100TwoCT
 
     IKET_V2_NATIVE_PROVENANCE = "V2_NATIVE_PROVENANCE"
 
+    def _provenance_sentinel(self, rank):
+        if False:
+            _iket.mark(self.IKET_V2_NATIVE_PROVENANCE, rank)
+
     def __init__(
         self,
         head_dim: int,
