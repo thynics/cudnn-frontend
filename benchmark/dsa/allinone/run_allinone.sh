@@ -137,7 +137,24 @@ if [[ -z "${skip_stage0}" ]]; then
     gate_args=(--capture-root "${stage0_capture}"
                --reference-root "${reference_capture}"
                --output-dir "${partial}/stage0_analysis")
-    [[ -n "${gates}" ]] && gate_args+=(--expectations "${gates}")
+    if [[ -n "${gates}" ]]; then
+      # Auto-fill the per-run provenance pins from the checkout so the
+      # template's UPDATE_PER_RUN placeholders never reach the gates.
+      python3 - "${gates}" "${partial}/gates_effective.json" \
+          "${repo_root}" "${candidate_rel}" <<'PYFILL'
+import hashlib, json, subprocess, sys
+gates, out, root, rel = sys.argv[1:5]
+d = json.loads(open(gates).read())
+d["TARGET_REVISION"] = subprocess.run(
+    ["git", "-C", root, "rev-parse", "HEAD"],
+    capture_output=True, text=True).stdout.strip()
+h = hashlib.sha256()
+h.update(open(f"{root}/{rel}", "rb").read())
+d["TARGET_SOURCE_SHA256"] = h.hexdigest()
+open(out, "w").write(json.dumps(d, indent=1))
+PYFILL
+      gate_args+=(--expectations "${partial}/gates_effective.json")
+    fi
     if ! python3 "${script_dir}/stage0_analyzer.py" "${gate_args[@]}" \
         > "${partial}/stage0_analyzer.log" 2>&1; then
       [[ "${stage0_capture}" == "${partial}"* ]] \

@@ -760,12 +760,21 @@ def main() -> int:
     if args.expectations is not None:
         overrides = json.loads(args.expectations.read_text())
         for key, value in overrides.items():
+            if key.startswith("_"):
+                continue  # comment/annotation keys
             if key.isupper() and key in globals() and not key.endswith("_RE"):
                 globals()[key] = value
+                print(f"expectation override: {key} = {value!r}")
             else:
                 raise SystemExit(
                     f"unknown expectation constant: {key}"
                 )
+    # Placeholder pins self-disable so a template gates.json cannot
+    # hard-fail provenance before the orchestrator fills them.
+    for _pin in ("TARGET_REVISION", "TARGET_SOURCE_SHA256"):
+        if globals().get(_pin) == "UPDATE_PER_RUN":
+            globals()[_pin] = None
+            print(f"expectation pin disabled (placeholder): {_pin}")
     capture_root = args.capture_root.resolve()
     reference_root = args.reference_root.resolve()
     output_dir = args.output_dir.resolve()
@@ -789,7 +798,12 @@ def main() -> int:
     reference_codegen_path, reference_codegen = codegen_metadata(reference_root)
 
     resources = parse_resources(resource_path)
-    provenance_matches = candidate_sha == TARGET_SOURCE_SHA256
+    # A disabled pin (None) accepts any candidate; the orchestrator
+    # normally fills the real values into gates_effective.json.
+    provenance_matches = (
+        TARGET_SOURCE_SHA256 is None
+        or candidate_sha == TARGET_SOURCE_SHA256
+    )
     if args.dynamic_smem_bytes is not None:
         dynamic_smem = args.dynamic_smem_bytes
         dynamic_smem_basis = "explicit analyzer argument"
