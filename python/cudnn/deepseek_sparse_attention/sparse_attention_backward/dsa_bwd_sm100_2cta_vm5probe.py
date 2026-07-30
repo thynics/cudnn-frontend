@@ -13238,10 +13238,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
             # executes no pipeline operation at all (FA4 rule).
-            _iket.mark(
-                self.IKET_V2_NATIVE_PROVENANCE,
-                rank,
-            )
+            # vm5probe: the purely diagnostic V2_NATIVE_PROVENANCE mark is
+            # retired -- CuTe DSL 4.6.1 hard-caps IKET name registration
+            # below the previously assumed 31 (the 30th registration,
+            # PROBE_GEN, tripped it on hardware).  The provenance
+            # validator is already skipped for this variant per
+            # VM5PROBE_RUNNER_NOTES.md.  Name count: 29.
             if is_leader_cta:
                 _iket.mark("ROLE_MMA", rank)
                 s_prod = pipeline.make_pipeline_state(

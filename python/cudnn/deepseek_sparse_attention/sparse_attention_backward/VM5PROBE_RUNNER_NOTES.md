@@ -1,5 +1,11 @@
 # vm5probe runner 注记（随提交发布，优先级高于此前 prompt 中冲突的条目）
 
+> **rev2**：应真实 B200 首跑的 STOP 反馈，V2_NATIVE_PROVENANCE mark 已删除
+> （CuTe DSL 4.6.1 的 IKET 名字注册上限低于先前假设的 31——第 30 个注册即触发；
+> 现在总数 29）。provenance 校验本就在本变体的跳过清单里。首跑已验证：
+> 正确性 4/4、vm5probe release 11.668ms ≈ v12 的 11.654ms——**探针的翻转序/
+> parity 模型在硬件上被确认正确**（模型错会导致每 launch +5-10s 自旋超时）。
+
 vm5probe = M5 插桩探针变体，**永远不是性能候选**。不要把它的耗时当性能结果、
 不要用它更新任何 performance JSON。
 
