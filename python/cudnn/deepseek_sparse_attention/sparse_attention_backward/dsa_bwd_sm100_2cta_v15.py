@@ -906,7 +906,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
                 "v15 L2X requires batch_size == 1 "
                 "(per-token pds ring is not batch-indexed)"
             )
-            if workspace_pds is None:
+            if cutlass.const_expr(workspace_pds is None):
                 # Harness-free operation: self-allocate the ring at
                 # trace time and bake its pointer into the compiled
                 # artifact.  When the harness passes total_S_q as a
@@ -922,30 +922,36 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
                     tensor_conversion as _tc,
                 )
 
-                # DSL lesson #5: staged Integers PASS isinstance(x,
-                # int) (interop design), and int(staged) raises
-                # PHASE_DYNAMIC_INDEX -- so never touch problem_shape
-                # here.  Size purely by the hint; exact sizing is the
-                # explicit-workspace path's job.
-                if type(problem_shape[0]) is int:
+                # DSL lessons #5/#6: staged Integers PASS
+                # isinstance(x, int) and int(staged) raises
+                # PHASE_DYNAMIC_INDEX (use type-is); names born inside
+                # a branch and used after it trip the staged-join
+                # pre-initialization check (pre-initialize, and prune
+                # the branch with const_expr so no join exists at all).
+                ring_tokens = int(
+                    os.environ.get("DSA_V15_RING_TOKENS", "8192")
+                )
+                if cutlass.const_expr(
+                    type(problem_shape[0]) is int
+                ):
                     ring_tokens = problem_shape[0]
                 else:
-                    ring_tokens = int(
-                        os.environ.get("DSA_V15_RING_TOKENS", "8192")
-                    )
                     print(
-                        "v15 L2X: total_S_q is dynamic at trace; ring "
-                        f"sized for <= {ring_tokens} tokens "
-                        "(DSA_V15_RING_TOKENS).  Longer sequences "
-                        "would overrun -- raise the hint or pass "
-                        "workspace_pds explicitly."
+                        "v15 L2X: total_S_q is dynamic at trace; "
+                        "ring sized for <= "
+                        + str(ring_tokens)
+                        + " tokens (DSA_V15_RING_TOKENS).  Longer "
+                        "sequences would overrun -- raise the hint "
+                        "or pass workspace_pds explicitly."
                     )
                 _key = (
                     _torch.cuda.current_device(),
                     ring_tokens,
                     int(self.PDS_RING_TOKEN_BYTES),
                 )
-                if _key not in _V15_WS_PDS_REGISTRY:
+                if cutlass.const_expr(
+                    _key not in _V15_WS_PDS_REGISTRY
+                ):
                     _V15_WS_PDS_REGISTRY[_key] = _torch.zeros(
                         *self._get_workspace_size_pds(ring_tokens),
                         dtype=_torch.uint8,
