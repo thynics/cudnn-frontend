@@ -13,7 +13,13 @@ v15 = 性能候选（v12 基础 + 三主杠杆 + 一 rider，全部 env 可 bise
 | `DSA_V15_DQ_MERGE` | 1 | dQ 两 round 并一协议块（kdq 信用本就成对提交，无格死锁） |
 | `DSA_V15_ALLTMA` | **0**（G2 两轮证据：全 TMA 循环多 ~2 个活跃不变量，任何已试预算下都溢出到 W17 的 local——收益本就条件于压缩后 fill 链上环，届时再以 one-off 回归） | own-half DSM bulk 退役开关（run2：DSM 腿慢 1.7×） |
 
-## 【必读】harness 适配：workspace_pds（仅 L2X=1 需要）
+## harness 适配：workspace_pds（rev6 起默认不再需要）
+
+**rev6 起 L2X 的环缓冲在 trace 期自分配**（进程生命周期注册表保活，指针
+烘入编译产物；scratch 语义下安全）——**私有 harness 零改动即可跑 L2X=1**。
+显式传参路径保留（见下），仅在需要控制分配位置/复用时使用。
+
+## 【可选】显式 workspace_pds（rev6 前为必需）
 
 v15 的 `__call__` 末尾新增**尾参**（带默认值，老调用点不传也能编译）：
 `workspace_pds: Optional[cute.Tensor] = None`。

@@ -21,6 +21,12 @@ import math
 import os
 from typing import Optional, Tuple
 
+# v15 (L2X): process-lifetime registry for trace-time self-allocated
+# exchange rings.  The ring is scratch (no cross-launch content), so a
+# buffer whose pointer is baked into the compiled artifact is safe as
+# long as it outlives every launch -- this registry guarantees that.
+_V15_WS_PDS_REGISTRY: dict = {}
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -890,10 +896,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             # __call__ (v15_run1 stage-0 lesson).  The batch check only
             # fires when the value is a compile-time Python int (the
             # interface specializes on it); a symbolic batch skips it.
-            assert workspace_pds is not None, (
-                "v15 L2X requires workspace_pds -- allocate per "
-                "V15_RUNNER_NOTES.md or run with DSA_V15_L2X=0"
-            )
             assert (
                 not isinstance(problem_shape[3][1], int)
                 or problem_shape[3][1] == 1
@@ -901,6 +903,42 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
                 "v15 L2X requires batch_size == 1 "
                 "(per-token pds ring is not batch-indexed)"
             )
+            if workspace_pds is None:
+                # Harness-free operation: self-allocate the ring at
+                # trace time and bake its pointer into the compiled
+                # artifact.  Requires a compile-time token count (the
+                # interface specializes on problem_shape).
+                assert isinstance(problem_shape[0], int), (
+                    "v15 L2X self-allocation needs a compile-time "
+                    "total_S_q; pass workspace_pds explicitly instead"
+                )
+                import torch as _torch
+
+                from cudnn.deepseek_sparse_attention.utils import (
+                    tensor_conversion as _tc,
+                )
+
+                _key = (
+                    _torch.cuda.current_device(),
+                    int(problem_shape[0]),
+                    int(self.PDS_RING_TOKEN_BYTES),
+                )
+                if _key not in _V15_WS_PDS_REGISTRY:
+                    _V15_WS_PDS_REGISTRY[_key] = _torch.zeros(
+                        *self._get_workspace_size_pds(
+                            int(problem_shape[0])
+                        ),
+                        dtype=_torch.uint8,
+                        device="cuda",
+                    )
+                    print(
+                        "v15 L2X: self-allocated workspace_pds "
+                        f"{_V15_WS_PDS_REGISTRY[_key].numel()} B "
+                        "(trace-time, process-lifetime)"
+                    )
+                workspace_pds = _tc.to_cute_tensor(
+                    _V15_WS_PDS_REGISTRY[_key]
+                )
             kernel_args = kernel_args + (workspace_pds,)
         self.kernel(*kernel_args).launch(
             grid=(
