@@ -13642,15 +13642,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         loop_iter,
                     )
                 else:
-                    math_pds_acq_token = _iket.range_start(
-                        "MATH_PDS_ACQ(i)",
-                        loop_iter,
-                    )
+                    # v15: span retired file-wide (harness counts the
+                    # STATIC name set; see V15_RUNNER_NOTES).
                     pipe_pds.producer_acquire(pds_state)
-                    _iket.range_end(
-                        math_pds_acq_token,
-                        loop_iter,
-                    )
 
                     math_store_token = _iket.range_start(
                         "MATH_STORE(i)",
@@ -13711,17 +13705,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # Each math thread hands off with one
                     # release-semantics mbarrier arrive after its own
                     # fenced stores; MATH_BAR1 brackets that arrive.
-                    math_bar1_token = _iket.range_start(
-                        "MATH_BAR1(i)",
-                        loop_iter,
-                    )
                     cute.arch.mbarrier_arrive(
                         pds_ready_mbars,
                         rank,
-                    )
-                    _iket.range_end(
-                        math_bar1_token,
-                        loop_iter,
                     )
                     pds_state.advance()
                 _iket.range_end(
@@ -14558,10 +14544,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             ready_phase,
                         )
                         ready_phase = Int32(1) - ready_phase
-                        route_p_token = _iket.range_start(
-                            "ROUTE_P(i)",
-                            loop_iter,
-                        )
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             landing_mbars,
                             self.PDS_BLOCK_BYTES,
@@ -14583,14 +14565,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 self.PDS_BLOCK_BYTES,
                                 peer_rank,
                             )
-                        _iket.range_end(
-                            route_p_token,
-                            loop_iter,
-                        )
-                        route_ds_token = _iket.range_start(
-                            "ROUTE_dS(i)",
-                            loop_iter,
-                        )
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             landing_mbars + 1,
                             self.PDS_BLOCK_BYTES,
@@ -14615,10 +14589,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 self.PDS_BLOCK_BYTES,
                                 peer_rank,
                             )
-                        _iket.range_end(
-                            route_ds_token,
-                            loop_iter,
-                        )
                         pipe_pds.producer_commit(pds_com)
                         pds_com.advance()
                         _mbarrier_wait_acquire_cluster(
