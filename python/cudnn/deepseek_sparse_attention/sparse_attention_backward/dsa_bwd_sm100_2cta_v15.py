@@ -11420,7 +11420,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     #       (G5 gate watches the v11-measured 23 residual drain spills)
     #   2 = variant C: W16-19 uniform 56, funded by gather 48->40
     # Every variant keeps the pool at exactly 640*96 = 61,440.
-    V15_REGSWAP = int(os.environ.get("DSA_V15_REGSWAP", "2"))
+    # Default flipped 2 -> 1 after v15_run1 stage-0 G2: at 56 regs the
+    # ALLTMA fill loop rotates 1-2 scalars through a local slot (2 new
+    # STL on W17, sites 0x1c260/0x1c550, even/odd unrolled bodies);
+    # variant B's extra 8 regs absorb it, paid for by reduce at 120
+    # (v11-measured 23 residual drain spills, off-ring slack; G4 gates).
+    V15_REGSWAP = int(os.environ.get("DSA_V15_REGSWAP", "1"))
     # Merge the two dQ rounds into one protocol block.  Safe (unlike the
     # condemned dVdK merge): ROUTE_K acquires AND commits both kdq
     # credits upfront, so waiting g0+g1 back-to-back has no producer

@@ -9,7 +9,7 @@ v15 = 性能候选（v12 基础 + 三主杠杆 + 一 rider，全部 env 可 bise
 | 开关 | 默认 | 含义 |
 |---|---|---|
 | `DSA_V15_L2X` | 1 | L2-staged exchange：P/dS 经 8KB pds_stage → HBM 环 → W18 五发 G2S 回填；DSM 发送/count-128 握手/math 槽位停车全拆 |
-| `DSA_V15_REGSWAP` | 2 | 0=v12 寄存器分布；1=变体 B（W16-19 统一 64，reduce 120）；2=变体 C（W16-19 统一 56，gather 40）。全部池精确 61,440 |
+| `DSA_V15_REGSWAP` | **1**（run1 G2 后从 2 改默认） | 0=v12 分布；1=变体 B（W16-19 统一 64，reduce 120）；2=变体 C（W16-19 统一 56，gather 40——已知 56 下 W17 的 ALLTMA 循环有 2 个 STL 轮转位点）。全部池精确 61,440 |
 | `DSA_V15_DQ_MERGE` | 1 | dQ 两 round 并一协议块（kdq 信用本就成对提交，无格死锁） |
 | `DSA_V15_ALLTMA` | 1 | own-half DSM bulk 退役，走纯 TMA 回退路径（run2 实测 DSM 腿慢 1.7×） |
 
@@ -42,12 +42,12 @@ workspace_pds_tensor = to_cute_tensor(workspace_pds)
 ## Stage-0 SASS 门（编译产物，B200 run 之前）
 
 - G0: SMEM ≤ 232,448（struct assert 编译期兜底）。
-- G1: USETMAXREG 按变体核对（C: gather 40 / W16-19 56 / math 128 / reduce 128）。
+- G1: USETMAXREG 按变体核对（默认 B: gather 48 / W16-19 64 / math 128 / reduce 120）。
 - G2: W16/W17/W18 分支零新增 STL/LDL（nvdisasm 分支归因，vm5probe 先例）；
   记录 leader 区 spill 数 vs v12（regswap 的收益指纹）。
 - G3: math 分支 stmatrix m8n8.x4.trans 仍在、零 STS.U16 回退（build assert 兜底）；
   每 tile 恰好 2 条 cp.async.bulk S2G + W18 5 条 G2S。
-- G4（变体 B 时）: reduce 120 的 drain spill ≤ 23（v11 实测残余）。
+- G4（默认 B 生效）: reduce 120 的 drain spill ≤ 23（v11 实测残余基线）。
 
 ## 运行序列
 
