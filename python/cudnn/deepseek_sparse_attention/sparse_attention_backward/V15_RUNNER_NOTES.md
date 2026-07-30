@@ -9,9 +9,9 @@ v15 = 性能候选（v12 基础 + 三主杠杆 + 一 rider，全部 env 可 bise
 | 开关 | 默认 | 含义 |
 |---|---|---|
 | `DSA_V15_L2X` | 1 | L2-staged exchange：P/dS 经 8KB pds_stage → HBM 环 → W18 五发 G2S 回填；DSM 发送/count-128 握手/math 槽位停车全拆 |
-| `DSA_V15_REGSWAP` | **1**（run1 G2 后从 2 改默认） | 0=v12 分布；1=变体 B（W16-19 统一 64，reduce 120）；2=变体 C（W16-19 统一 56，gather 40——已知 56 下 W17 的 ALLTMA 循环有 2 个 STL 轮转位点）。全部池精确 61,440 |
+| `DSA_V15_REGSWAP` | **0**（两轮 G2 后定：warpgroup 分配器非单调，56 出 STL 轮转、64 出 +10 不变量重载——归零回 v12 布局，G2 构造性干净；120 下 reduce 实测 7≤23 留作后续 one-off 依据） | 0=v12 分布；1=变体 B；2=变体 C。全部池精确 61,440 |
 | `DSA_V15_DQ_MERGE` | 1 | dQ 两 round 并一协议块（kdq 信用本就成对提交，无格死锁） |
-| `DSA_V15_ALLTMA` | 1 | own-half DSM bulk 退役，走纯 TMA 回退路径（run2 实测 DSM 腿慢 1.7×） |
+| `DSA_V15_ALLTMA` | **0**（G2 两轮证据：全 TMA 循环多 ~2 个活跃不变量，任何已试预算下都溢出到 W17 的 local——收益本就条件于压缩后 fill 链上环，届时再以 one-off 回归） | own-half DSM bulk 退役开关（run2：DSM 腿慢 1.7×） |
 
 ## 【必读】harness 适配：workspace_pds（仅 L2X=1 需要）
 
@@ -67,3 +67,20 @@ workspace_pds_tensor = to_cute_tensor(workspace_pds)
 - REGSWAP：leader 区 SASS spill 下降 + dVdK_ISSUE 间隙缩短；
 - DQ_MERGE：WAIT_dQ(r1) 提前到 r0 issue 之前；
 - ALLTMA：MAT_QDO 内 own-half 腿的 p90 尾收敛到 TMA 腿水平。
+
+## rev5 起：一条命令（allinone）
+
+```bash
+DSA_STAGE0_CMD="<私有编译 helper>" DSA_RESULTS_ROOT="<harness 结果根>" \
+./benchmark/dsa/allinone/run_allinone.sh --impl v15 \
+    --reference-capture <v12 capture> \
+    --gates benchmark/dsa/allinone/v15_gates.json
+```
+
+stage-0 门 → 一键管线 → ncu（钩子）→ 标准 readout → MANIFEST 原子发布，
+全部一次完成；任何 STOP 自动写 `.FAILED`。门期望全部在
+`benchmark/dsa/allinone/v15_gates.json`（每个新 rev 只改
+TARGET_REVISION/TARGET_SOURCE_SHA256 两行）。**rev5 默认下的 G1 期望**：
+DEALLOC 48 ×2 + TRY_ALLOC 128 ×2；**G2 重规格**：W16/W17 零增量，
+W18 允许 +4 LDL / 0 STL（角色重写，v12 零增量不是正确标尺；rev4 实测
+64 规格下 9 vs 9）。

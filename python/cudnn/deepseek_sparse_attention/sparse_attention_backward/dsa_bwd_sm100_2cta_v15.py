@@ -11420,12 +11420,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     #       (G5 gate watches the v11-measured 23 residual drain spills)
     #   2 = variant C: W16-19 uniform 56, funded by gather 48->40
     # Every variant keeps the pool at exactly 640*96 = 61,440.
-    # Default flipped 2 -> 1 after v15_run1 stage-0 G2: at 56 regs the
-    # ALLTMA fill loop rotates 1-2 scalars through a local slot (2 new
-    # STL on W17, sites 0x1c260/0x1c550, even/odd unrolled bodies);
-    # variant B's extra 8 regs absorb it, paid for by reduce at 120
-    # (v11-measured 23 residual drain spills, off-ring slack; G4 gates).
-    V15_REGSWAP = int(os.environ.get("DSA_V15_REGSWAP", "1"))
+    # Default 2 -> 1 -> 0 across v15_run1 stage-0 G2 rounds: the
+    # warpgroup allocator is NON-MONOTONIC -- at 56 regs W17 rotated 2
+    # scalars through STL/LDL while W16 was clean (1 local access); at
+    # 64 the rotation vanished but W17 parked two loop invariants
+    # (slots 0x84 x9 / 0xb4 x5 reloads across the fill bodies, +10 LDL)
+    # and W16 regressed to 25.  Chasing zero-delta across variants is
+    # whack-a-mole; default 0 keeps the v12 register layout so the G2
+    # contract is clean by construction, and the swap returns as a
+    # data-driven one-off (G4 at 120 measured a healthy 7 <= 23).
+    V15_REGSWAP = int(os.environ.get("DSA_V15_REGSWAP", "0"))
     # Merge the two dQ rounds into one protocol block.  Safe (unlike the
     # condemned dVdK merge): ROUTE_K acquires AND commits both kdq
     # credits upfront, so waiting g0+g1 back-to-back has no producer
@@ -11434,7 +11438,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # L4: retire the own-half DSM bulk (vm5probe run2: DSM legs 1.7x
     # slower mean, 2.25x worse p90 than the L2-hot TMA legs) by taking
     # the pre-existing pure-TMA fallback path below.
-    V15_ALLTMA = os.environ.get("DSA_V15_ALLTMA", "1") != "0"
+    # Default flipped 1 -> 0 after two G2 rounds: the all-TMA fill loop
+    # carries ~2 more live loop invariants than the bulk path at every
+    # warpgroup budget tried (56: STL rotation; 64: +10 parked-invariant
+    # LDL reloads, ~0.3-0.4us/tile on the future-binder warp).  L4's
+    # value is conditional on the fill chain binding POST-compression --
+    # re-enable as a one-off with its own gate waiver once run data
+    # shows that regime.
+    V15_ALLTMA = os.environ.get("DSA_V15_ALLTMA", "0") != "0"
 
     # v4: fill the h==rank gradient panels with one local 16 KiB bulk copy
     # from the (byte-identical) stationary slice instead of a fragmented
