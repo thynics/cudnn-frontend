@@ -146,3 +146,15 @@ nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi --capture-range-end=st
 ncu --profile-from-start off -o dsa_bwd \
   python benchmark_dsa_sparse_attention_backward.py profile --seqlens 8192 --topks 2048
 ```
+
+## B200 管线卡死处置口诀（2026-07-31 实战沉淀）
+
+1. **4h 服务额度到期**（`salloc ... exceeded its time limit` / `SERVICE_OWNER_EXIT rc=143`）：
+   直接原样重跑即可，新服务会冷启动（容器拉取 ~10-15 分钟）。
+2. **重跑后卡在 `B200_MANAGER_LOCK_WAIT` 超过 ~10 分钟**：额度到期的强杀会留下
+   stale `manager.lock`（computelab:/home/scratch.longcheng_gpu/dsa-b200-global-service/）。
+   处置：先 `cat` 锁文件核对持有者 pid 已死，再删除。
+   **注意**：删锁叫不醒已经在等的进程（flock 挂在旧 inode）——必须把卡住的
+   `run_b200_pipeline.sh` 进程一并 kill 掉重投，新进程才能拿到锁。
+3. 观察工具：haifa 上 `ps -eo pid,etime,cmd | grep run_b200_pipeline` 看运行时长；
+   `tail /tmp/dsa-b200-client.*.log` 看卡在哪个阶段（LOCK_WAIT/SERVICE/PHASE）。
