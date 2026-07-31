@@ -12127,8 +12127,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.MATH_WARP_BEGIN,
         )
-        if warp_idx == Int32(self.MATH_WARP_BEGIN):
-            tmem.allocate(self.TMEM_COLUMNS)
+        tmem.allocate(self.TMEM_COLUMNS)
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
