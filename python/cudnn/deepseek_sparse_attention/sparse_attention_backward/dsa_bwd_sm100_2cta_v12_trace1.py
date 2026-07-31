@@ -13245,12 +13245,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
             # executes no pipeline operation at all (FA4 rule).
-            # vm5probe: the purely diagnostic V2_NATIVE_PROVENANCE mark is
-            # retired -- CuTe DSL 4.6.1 hard-caps IKET name registration
-            # below the previously assumed 31 (the 30th registration,
-            # PROBE_GEN, tripped it on hardware).  The provenance
-            # validator is already skipped for this variant per
-            # VM5PROBE_RUNNER_NOTES.md.  Name count: 29.
+            # v12_trace1: the V2_NATIVE_PROVENANCE mark is restored (the
+            # current pipeline venv, cutlass 4.5.0, traced the 31-name
+            # standard v12 set in E1; vm5probe's 29-name cap belonged to
+            # the retired 4.6.1 channel).  Harness prepare requires exactly
+            # one such mark.  Name count: 30.
+            _iket.mark(
+                self.IKET_V2_NATIVE_PROVENANCE,
+                rank,
+            )
             if is_leader_cta:
                 _iket.mark("ROLE_MMA", rank)
                 s_prod = pipeline.make_pipeline_state(
