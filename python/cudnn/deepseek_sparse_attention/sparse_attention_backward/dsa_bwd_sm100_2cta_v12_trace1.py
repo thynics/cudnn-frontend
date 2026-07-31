@@ -12708,10 +12708,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             _iket.mark("ROLE_MATH", rank)
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
             if warp_idx == Int32(self.MATH_WARP_BEGIN):
-                load_stats_token = _iket.range_start(
-                    "LOAD_STATS",
-                    Int32(0),
-                )
                 if tile_count > Int32(0):
                     cute.copy(
                         stats_copy_atom,
@@ -12726,10 +12722,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
-                _iket.range_end(
-                    load_stats_token,
-                    Int32(0),
-                )
             self.math_barrier.arrive_and_wait()
 
             s_state = pipeline.make_pipeline_state(
@@ -13478,10 +13470,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             tma_phase_0 = Int32(0)
             tma_phase_1 = Int32(0)
             if tile_count > Int32(0):
-                load_qdo_token = _iket.range_start(
-                    "LOAD_QDO",
-                    Int32(0),
-                )
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         stationary_tma_mbars,
@@ -13502,10 +13490,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     t_do_gmem[None, rank, 0],
                     t_do_smem[None, 0],
                     tma_bar_ptr=stationary_tma_mbars + 1,
-                )
-                _iket.range_end(
-                    load_qdo_token,
-                    Int32(0),
                 )
                 # Split readiness: S needs only Q, dP needs only dO, so the
                 # leader can issue the first S one TMA earlier.
