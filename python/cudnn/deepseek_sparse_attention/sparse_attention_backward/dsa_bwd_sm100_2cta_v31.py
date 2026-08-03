@@ -11681,6 +11681,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # sources (p_xchg/ds_xchg) are drained; math waits this
                 # phase before overwriting them for the next tile.
                 xchg_read_mbars: cute.struct.MemRange[cutlass.Int64, 1]
+                # v3.1 rev2: dedicated per-tile dQ landing gate.  The
+                # leader commits after the dQ(t) issues (tcgen05-
+                # tracked, cluster-visible); W18 consumes it before the
+                # dS push may overwrite the peer's live image half.
+                # (dq_done itself commits once per QUERY tile -- the
+                # rev1 observe-gate on it deadlocked tile 0.)
+                dq_land_mbars: cute.struct.MemRange[cutlass.Int64, 2]
                 # v3.1 CHASE gates (allocated in both variants; ~24 B
                 # rides the head pad).  chase: leader commits after the
                 # S/dP chunk-0 atoms so the gather tail pass may refill
@@ -12351,12 +12358,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # only in the DBUF struct variant; const_expr keeps this
             # prologue read out of the fallback trace).
             xchg_read_mbar_ptr = storage.xchg_read_mbars.data_ptr()
-            # v3.1: raw view of the dq_done FULL barrier for W18's
-            # observe-only landing gate.  ASSUMPTION (audit item): the
-            # pipeline barrier storage places the full barriers at
-            # offset 0 (the convention the vm5probe completion-edge
-            # probes ran on in hardware).
-            dq_done_full_raw = storage.dq_done_mbars.data_ptr()
         if cutlass.const_expr(self.V19_CHASE):
             # v3.1 CHASE: the gather tail pass arrives here once chunk
             # 3 is filled and fenced; the leader waits it before the
@@ -13108,6 +13109,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 producer_group=leader_group,
                 consumer_group=chase_consumer_group,
                 barrier_storage=storage.chase_mbars.data_ptr(),
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
+        if cutlass.const_expr(self.V19_DBUF):
+            # v3.1 rev2: per-tile dQ landing gate (leader -> W18 lane).
+            # producer_commit sits right after the dQ(t) issues, so the
+            # full flip is dQ(t) MMA hardware completion on both CTAs;
+            # W18 consumes it before issuing the dS push whose landing
+            # overwrites the peer's live image half.
+            dq_land_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                1,
+            )
+            pipe_dq_land = pipeline.PipelineUmmaAsync.create(
+                num_stages=1,
+                producer_group=leader_group,
+                consumer_group=dq_land_consumer_group,
+                barrier_storage=storage.dq_land_mbars.data_ptr(),
                 cta_layout_vmnk=cluster_layout_vmnk,
                 defer_sync=True,
             )
@@ -14549,6 +14568,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         1,
                     )
                     fill3_phase = Int32(0)
+                if cutlass.const_expr(self.V19_DBUF):
+                    dq_land_prod = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Producer,
+                        1,
+                    )
                 if tile_count > Int32(0):
                     _mbarrier_wait_acquire_cluster(
                         stationary_ready_mbar,
@@ -14637,6 +14661,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     loop_iter - Int32(1),
                                 )
                             )
+                        if cutlass.const_expr(self.V19_DBUF):
+                            # rev2 landing gate: tcgen05-tracked commit
+                            # right after the dQ(t-1) issues; W18 must
+                            # see it fire (dQ MMAs complete) before its
+                            # dS push overwrites the peer image half.
+                            pipe_dq_land.producer_acquire(dq_land_prod)
+                            pipe_dq_land.producer_commit(dq_land_prod)
+                            dq_land_prod.advance()
 
                     # v7 reorder (kept): S(t) and dP(t) both issue
                     # BEFORE the previous tile's dVdK block.  dP depends
@@ -14908,6 +14940,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 tile_count - Int32(1),
                             )
                         )
+                    if cutlass.const_expr(self.V19_DBUF):
+                        # rev2 landing gate, TAIL twin.
+                        pipe_dq_land.producer_acquire(dq_land_prod)
+                        pipe_dq_land.producer_commit(dq_land_prod)
+                        dq_land_prod.advance()
                     _mbarrier_wait_acquire_cluster(
                         relay_mbars + 1,
                         relay_phase,
@@ -15023,6 +15060,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     else:
                         pipe_dkv_done.producer_tail(dkv_prod)
                     pipe_dq_done.producer_tail(dq_done_prod)
+                    if cutlass.const_expr(self.V19_DBUF):
+                        pipe_dq_land.producer_tail(dq_land_prod)
                     if cutlass.const_expr(self.V19_CHASE):
                         pipe_chase.producer_tail(chase_prod)
                     _iket.range_end(
@@ -15382,9 +15421,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 landing_phase = Int32(0)
                 ds_ready_phase = Int32(0)
                 p_ready_phase = Int32(0)
-                # v3.1: observe-only phase for the dq_done(t) landing
-                # gate (single-stage pipe: one full flip per tile).
-                dq_obs_phase = Int32(0)
+                if cutlass.const_expr(self.V19_DBUF):
+                    # rev2: consumer state for the per-tile dQ landing
+                    # gate.
+                    dq_land_cons = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer,
+                        1,
+                    )
                 pds_com = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
                     pds_publish_stages,
@@ -15410,21 +15453,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
                     p_ready_phase = Int32(1) - p_ready_phase
                     if cutlass.const_expr(self.V19_DBUF):
-                        # dq_done(t) landing gate: the dS landing now
-                        # overwrites the peer's LIVE ds_image half (the
-                        # aliased block), which dQ(t) reads as its B on
-                        # both CTAs (one cluster GEMM).  The dq_done
-                        # full flip is tcgen05-commit tracked and
-                        # cluster-visible, so one observe-only wait
-                        # covers both CTAs' reads.  FATAL-1 anti-cycle:
-                        # the pds_dS EARLY commit above already fed the
-                        # leader's dQ(t), so waiting dq_done(t) here
-                        # cannot deadlock.
-                        cute.arch.mbarrier_wait(
-                            dq_done_full_raw,
-                            dq_obs_phase,
-                        )
-                        dq_obs_phase = Int32(1) - dq_obs_phase
+                        # dQ(t) landing gate (rev2, dedicated pipe):
+                        # the dS landing overwrites the peer's LIVE
+                        # ds_image half (the aliased block), which
+                        # dQ(t) reads as its B on both CTAs (one
+                        # cluster GEMM).  The dq_land full flip is
+                        # tcgen05-commit tracked right after the dQ(t)
+                        # issues, so it certifies both CTAs' reads.
+                        # FATAL-1 anti-cycle: the pds_dS EARLY commit
+                        # above already fed the leader's dQ(t), so
+                        # waiting here cannot deadlock.
+                        pipe_dq_land.consumer_wait(dq_land_cons)
+                        pipe_dq_land.consumer_release(dq_land_cons)
+                        dq_land_cons.advance()
                     route_p_token = _iket.range_start(
                         "ROUTE_P(i)",
                         loop_iter,
