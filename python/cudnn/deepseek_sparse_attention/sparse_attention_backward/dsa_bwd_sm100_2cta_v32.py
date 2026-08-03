@@ -14637,17 +14637,33 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
         wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
         t_dkv_core = t_dkv_slot[(None, None), 0, 0]
+        # The M64-interleaved UMMA_2SM fragment core is
+        # (m64,(n64,h2)):(1,(128,64)) -- logical, with the D-half h
+        # folded onto DP rows 64..127.  make_tmem_copy needs the
+        # PHYSICAL (DP, col) congruence, so regroup to
+        # ((m64,h2),n64):((1,64),128): DP = kv + 64*Dhalf, col = n.
+        assert t_dkv_core.layout == cute.make_layout(
+            (self.N_TILE, (self.N_TILE, 2)),
+            stride=(1, (2 * self.N_TILE, self.N_TILE)),
+        ), str(t_dkv_core.layout)
+        t_dkv_phys = cute.make_tensor(
+            t_dkv_core.iterator,
+            cute.make_layout(
+                ((self.N_TILE, 2), self.N_TILE),
+                stride=((1, self.N_TILE), 2 * self.N_TILE),
+            ),
+        )
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
             self.acc_dtype,
         )
         tiled_t2r = tcgen05.make_tmem_copy(
             tmem_load_atom,
-            t_dkv_core,
+            t_dkv_phys,
         )
         thread_t2r = tiled_t2r.get_slice(dp_idx)
         c_dkv = cute.make_identity_tensor(
-            (2 * self.N_TILE, self.N_TILE)
+            ((self.N_TILE, 2), self.N_TILE)
         )
         thread_coordinates = self.split_wg(
             thread_t2r.partition_D(c_dkv),
@@ -14655,7 +14671,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             wg_idx,
         )
         thread_source = self.split_wg(
-            thread_t2r.partition_S(t_dkv_core),
+            thread_t2r.partition_S(t_dkv_phys),
             2,
             wg_idx,
         )
@@ -14664,15 +14680,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.acc_dtype,
         )
 
-        # Single per-thread gather row: kv = dp % 64 under the M64
-        # interleaved fold; the block's rows are this CTA's own kv-half
-        # of the 128-token bundle.
+        # Single per-thread gather row: coordinate mode [0,0] is the kv
+        # row of the fold (DP % 64); the block's rows are this CTA's
+        # own kv-half of the 128-token bundle.
         local_kv = Int32(
             cute.get(
                 thread_coordinates[0],
-                mode=[0],
+                mode=[0, 0],
             )
-        ) % Int32(2 * self.N_TILE_CTA)
+        )
         global_row = (
             tile_index * Int32(2 * self.N_TILE)
             + rank * Int32(2 * self.N_TILE_CTA)
@@ -14709,21 +14725,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             rdkv_frg[0] = thread_values[v0]
             rdkv_frg[1] = thread_values[v1]
             if kv_index >= Int32(0):
-                # D within the block = 64 * (dp // 64) + n; the block's
-                # GMEM quadrant is d_round.
+                # D within the block = 64 * h(fold half, mode [0,1])
+                # + n (mode [1]); the block's GMEM quadrant is d_round.
                 d_local = Int32(
                     cute.get(
                         thread_coordinates[v0],
                         mode=[1],
                     )
-                ) + (
-                    Int32(
-                        cute.get(
-                            thread_coordinates[v0],
-                            mode=[0],
-                        )
+                ) + Int32(
+                    cute.get(
+                        thread_coordinates[v0],
+                        mode=[0, 1],
                     )
-                    // Int32(2 * self.N_TILE_CTA)
                 ) * Int32(2 * self.N_TILE_CTA)
                 dkv_row = mdKV_acc[
                     None,
