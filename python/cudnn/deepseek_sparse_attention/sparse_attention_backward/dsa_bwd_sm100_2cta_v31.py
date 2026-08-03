@@ -57,7 +57,9 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 # per variant, so import-time capture is the established contract).
 # Host-side constants only: every staged-code use must go through class
 # attrs under cutlass.const_expr (DSL lesson #4).
-DSA_V19_CHASE = os.environ.get("DSA_V19_CHASE", "1") == "1"
+# BISECT-A state: the harness runs remotely (env does not propagate),
+# so the bisect runs flip these DEFAULTS per revision.
+DSA_V19_CHASE = os.environ.get("DSA_V19_CHASE", "0") == "1"
 DSA_V19_DBUF = os.environ.get("DSA_V19_DBUF", "1") == "1"
 
 
