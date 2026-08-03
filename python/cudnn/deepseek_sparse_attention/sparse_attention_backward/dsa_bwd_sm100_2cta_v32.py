@@ -443,20 +443,44 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         # CTA's N-half heads of h-chunk c, H[c*64+rank*32 : +32), land in
         # panel stage c), keeping every round-gen chunk window a single
         # contiguous box.  v0 keeps the one 64-row box.
-        stationary_tiler = (
-            self.STATIONARY_TILE_H,
-            self.N_TILE,
-            self.D_HEAD,
-        )
-        stationary_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.element_dtype,
-            self.element_dtype,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            self.acc_dtype,
-            cg1,
-            stationary_tiler[:2],
-        )
+        if cutlass.const_expr(self.SCORE_A_IS_STATIONARY):
+            # v0/v17a: the panel is the score-A operand; the helper MMA
+            # carries the box on its M-mode (64, legal).
+            stationary_tiler = (
+                self.STATIONARY_TILE_H,
+                self.N_TILE,
+                self.D_HEAD,
+            )
+            stationary_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+                self.element_dtype,
+                self.element_dtype,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                self.acc_dtype,
+                cg1,
+                stationary_tiler[:2],
+            )
+        else:
+            # v3.2: the panel is the (zero-copy) score-B operand and its
+            # box is 32 rows.  MmaF16BF16Op forbids M=32, so the helper
+            # MMA carries the box on its N-mode instead ((M=64, N=32) is
+            # legal; the M-mode is a dummy -- only the B fraction of
+            # this MMA is ever used, for the panel SMEM layout, the Q/dO
+            # TMA atoms, and the kernel-side partition_B).
+            stationary_tiler = (
+                self.H_TILE_CTA,
+                self.STATIONARY_TILE_H,
+                self.D_HEAD,
+            )
+            stationary_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+                self.element_dtype,
+                self.element_dtype,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                self.acc_dtype,
+                cg1,
+                stationary_tiler[:2],
+            )
         score_tiler = (self.H_TILE_CLUSTER, self.N_TILE, self.K_CHUNK)
         dkv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
@@ -515,12 +539,22 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             self.element_dtype,
             self.SCORE_A_STAGES,
         )
-        stationary_a_layout_staged = sm100_utils.make_smem_layout_a(
-            stationary_tiled_mma,
-            stationary_tiler,
-            self.element_dtype,
-            self.STATIONARY_STAGES,
-        )
+        if cutlass.const_expr(self.SCORE_A_IS_STATIONARY):
+            stationary_a_layout_staged = sm100_utils.make_smem_layout_a(
+                stationary_tiled_mma,
+                stationary_tiler,
+                self.element_dtype,
+                self.STATIONARY_STAGES,
+            )
+        else:
+            # v3.2: B-operand derivation of the same [32 x D512] K-major
+            # SW128B box (the panel IS score-B; see the helper-MMA note).
+            stationary_a_layout_staged = sm100_utils.make_smem_layout_b(
+                stationary_tiled_mma,
+                stationary_tiler,
+                self.element_dtype,
+                self.STATIONARY_STAGES,
+            )
         score_b_layout_staged = sm100_utils.make_smem_layout_b(
             score_tiled_mma,
             score_tiler,
@@ -604,9 +638,17 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         else:
             # v3.2: score B is the zero-copy panel view instead; the
             # swizzle-atom compatibility obligation moves to score B.
-            # V32-TODO(audit): host-probe stationary_a.inner against
-            # score_b.inner once the trace harness runs; SW128B on both
-            # sides is expected but unverified without a GPU.
+            # The atom identity is checked here (compile-time, static
+            # layouts); the intra-stage block ORDER identity (panel
+            # [32 x 512] == 8 contiguous [32 x 64] score-B stages) is
+            # what the correctness gate adjudicates on hardware.
+            assert (
+                stationary_a_layout_staged.inner
+                == score_b_layout_staged.inner
+            ), (
+                str(stationary_a_layout_staged.inner),
+                str(score_b_layout_staged.inner),
+            )
             assert cute.cosize(stationary_a_layout_staged) >= cute.cosize(
                 score_b_layout_staged
             )
@@ -635,20 +677,38 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(
             tcgen05.CtaGroup.ONE
         )
-        tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mQ,
-            stationary_a_layout,
-            stationary_tiler,
-            stationary_tiled_mma,
-        )
-        tma_atom_do, tma_tensor_do = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mdO,
-            stationary_a_layout,
-            stationary_tiler,
-            stationary_tiled_mma,
-        )
+        if cutlass.const_expr(self.SCORE_A_IS_STATIONARY):
+            tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mQ,
+                stationary_a_layout,
+                stationary_tiler,
+                stationary_tiled_mma,
+            )
+            tma_atom_do, tma_tensor_do = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mdO,
+                stationary_a_layout,
+                stationary_tiler,
+                stationary_tiled_mma,
+            )
+        else:
+            # v3.2: the B gmem convention is (N, K) = (H rows, D), which
+            # is exactly the natural mQ/mdO view -- no re-view needed.
+            tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mQ,
+                stationary_a_layout,
+                stationary_tiler,
+                stationary_tiled_mma,
+            )
+            tma_atom_do, tma_tensor_do = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mdO,
+                stationary_a_layout,
+                stationary_tiler,
+                stationary_tiled_mma,
+            )
         score_a_stage_bytes = cute.size_in_bytes(
             self.element_dtype,
             score_a_layout,
@@ -12623,25 +12683,36 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             softmax_stats[None, 1]
         )
 
+        # v3.2: the panel boxes are STATIONARY_TILE_H(32)-row B-operand
+        # tiles (the TMA coordinates 2c + rank walk FOUR 32-row gmem
+        # H-tiles), partitioned through the helper MMA's B fraction.
         g_q = cute.local_tile(
             tma_tensor_q,
             cute.select(
-                (self.H_TILE_CTA, self.N_TILE, self.D_HEAD),
-                mode=[0, 2],
+                (
+                    self.H_TILE_CTA,
+                    self.STATIONARY_TILE_H,
+                    self.D_HEAD,
+                ),
+                mode=[1, 2],
             ),
             (None, None, (token_idx, batch_idx)),
         )
         g_do = cute.local_tile(
             tma_tensor_do,
             cute.select(
-                (self.H_TILE_CTA, self.N_TILE, self.D_HEAD),
-                mode=[0, 2],
+                (
+                    self.H_TILE_CTA,
+                    self.STATIONARY_TILE_H,
+                    self.D_HEAD,
+                ),
+                mode=[1, 2],
             ),
             (None, None, (token_idx, batch_idx)),
         )
         stationary_thr_mma = stationary_tiled_mma.get_slice(0)
-        rank_g_q = stationary_thr_mma.partition_A(g_q)
-        rank_g_do = stationary_thr_mma.partition_A(g_do)
+        rank_g_q = stationary_thr_mma.partition_B(g_q)
+        rank_g_do = stationary_thr_mma.partition_B(g_do)
         t_q_smem, t_q_gmem = cpasync.tma_partition(
             tma_atom_q,
             0,
