@@ -13913,26 +13913,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 for loop_iter in cutlass.range(tile_count):
                     dqb_parity = loop_iter & Int32(1)
 
-                    self._issue_score_pieces_v32(
-                        score_tiled_mma,
-                        dp_tiled_mma,
-                        t_score,
-                        t_score_pp,
-                        t_dp,
-                        t_dp_pp,
-                        score_k_fragment,
-                        dp_k_fragment,
-                        score_q_fragments[0],
-                        score_q_fragments[1],
-                        score_do_fragments[0],
-                        score_do_fragments[1],
-                        pipe_kscore,
-                        kscore_cons,
-                        pipe_s_done,
-                        s_prod,
-                        pipe_dp_done,
-                        dp_prod,
-                        loop_iter,
+                    # The @cute.jit boundary re-materializes state
+                    # arguments: the helper's advances must come back
+                    # through the return (rev3 dominance failure).
+                    kscore_cons, s_prod, dp_prod = (
+                        self._issue_score_pieces_v32(
+                            score_tiled_mma,
+                            dp_tiled_mma,
+                            t_score,
+                            t_score_pp,
+                            t_dp,
+                            t_dp_pp,
+                            score_k_fragment,
+                            dp_k_fragment,
+                            score_q_fragments[0],
+                            score_q_fragments[1],
+                            score_do_fragments[0],
+                            score_do_fragments[1],
+                            pipe_kscore,
+                            kscore_cons,
+                            pipe_s_done,
+                            s_prod,
+                            pipe_dp_done,
+                            dp_prod,
+                            loop_iter,
+                        )
                     )
 
                     # (2) G5 D-round 0: gated per wave on the mb_dqb[w]
@@ -14434,8 +14439,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         S^T/dP^T chunk accumulators are done-pipeline stages (stage ==
         h-chunk); both stages of both pipelines are acquired up front
         (piece 0 touches all four accumulators) and committed after the
-        last piece.  Returns nothing; the caller advances the pipeline
-        states it owns (they are advanced here in place).
+        last piece.  RETURNS the advanced (kscore, s, dp) states -- the
+        @cute.jit boundary re-materializes argument states, so in-place
+        advances do NOT propagate to the caller (the rev3 MLIR
+        dominance failure; _drain_dkv_block_v32 return precedent).
         """
 
         # Both chunk stages of both done-pipelines are written from
@@ -14515,6 +14522,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dp_producer_state.advance()
         dp_done_pipeline.producer_commit(dp_state_c1)
         dp_producer_state.advance()
+        return (
+            kscore_consumer_state,
+            s_producer_state,
+            dp_producer_state,
+        )
 
     @cute.jit
     def _issue_dkv_round_v32(
