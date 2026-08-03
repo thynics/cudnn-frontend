@@ -505,7 +505,10 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         # tile halves to [H64, D128] and the epilogue runs 2 waves per
         # round.  getattr: this host builder is shared with the dormant
         # bring-up classes, which do not define the v3.1 knobs.
-        if getattr(self, "V19_CHASE", False):
+        # const_expr: this builder runs inside the DSL-preprocessed
+        # __call__, where a bare if is a staged branch and assignments
+        # do not escape it (run-1 UnboundLocalError).
+        if cutlass.const_expr(getattr(self, "V19_CHASE", False)):
             dq_epi_tile = (
                 self.H_TILE_CTA,
                 self.D_TILE_CTA,
@@ -529,7 +532,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             self.element_dtype,
             dq_epi_layout_staged,
         )
-        if getattr(self, "V19_CHASE", False):
+        if cutlass.const_expr(getattr(self, "V19_CHASE", False)):
             assert dq_epi_bytes <= 16 * 1024, dq_epi_bytes
         else:
             assert dq_epi_bytes <= 32 * 1024
