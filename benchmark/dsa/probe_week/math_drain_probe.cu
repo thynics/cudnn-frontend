@@ -119,7 +119,9 @@ static void report_math(const char* name, long long cyc, int elems, int iters, i
 int main(int argc, char** argv){
   int iters = 64;
   cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0));
-  ghz = prop.clockRate / 1e6f;
+  int khz = 0;
+  cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0);   // removed from struct in CUDA 13
+  ghz = khz > 0 ? khz / 1e6f : 1.86f;
   printf("device=%s SMs=%d clock=%.2fGHz\n", prop.name, prop.multiProcessorCount, ghz);
 
   // ---------------- Part 1: math chain ----------------
