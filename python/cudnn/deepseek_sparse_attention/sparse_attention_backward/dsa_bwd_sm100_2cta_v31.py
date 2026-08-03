@@ -57,12 +57,8 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 # per variant, so import-time capture is the established contract).
 # Host-side constants only: every staged-code use must go through class
 # attrs under cutlass.const_expr (DSL lesson #4).
-# BISECT-B state: CHASE only.  (Bisect-A proved DBUF-only is
-# structurally over the SMEM cap -- CHASE's 8,192 B funds the DBUF
-# doubling, per the approved plan -- so the informative legs are
-# CHASE-only and both-on.)
 DSA_V19_CHASE = os.environ.get("DSA_V19_CHASE", "1") == "1"
-DSA_V19_DBUF = os.environ.get("DSA_V19_DBUF", "0") == "1"
+DSA_V19_DBUF = os.environ.get("DSA_V19_DBUF", "1") == "1"
 
 
 class _IketProxy:
@@ -12411,6 +12407,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 score_b_layout_staged,
                 mode=[0, 1, 2],
             )
+            # Byte-identity backing for the manual slot offsets: the
+            # staged layout must pack its stages at exactly one stage
+            # cosize apart (no engine padding), or the recast views
+            # below would diverge from k_n[..., c] (audit item).
+            assert (
+                cute.cosize(score_b_layout_staged)
+                == self.K_CHUNKS
+                * cute.cosize(score_b_stage_layout)
+            )
+            assert (
+                cute.cosize(score_b_stage_layout)
+                == self.SCORE_STAGE_ELEMENTS
+            )
             k_chunk_0 = cute.make_tensor(
                 cute.recast_ptr(
                     score_kv_raw,
@@ -13104,9 +13113,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # chunk-0 atoms (tcgen05-tracked); one gather lane consumes
             # and broadcasts through gather_barrier before the tail
             # pass refills slot 0.
+            # Consumer count MUST carry the atom_thr_size factor: on a
+            # cluster pipeline BOTH CTAs' consumer lanes release, and
+            # the empties land on the leading CTA -- count 1 flips the
+            # phase twice per tile and desyncs the producer (audit
+            # fatal; the run-2/3 dense deadlock).
             chase_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                1,
+                atom_thr_size,
             )
             pipe_chase = pipeline.PipelineUmmaAsync.create(
                 num_stages=1,
@@ -13122,9 +13136,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # full flip is dQ(t) MMA hardware completion on both CTAs;
             # W18 consumes it before issuing the dS push whose landing
             # overwrites the peer's live image half.
+            # Same atom_thr_size rule as chase_consumer_group above
+            # (both CTAs' W18 lanes release).
             dq_land_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                1,
+                atom_thr_size,
             )
             pipe_dq_land = pipeline.PipelineUmmaAsync.create(
                 num_stages=1,
@@ -13160,9 +13176,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # read-completion of both outbound push sources.
                 cute.arch.mbarrier_init(xchg_read_mbar_ptr, 1)
             if cutlass.const_expr(self.V19_CHASE):
-                # One gather lane arrives once per tile after the
-                # fenced chunk-3 tail fill.
-                cute.arch.mbarrier_init(fill3_ready_mbar_ptr, 1)
+                # Cross-CTA chunk-3 gate (relay_mbars precedent): BOTH
+                # CTAs' gather lanes arrive at the leading CTA, count
+                # 2; the S3/dP3 CG2 GEMMs read BOTH CTAs' slot 0, so a
+                # CTA-local gate would race rank 1's tail fill (audit
+                # fatal).
+                cute.arch.mbarrier_init(fill3_ready_mbar_ptr, 2)
             _store_shared_seq_v4(khot_seq, Int32(0))
         cute.arch.fence_view_async_shared()
         self.cta_barrier.arrive_and_wait()
@@ -13399,9 +13418,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         cute.arch.fence_view_async_shared()
                         self.gather_barrier.arrive_and_wait()
                         if tidx == Int32(0):
+                            # Remote arrive at the leading CTA (cross-
+                            # CTA gate, relay precedent).
                             cute.arch.mbarrier_arrive(
                                 fill3_ready_mbar_ptr,
-                                rank,
+                                Int32(0),
                             )
                             pipe_chase.consumer_release(chase_cons)
                         chase_cons.advance()
@@ -13502,7 +13523,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     if tidx == Int32(0):
                         cute.arch.mbarrier_arrive(
                             fill3_ready_mbar_ptr,
-                            rank,
+                            Int32(0),
                         )
                         pipe_chase.consumer_release(chase_cons)
                     chase_cons.advance()
@@ -15746,6 +15767,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
+    @cute.jit
     def _issue_score_pair_chunks_v31(
         self,
         score_tiled_mma: cute.TiledMma,
@@ -15818,7 +15840,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 s_c2[None, None, k_block],
                 acc_s,
             )
-        cute.arch.mbarrier_wait(fill3_mbar, fill3_phase)
+        # Cluster wait on the leading CTA's cross-CTA fill3 gate (both
+        # ranks' tail fills must have landed before the chunk-3 atoms).
+        _mbarrier_wait_acquire_cluster(fill3_mbar, fill3_phase)
         for k_block in cutlass.range(0, k_blocks_per_chunk, unroll=4):
             cute.gemm(
                 mma_s,
