@@ -57,10 +57,12 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 # per variant, so import-time capture is the established contract).
 # Host-side constants only: every staged-code use must go through class
 # attrs under cutlass.const_expr (DSL lesson #4).
-# BISECT-A state: the harness runs remotely (env does not propagate),
-# so the bisect runs flip these DEFAULTS per revision.
-DSA_V19_CHASE = os.environ.get("DSA_V19_CHASE", "0") == "1"
-DSA_V19_DBUF = os.environ.get("DSA_V19_DBUF", "1") == "1"
+# BISECT-B state: CHASE only.  (Bisect-A proved DBUF-only is
+# structurally over the SMEM cap -- CHASE's 8,192 B funds the DBUF
+# doubling, per the approved plan -- so the informative legs are
+# CHASE-only and both-on.)
+DSA_V19_CHASE = os.environ.get("DSA_V19_CHASE", "1") == "1"
+DSA_V19_DBUF = os.environ.get("DSA_V19_DBUF", "0") == "1"
 
 
 class _IketProxy:
