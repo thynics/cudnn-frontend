@@ -22,10 +22,10 @@
 输出: 稳态 bundle 时长/2 = per-64kv period, 每 squad backlog 峰值, 空闲率, 绑定门统计.
 """
 
-LEDGERS = {
-    "opt":  dict(exp=9.0,  t2r=4.8, pub=12.0, stats=0.7, drain_slot=3.6),
-    "mid":  dict(exp=14.0, t2r=4.8, pub=12.8, stats=0.7, drain_slot=4.7),
-    "cons": dict(exp=19.0, t2r=4.8, pub=13.6, stats=1.2, drain_slot=6.2),
+LEDGERS = {  # R14 校准 (2026-08-03 mixed_residency 实测): exp x1.27, pub 相位错开残余, REDG 4w 饱和
+    "opt":  dict(exp=11.4, t2r=4.8, pub=13.8, stats=0.7, drain_slot=1.04),  # REDG 通道 4ns/instr = v12 实核锚(0.26µs/槽)
+    "mid":  dict(exp=14.0, t2r=4.8, pub=16.0, stats=0.7, drain_slot=1.8),   # 7ns/instr (0.45µs/槽)
+    "cons": dict(exp=17.8, t2r=4.8, pub=22.0, stats=1.2, drain_slot=2.6),   # 10ns/instr 探针天真循环锚(0.65µs/槽)+pub x1.6
 }
 SUPPLY_WALL_64KV = (2.3, 2.9)     # per-64kv
 MMA_BUNDLE = 3.38                  # µs busy per bundle
@@ -36,7 +36,8 @@ def simulate(led, supply_64kv, verbose=False):
     # per-chunk math items (half of bundle math each):
     p_item  = (led["exp"] * 0.55 + led["t2r"] * 0.5 + led["pub"] * 0.45 + led["stats"] * 0.5) / 2
     ds_item = (led["exp"] * 0.45 + led["t2r"] * 0.5 + led["pub"] * 0.55 + led["stats"] * 0.5) / 2
-    drain_item = led["drain_slot"]
+    drain_t2r = 0.35                       # T2R 波切, squad 并行段
+    drain_redg = led["drain_slot"]         # REDG 段, 全 SM 单通道(4w 饱和)
     # squad state: next free time
     squad_free = [0.0, 0.0, 0.0]
     backlog_peak = [0.0, 0.0, 0.0]
@@ -44,6 +45,7 @@ def simulate(led, supply_64kv, verbose=False):
     gate_stall = {"CG_P0": 0.0, "CG_P1": 0.0, "CG_dS": 0.0, "dkv": 0.0, "floor": 0.0}
     t = 0.0
     prev_end = 0.0
+    simulate._chan = 0.0
     prev_drain_done = {}   # (grad, r) -> completion time of bundle b-1 drains
     periods = []
     for b in range(N_BUNDLES):
@@ -77,13 +79,17 @@ def simulate(led, supply_64kv, verbose=False):
         t_shift += s2
         # --- drains: dV r0..3 -> dlead, dK r0..3 -> c0-squad ---
         dkv_slip = 0.0
+        redg_chan = getattr(simulate, "_chan", 0.0)          # 全 SM REDG 通道空闲时刻
         for grad, squad in (("dV", dl), ("dK", c0)):
             for r in range(4):
                 avail = t_b + t_shift + 1.0 + r * 0.9        # leader commit of round r
                 est = max(avail, squad_free[squad])
-                done = est + drain_item / 4.0
+                t2r_done = est + drain_t2r
+                redg_start = max(t2r_done, redg_chan)
+                done = redg_start + drain_redg / 4.0
+                redg_chan = done
                 squad_free[squad] = done
-                busy_acc[squad] += drain_item / 4.0
+                busy_acc[squad] += drain_t2r + drain_redg / 4.0
                 # slot needed again at round r+2 (same bundle) or next bundle r-2
                 if r < 2:
                     need = t_b + t_shift + 1.0 + (r + 2) * 0.9
@@ -99,6 +105,7 @@ def simulate(led, supply_64kv, verbose=False):
         # (handled implicitly: if squad_free pushed them late, dkv_slip via next iteration's avail)
         gate_stall["dkv"] += dkv_slip
         t_shift += dkv_slip
+        simulate._chan = redg_chan
         # --- bundle floor: MMA + bubbles, supply, protocol ---
         floor = max(MMA_BUNDLE + BUBBLES, 2.0 * supply_64kv)
         end = max(t_b + t_shift + floor, ds1_done, t_b + t_shift + 2.2 + 0.9)
