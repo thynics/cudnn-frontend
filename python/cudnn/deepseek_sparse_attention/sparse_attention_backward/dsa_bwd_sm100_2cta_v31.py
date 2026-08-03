@@ -14778,20 +14778,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     kscore_cons.advance()
 
                     if has_prev:
-                        # v18a (E3): the ROUTE_dS(t-1) landing wait
-                        # moved here from the head helper's pass-2
-                        # position -- it must precede the pds_dS
-                        # release so the release proves BOTH dQ(t-1)
-                        # completion (tcgen05 commit tracking) and the
-                        # ROUTE_dS(t-1) source read (landing == full
-                        # transfer done): the two WAR reader legs of
-                        # math(t)'s early dS-image store.  Program
-                        # order keeps it ahead of the dVdK dS passes
-                        # below, preserving their peer-landing gate.
-                        _mbarrier_wait_acquire_cluster(
-                            relay_mbars + 1,
-                            relay_phase,
-                        )
+                        if cutlass.const_expr(not self.V19_DBUF):
+                            # v18a (E3): the ROUTE_dS(t-1) landing wait
+                            # must precede the pds_dS release here: the
+                            # release certifies the ROUTE_dS source
+                            # read (the live image half) for math(t)'s
+                            # early store.
+                            _mbarrier_wait_acquire_cluster(
+                                relay_mbars + 1,
+                                relay_phase,
+                            )
+                        # rev5 (DBUF): the wait sinks into the grads
+                        # block at the first dS consumer (FATAL-2's
+                        # proper form) -- ROUTE_dS now sources the
+                        # ds_xchg staging (P1b inverted) and math's
+                        # image WAR is certified by the depth-2 pds
+                        # acquire, so this release certifies only
+                        # dQ(t-1) completion (tcgen05-tracked).
                         pipe_pds_ds.consumer_release(pds_ds_cons)
                         pds_ds_cons.advance()
 
@@ -14970,10 +14973,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         pipe_dq_land.producer_acquire(dq_land_prod)
                         pipe_dq_land.producer_commit(dq_land_prod)
                         dq_land_prod.advance()
-                    _mbarrier_wait_acquire_cluster(
-                        relay_mbars + 1,
-                        relay_phase,
-                    )
+                    if cutlass.const_expr(not self.V19_DBUF):
+                        _mbarrier_wait_acquire_cluster(
+                            relay_mbars + 1,
+                            relay_phase,
+                        )
                     pipe_pds_ds.consumer_release(pds_ds_cons)
                     pds_ds_cons.advance()
                     if cutlass.const_expr(self.V19_DBUF):
@@ -15839,17 +15843,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 s_c2[None, None, k_block],
                 acc_s,
             )
-        # Cluster wait on the leading CTA's cross-CTA fill3 gate (both
-        # ranks' tail fills must have landed before the chunk-3 atoms).
-        _mbarrier_wait_acquire_cluster(fill3_mbar, fill3_phase)
-        for k_block in cutlass.range(0, k_blocks_per_chunk, unroll=4):
-            cute.gemm(
-                mma_s,
-                acc_s,
-                score_q_fragment[None, None, k_block, 3],
-                s_c3[None, None, k_block],
-                acc_s,
-            )
+        # rev5: dP1/dP2 issue BEFORE the fill3 wait -- issuing is ns,
+        # execution is us, so the masking window ahead of the wait must
+        # hold real work (S1,S2,dP1,dP2 = 32 atoms ~1.0-1.3us of exec
+        # vs the ~0.8-1.2us chase round trip).  rev4 waited after only
+        # S1,S2 and stalled the leader nearly a full round trip per
+        # tile (the 13.35 ms regression's main term).
         for k_block in cutlass.range(0, k_blocks_per_chunk, unroll=4):
             cute.gemm(
                 mma_dp,
@@ -15865,6 +15864,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 score_do_fragment[None, None, k_block, 2],
                 dp_c2[None, None, k_block],
                 acc_dp,
+            )
+        # Cluster wait on the leading CTA's cross-CTA fill3 gate (both
+        # ranks' tail fills must have landed before the chunk-3 atoms).
+        _mbarrier_wait_acquire_cluster(fill3_mbar, fill3_phase)
+        for k_block in cutlass.range(0, k_blocks_per_chunk, unroll=4):
+            cute.gemm(
+                mma_s,
+                acc_s,
+                score_q_fragment[None, None, k_block, 3],
+                s_c3[None, None, k_block],
+                acc_s,
             )
         for k_block in cutlass.range(0, k_blocks_per_chunk, unroll=4):
             cute.gemm(
@@ -16410,9 +16420,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
 
-        # --- dK half, slot 0.  The dS landing (relay + 1) was waited
-        # by the leader body before releasing pds_dS, which precedes
-        # this call in program order: the dS passes stay covered.
+        # --- dK half, slot 0.  rev5 (FATAL-2 proper form): the dS
+        # landing wait sits HERE, at the first dS consumer (global
+        # pass 5), masked by the four dV passes above.  Safe: math's
+        # WAR on the parity image is certified by the depth-2 pds
+        # acquire (grads(t-2) drained), and ROUTE_dS sources the xchg
+        # staging, so no release upstream depends on this landing.
+        _mbarrier_wait_acquire_cluster(
+            relay_mbars + 1,
+            relay_phase,
+        )
         round_pipeline.consumer_wait(round_consumer_state)
         dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
