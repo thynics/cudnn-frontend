@@ -14,6 +14,16 @@ for arch in sm_100a sm_100 sm_90a; do
 done
 if [[ -n "${built}" ]]; then "${out}"; else echo "PART1_BUILD_FAILED"; cat /tmp/nvcc_err.log; fi
 
+echo "=== PART1b: drain channel (kernel-grade REDG shape) ==="
+out2=/tmp/drain_channel_probe
+b2=""
+for arch in sm_100a sm_100 sm_90a; do
+  if nvcc -O3 -arch=${arch} -o "${out2}" "${here}/drain_channel_probe.cu" 2>/tmp/nvcc_err2.log; then
+    echo "PROBE_BUILD arch=${arch}"; b2=1; break
+  fi
+done
+if [[ -n "${b2}" ]]; then "${out2}"; else echo "PART1B_BUILD_FAILED"; cat /tmp/nvcc_err2.log; fi
+
 echo "=== PART2: cluster-DSM mbar semantics ==="
 if [[ -f "${here}/dsm_cluster_probe.py" ]]; then
   /home/scratch.longcheng_gpu/cudnn-frontend/.venv/bin/python "${here}/dsm_cluster_probe.py" || echo "PART2_FAILED rc=$?"
