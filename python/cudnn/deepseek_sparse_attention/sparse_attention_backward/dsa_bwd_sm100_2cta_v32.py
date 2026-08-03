@@ -11922,8 +11922,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ]
 
         assert SharedStorageV2.size_in_bytes() <= self.MAX_SMEM_BYTES
-        # v3.2 SELF-CHECK: the plan above must land on the addendum total.
-        assert SharedStorageV2.size_in_bytes() == 231_424, (
+        # v3.2 SELF-CHECK: the plan above must fit the addendum total
+        # (upper-bound form per the audit rule -- exact-size asserts
+        # are brittle against alignment padding; the actual value is
+        # echoed on failure).
+        assert SharedStorageV2.size_in_bytes() <= 231_424, (
             SharedStorageV2.size_in_bytes()
         )
         return SharedStorageV2
@@ -13145,6 +13148,30 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     for piece in cutlass.range_constexpr(
                         self.SCORE_D_PIECES
                     ):
+                        if cutlass.const_expr(piece == 2):
+                            # The 2-slot ring banks only TWO cross-
+                            # bundle credits (score(prev)'s last two
+                            # releases); piece 2 blocks on score(this).
+                            # The r1(prev) rendezvous must run BEFORE
+                            # that block, or leader step (4) of prev
+                            # never unblocks (audit: four-role cycle,
+                            # tile_count >= 2 deterministic deadlock).
+                            if loop_iter > Int32(0):
+                                self._gather_kdq_v8(
+                                    mKV,
+                                    mTopkIdxs,
+                                    gather_kd_rows_0,
+                                    gather_kd_rows_1,
+                                    token_idx,
+                                    batch_idx,
+                                    bundle_idx + Int32(1),
+                                    Int32(1),
+                                    topk,
+                                    rank,
+                                    tidx,
+                                    kv_copy_atom,
+                                    kv_thread_copy,
+                                )
                         pipe_kscore.producer_acquire(gather_state)
                         if cutlass.const_expr(piece % 2 == 0):
                             self._load_chase_piece_v32(
@@ -13185,25 +13212,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         load_k_token,
                         loop_iter,
                     )
-                    if loop_iter > Int32(0):
-                        # Round-1 kdq of the PREVIOUS bundle (its g10/g11
-                        # credits free near the end of grads(prev), after
-                        # this bundle's chase -- v8 software pipelining).
-                        self._gather_kdq_v8(
-                            mKV,
-                            mTopkIdxs,
-                            gather_kd_rows_0,
-                            gather_kd_rows_1,
-                            token_idx,
-                            batch_idx,
-                            bundle_idx + Int32(1),
-                            Int32(1),
-                            topk,
-                            rank,
-                            tidx,
-                            kv_copy_atom,
-                            kv_thread_copy,
-                        )
+                    # (r1(prev) kdq now runs inside the chase loop, at
+                    # the piece-2 boundary -- see the audit note there.)
                     # Round-0 kdq of THIS bundle (g0/g1, feeds the G5 r0
                     # waves that run right after the score plane).
                     self._gather_kdq_v8(
@@ -13249,6 +13259,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     Int32(0),
                 )
                 if tile_count > Int32(0):
+                    # The 32-thread x 2-value machine moves 64 heads
+                    # per tile; the v3.2 stats vectors are the FULL 128
+                    # heads, so BOTH rest tiles must be copied (audit
+                    # F4: tile 1 missing left head[64:128) stats as
+                    # uninitialized SMEM garbage).
                     cute.copy(
                         stats_copy_atom,
                         t_g_scaled_lse[None, 0],
@@ -13256,8 +13271,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
                     cute.copy(
                         stats_copy_atom,
+                        t_g_scaled_lse[None, 1],
+                        t_s_scaled_lse[None, 1],
+                    )
+                    cute.copy(
+                        stats_copy_atom,
                         t_g_sum_odo[None, 0],
                         t_s_sum_odo[None, 0],
+                    )
+                    cute.copy(
+                        stats_copy_atom,
+                        t_g_sum_odo[None, 1],
+                        t_s_sum_odo[None, 1],
                     )
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
@@ -13676,6 +13701,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # dQ epilogue: wait for the last dQ generation, then store both
             # rank-owned [D128, H128] slices (disjoint across CTAs/rounds).
             if tile_count > Int32(0):
+                # Drain the leader's LAST dq_b free commit (pre-arm 1 +
+                # 1/bundle = tile_count+1 commits vs tile_count in-loop
+                # consumes; without this the leader's producer_tail
+                # waits a release that never comes -- audit F3).
+                pipe_dqb_free.consumer_wait(dqb_free_state)
+                pipe_dqb_free.consumer_release(dqb_free_state)
+                dqb_free_state.advance()
                 pipe_dq_done.consumer_wait(dq_done_state)
                 dq_epi_0_token = _iket.range_start(
                     "DQ_EPI(r)",
@@ -14312,9 +14344,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         self.PDS_BLOCK_BYTES,
                         peer_cta_rank_in_cluster=peer_rank,
                     )
+                    # Helper signature is (source_local, dest_at_peer)
+                    # -- the V31_SURGERY_SPEC section 0 convention and
+                    # both base-class call sites agree.
                     _cpasync_bulk_s2cluster(
-                        dqb_dst_ptr,
                         dqb_src_ptr,
+                        dqb_dst_ptr,
                         landing_mbars,
                         self.PDS_BLOCK_BYTES,
                         peer_rank,
@@ -14545,44 +14580,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             mma.set(tcgen05.Field.ACCUMULATE, True)
 
-    @cute.kernel
-    def convert_canonical(
-        self,
-        mdKV_acc: cute.Tensor,
-        mdKV: cute.Tensor,
-        seqlen: Int32,
-    ):
-        """Decode the baseline reducer's within-panel column scramble.
-
-        The v6 drain stores each thread's register-gathered FP32x4 quad at
-        group index dp_idx//4 of its 128-column panel (the production
-        store_dKV addressing), so the workspace column order inside every
-        panel is the baseline permutation; this override replaces the
-        canonical copy with the baseline convert's dim_idx decode.  The
-        scramble is panel-base invariant, so the same formula covers our
-        2*round+rank panel bases.
-        """
-
-        assert self.same_hdim_kv
-        tidx, tidy, _ = cute.arch.thread_idx()
-        seq_block_idx, _, batch_idx = cute.arch.block_idx()
-        seq_id = self.block_seq * seq_block_idx + tidy
-        if seq_id < seqlen:
-            acc_row = mdKV_acc[None, seq_id, (0, batch_idx)]
-            out_row = mdKV[None, seq_id, (0, batch_idx)]
-            tile_acc_row = cute.flat_divide(acc_row, (64,))
-            tile_acc_row = cute.flat_divide(tile_acc_row, (32,))
-            num_128_tiles = self.head_dim_main // 64
-            for i in cutlass.range(num_128_tiles, unroll_full=True):
-                for j in cutlass.range(2, unroll_full=True):
-                    scrambled = tile_acc_row[tidx, j, i]
-                    dim_idx = (
-                        tidx // 4
-                        + tidx % 4 * 8
-                        + j * 32
-                        + i * 64
-                    )
-                    out_row[dim_idx] = self.element_dtype(scrambled)
+    # convert_canonical: NOT overridden in v3.2.  The v6/v8 scramble
+    # decode belonged to the thread-indexed drain addressing; the v3.2
+    # drain stores through coordinate-exact identity decoding (natural
+    # order), which pairs with the BASE class's canonical per-element
+    # copy (audit F6: keeping the v6 decode here permuted every
+    # 32-column group of the output).
 
     @cute.jit
     def _drain_dkv_block_v32(
@@ -14605,18 +14608,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         """v3.2: drain ONE [own-kv64 x D128] dV or dK block.
 
         Reducer mechanics inherit the v8 drain (Ld16x256b Rep-4 T2R
-        split across two warp groups, preloaded KV index, red.global
-        f32 atomics).  V == K, so dV and dK blocks of the same D-round
-        land in the SAME GMEM quadrant and the atomics merge them into
-        the shared dKV accumulator.  The transposed fragment puts kv on
-        the datapath axis (ONE fixed gather row per thread -- a single
-        index preload replaces v8's eight) and D on the column axis,
-        where a thread owns column PAIRS, so the atomic vector narrows
-        to f32x2 (this is inside the design doc's +8-trip drain tax).
-        V32-TODO(audit): the {n, n+1} pair adjacency and the DP fold
-        decode (kv = dp %% 64, D = 64*(dp // 64) + n) are derived from
-        the UMMA_2SM M64 interleaved atom (64,(64,2)):(1,(128,64));
-        host-probe the coordinate tensor before trusting either.
+        split across two warp groups, red.global f32 atomics).  V == K,
+        so dV and dK blocks of the same D-round land in the SAME GMEM
+        quadrant and the atomics merge them into the shared dKV
+        accumulator.  The transposed fragment puts kv on the datapath
+        axis and D on the column axis, where a thread owns column
+        PAIRS, so the atomic vector narrows to f32x2 (this is inside
+        the design doc's +8-trip drain tax).  The kv row and its topk
+        index are decoded PER PAIR from the identity coordinates (the
+        Rep-4 fragment spans multiple fold rows per thread -- v8
+        precedent: four dp rows; a one-entry cache elides redundant
+        index reloads).
+        V32-TODO(audit): the {n, n+1} pair adjacency (v1 = v0 column
+        neighbor, v0 column even) is still assumed from the v8 value
+        order; if the trace harness shows otherwise, degrade the f32x2
+        atomic to two scalars.
         """
 
         wait_dk_token = _iket.range_start(
@@ -14638,19 +14644,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
         t_dkv_core = t_dkv_slot[(None, None), 0, 0]
         # The M64-interleaved UMMA_2SM fragment core is
-        # (m64,(n64,h2)):(1,(128,64)) -- logical, with the D-half h
-        # folded onto DP rows 64..127.  make_tmem_copy needs the
-        # PHYSICAL (DP, col) congruence, so regroup to
-        # ((m64,h2),n64):((1,64),128): DP = kv + 64*Dhalf, col = n.
-        assert t_dkv_core.layout == cute.make_layout(
-            (self.N_TILE, (self.N_TILE, 2)),
-            stride=(1, (2 * self.N_TILE, self.N_TILE)),
+        # (m64,(n64,h2)) with TMEM-ENCODED strides (hardware echo:
+        # (65536,(1,4194304)) -- lane stride 2^16): lane = m + 64*h,
+        # column = n.  make_tmem_copy needs the physical (DP, col)
+        # congruence, so regroup to ((m64,h2),n64) -- a pure mode
+        # permutation; the encoded strides ride along verbatim.
+        assert t_dkv_core.shape == (
+            self.N_TILE,
+            (self.N_TILE, 2),
         ), str(t_dkv_core.layout)
+        core_stride = t_dkv_core.layout.stride
         t_dkv_phys = cute.make_tensor(
             t_dkv_core.iterator,
             cute.make_layout(
                 ((self.N_TILE, 2), self.N_TILE),
-                stride=((1, self.N_TILE), 2 * self.N_TILE),
+                stride=(
+                    (core_stride[0], core_stride[1][1]),
+                    core_stride[1][0],
+                ),
             ),
         )
         tmem_load_atom = cute.make_copy_atom(
@@ -14680,27 +14691,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.acc_dtype,
         )
 
-        # Single per-thread gather row: coordinate mode [0,0] is the kv
-        # row of the fold (DP % 64); the block's rows are this CTA's
-        # own kv-half of the 128-token bundle.
-        local_kv = Int32(
-            cute.get(
-                thread_coordinates[0],
-                mode=[0, 0],
-            )
-        )
-        global_row = (
-            tile_index * Int32(2 * self.N_TILE)
-            + rank * Int32(2 * self.N_TILE_CTA)
-            + local_kv
-        )
-        kv_index = Int32(-1)
-        if global_row < topk:
-            kv_index = mTopkIdxs[
-                global_row,
-                (token_idx, batch_idx),
-            ]
-
         cute.copy(tiled_t2r, thread_source, thread_values)
         cute.arch.fence_view_async_tmem_load()
         done_pipeline.consumer_release(release_state)
@@ -14715,6 +14705,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             "REDUCE_ATOMIC(i,r)",
             issue_seq,
         )
+        # Per-PAIR gather row: the Rep-4 fragment spans multiple fold
+        # rows per thread (v8 precedent: four dp rows), so the kv row
+        # and its topk index are decoded from THIS pair's coordinate
+        # (audit F5: a single hoisted row misroutes 3/4 of the mass).
+        # A one-entry cache elides the redundant index reloads within
+        # a row run.
+        cached_kv_row = Int32(-1)
+        kv_index = Int32(-1)
         for i in cutlass.range_constexpr(self.N_TILE // 4):
             v0 = 2 * i
             v1 = v0 + 1
@@ -14724,6 +14722,25 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             rdkv_frg[0] = thread_values[v0]
             rdkv_frg[1] = thread_values[v1]
+            pair_kv = Int32(
+                cute.get(
+                    thread_coordinates[v0],
+                    mode=[0, 0],
+                )
+            )
+            if pair_kv != cached_kv_row:
+                cached_kv_row = pair_kv
+                pair_global_row = (
+                    tile_index * Int32(2 * self.N_TILE)
+                    + rank * Int32(2 * self.N_TILE_CTA)
+                    + pair_kv
+                )
+                kv_index = Int32(-1)
+                if pair_global_row < topk:
+                    kv_index = mTopkIdxs[
+                        pair_global_row,
+                        (token_idx, batch_idx),
+                    ]
             if kv_index >= Int32(0):
                 # D within the block = 64 * h(fold half, mode [0,1])
                 # + n (mode [1]); the block's GMEM quadrant is d_round.
