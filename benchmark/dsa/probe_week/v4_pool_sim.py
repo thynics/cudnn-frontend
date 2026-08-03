@@ -23,9 +23,11 @@
 """
 
 LEDGERS = {  # R14 校准 (2026-08-03 mixed_residency 实测): exp x1.27, pub 相位错开残余, REDG 4w 饱和
-    "opt":  dict(exp=11.4, t2r=4.8, pub=13.8, stats=0.7, drain_slot=1.04),  # REDG 通道 4ns/instr = v12 实核锚(0.26µs/槽)
-    "mid":  dict(exp=14.0, t2r=4.8, pub=16.0, stats=0.7, drain_slot=1.8),   # 7ns/instr (0.45µs/槽)
-    "cons": dict(exp=17.8, t2r=4.8, pub=22.0, stats=1.2, drain_slot=2.6),   # 10ns/instr 探针天真循环锚(0.65µs/槽)+pub x1.6
+    # REDG 通道 = 10.18ns/instr 硬管线极限(2026-08-03 drain_channel_probe 钉死, 与 warp 数/代码形态无关)
+    # → drain_slot 通道时间固定 0.652µs/槽; 三档只剩 math 侧(exp 混驻/pub 相位错开成色)
+    "opt":  dict(exp=11.4, t2r=4.8, pub=13.8, stats=0.7, drain_slot=2.61),
+    "mid":  dict(exp=14.0, t2r=4.8, pub=16.0, stats=0.7, drain_slot=2.61),
+    "cons": dict(exp=17.8, t2r=4.8, pub=22.0, stats=1.2, drain_slot=2.61),
 }
 SUPPLY_WALL_64KV = (2.3, 2.9)     # per-64kv
 MMA_BUNDLE = 3.38                  # µs busy per bundle
@@ -80,19 +82,25 @@ def simulate(led, supply_64kv, verbose=False):
         # --- drains: dV r0..3 -> dlead, dK r0..3 -> c0-squad ---
         dkv_slip = 0.0
         redg_chan = getattr(simulate, "_chan", 0.0)          # 全 SM REDG 通道空闲时刻
-        for grad, squad in (("dV", dl), ("dK", c0)):
-            for r in range(4):
-                avail = t_b + t_shift + 1.0 + r * 0.9        # leader commit of round r
+        import os
+        D64 = os.environ.get("V4_D64_SLOTS") == "1"
+        n_rounds = 8 if D64 else 4
+        spacing = float(os.environ.get("V4_SPACING", "0.45" if D64 else "0.9"))
+        slot_chan = (drain_redg / 4.0) / (2 if D64 else 1)
+        slot_t2r = drain_t2r / (2 if D64 else 1) + (0.03 if D64 else 0.0)  # 趟数税
+        for r in range(n_rounds):
+            for grad, squad in (("dV", dl), ("dK", c0)):
+                avail = t_b + t_shift + 1.0 + r * spacing
                 est = max(avail, squad_free[squad])
-                t2r_done = est + drain_t2r
+                t2r_done = est + slot_t2r
                 redg_start = max(t2r_done, redg_chan)
-                done = redg_start + drain_redg / 4.0
+                done = redg_start + slot_chan
                 redg_chan = done
                 squad_free[squad] = done
-                busy_acc[squad] += drain_t2r + drain_redg / 4.0
+                busy_acc[squad] += slot_t2r + slot_chan
                 # slot needed again at round r+2 (same bundle) or next bundle r-2
-                if r < 2:
-                    need = t_b + t_shift + 1.0 + (r + 2) * 0.9
+                if r < n_rounds - 2:
+                    need = t_b + t_shift + 1.0 + (r + (4 if D64 else 2)) * spacing
                 else:
                     need = None  # checked next bundle via prev_drain_done
                 if need is not None:
