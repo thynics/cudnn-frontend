@@ -15791,15 +15791,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         chase_state: pipeline.PipelineState,
         fill3_mbar: cute.Pointer,
         fill3_phase: Int32,
-    ) -> pipeline.PipelineState:
-        """CHASE interleave: S0, dP0, [chase], S1, S2, [fill3], S3,
-        dP1-3 (the approved minimal interleave order).
+        pipe_s_done,
+        s_state: pipeline.PipelineState,
+        pipe_dp_done,
+        dp_state: pipeline.PipelineState,
+    ):
+        """CHASE interleave: S0, dP0, [chase], S1, S2, dP1, dP2,
+        [fill3], S3, [s_done], dP3, [dp_done].
 
         The chase commit is tcgen05-tracked: it fires once both
         chunk-0 GEMM chains complete, authorizing the gather tail pass
         to refill slot 0.  The fill3 wait keeps the chunk-3 atoms out
         of the queue until that refill is fenced -- the queued-atom /
         refill race is inverted into a short leader wait.
+
+        rev6: s_done commits right after S3 (v18a cadence) -- math's
+        softmax(t) waits s_done, and the rev5 end-of-pair commit had
+        pushed the gather tail fill, the chase gate and all of dP into
+        math's critical path (audit axis-3 finding).
         """
 
         mma_s = score_tiled_mma.with_()
@@ -15876,6 +15885,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 s_c3[None, None, k_block],
                 acc_s,
             )
+        # S complete: commit on the v18a cadence so math(t)'s softmax
+        # unblocks without waiting for the dP tail.
+        cute.arch.fence_view_async_tmem_store()
+        pipe_s_done.producer_commit(s_state)
+        s_state.advance()
         for k_block in cutlass.range(0, k_blocks_per_chunk, unroll=4):
             cute.gemm(
                 mma_dp,
@@ -15884,7 +15898,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 dp_c3[None, None, k_block],
                 acc_dp,
             )
-        return chase_state
+        cute.arch.fence_view_async_tmem_store()
+        pipe_dp_done.producer_commit(dp_state)
+        dp_state.advance()
+        return chase_state, s_state, dp_state
 
     @cute.jit
     def _issue_score_pair_v31(
@@ -15931,46 +15948,58 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             issue_seq,
         )
         if s_state.index == Int32(0):
-            chase_state = self._issue_score_pair_chunks_v31(
-                score_tiled_mma,
-                dp_tiled_mma,
-                t_score,
-                t_dp,
-                score_q_fragment,
-                score_do_fragment,
-                s_c0,
-                s_c1,
-                s_c2,
-                s_c3,
-                dp_c0,
-                dp_c1,
-                dp_c2,
-                dp_c3,
-                chase_pipeline,
-                chase_state,
-                fill3_mbar,
-                fill3_phase,
+            chase_state, s_state, dp_state = (
+                self._issue_score_pair_chunks_v31(
+                    score_tiled_mma,
+                    dp_tiled_mma,
+                    t_score,
+                    t_dp,
+                    score_q_fragment,
+                    score_do_fragment,
+                    s_c0,
+                    s_c1,
+                    s_c2,
+                    s_c3,
+                    dp_c0,
+                    dp_c1,
+                    dp_c2,
+                    dp_c3,
+                    chase_pipeline,
+                    chase_state,
+                    fill3_mbar,
+                    fill3_phase,
+                    pipe_s_done,
+                    s_state,
+                    pipe_dp_done,
+                    dp_state,
+                )
             )
         else:
-            chase_state = self._issue_score_pair_chunks_v31(
-                score_tiled_mma,
-                dp_tiled_mma,
-                t_score_pp,
-                t_dp_pp,
-                score_q_fragment,
-                score_do_fragment,
-                s_c0,
-                s_c1,
-                s_c2,
-                s_c3,
-                dp_c0,
-                dp_c1,
-                dp_c2,
-                dp_c3,
-                chase_pipeline,
-                chase_state,
-                fill3_mbar,
-                fill3_phase,
+            chase_state, s_state, dp_state = (
+                self._issue_score_pair_chunks_v31(
+                    score_tiled_mma,
+                    dp_tiled_mma,
+                    t_score_pp,
+                    t_dp_pp,
+                    score_q_fragment,
+                    score_do_fragment,
+                    s_c0,
+                    s_c1,
+                    s_c2,
+                    s_c3,
+                    dp_c0,
+                    dp_c1,
+                    dp_c2,
+                    dp_c3,
+                    chase_pipeline,
+                    chase_state,
+                    fill3_mbar,
+                    fill3_phase,
+                    pipe_s_done,
+                    s_state,
+                    pipe_dp_done,
+                    dp_state,
+                )
             )
         _iket.range_end(
             dp_issue_token,
@@ -15980,11 +16009,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             mma_issue_token,
             issue_seq,
         )
-        cute.arch.fence_view_async_tmem_store()
-        pipe_s_done.producer_commit(s_state)
-        s_state.advance()
-        pipe_dp_done.producer_commit(dp_state)
-        dp_state.advance()
         return s_state, dp_state, chase_state
 
     @cute.jit
