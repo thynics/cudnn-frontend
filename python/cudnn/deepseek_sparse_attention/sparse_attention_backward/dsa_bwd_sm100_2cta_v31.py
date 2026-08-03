@@ -15767,7 +15767,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
-    @cute.jit
     def _issue_score_pair_chunks_v31(
         self,
         score_tiled_mma: cute.TiledMma,
