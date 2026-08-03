@@ -158,28 +158,33 @@ int main(int argc, char** argv){
   int* rows_h = new int[NBLOCKS * RPB];
   cudaEvent_t ev0, ev1; CK(cudaEventCreate(&ev0)); CK(cudaEventCreate(&ev1));
   const int riters = 16;
-  for (int variant = 0; variant < 3; ++variant) {
-    const char* nm = variant==0 ? "disjoint" : (variant==1 ? "same" : "overlap50");
-    for (int b = 0; b < NBLOCKS; ++b)
-      for (int r = 0; r < RPB; ++r) {
-        if (variant == 0) rows_h[b*RPB + r] = (b*RPB + r) % NROWS;
-        if (variant == 1) rows_h[b*RPB + r] = r;
-        if (variant == 2) rows_h[b*RPB + r] = ((b/2)*RPB + r * 2 + (b & 1)) % NROWS;
-      }
-    CK(cudaMemcpy(rows_d, rows_h, NBLOCKS*RPB*4, cudaMemcpyHostToDevice));
-    redg_kernel<<<NBLOCKS, 256>>>(buf, rows_d, RPB, FPR, 1, cyc2); // warmup
-    CK(cudaDeviceSynchronize());
-    CK(cudaEventRecord(ev0));
-    redg_kernel<<<NBLOCKS, 256>>>(buf, rows_d, RPB, FPR, riters, cyc2);
-    CK(cudaEventRecord(ev1));
-    CK(cudaDeviceSynchronize());
-    float ms; CK(cudaEventElapsedTime(&ms, ev0, ev1));
-    double reds_per_block = (double)RPB * (FPR/4) * riters;          // v4 reds issued per block
-    double ns_per_red = ms * 1e6 / (reds_per_block * 1);             // per block (parallel blocks)
-    double bytes = (double)NBLOCKS * RPB * FPR * 4 * riters;
-    double per_block_us_per_iter = ms * 1e3 / riters;                // one drain-equivalent
-    printf("REDG %-9s total_ms=%.3f  per_block_us_per_128rowx2KB=%.3f  ns_per_v4red_per_block=%.3f  aggr_GBps=%.1f\n",
-           nm, ms, per_block_us_per_iter, ns_per_red, bytes / (ms * 1e-3) / 1e9);
+  // rev2: concurrency x hot-set sweep to separate solo issue floor / scaling /
+  // L2-resident vs DRAM-resident RMW. modes: same(256KB hot), l2res(rows in
+  // 4096-row=8MB window, mimics real dKV tensor), dram(spread over 128MB).
+  int concs[4] = {1, 37, 74, 148};
+  for (int mode = 0; mode < 3; ++mode) {
+    const char* nm = mode==0 ? "same256K" : (mode==1 ? "l2res8MB" : "dram128MB");
+    for (int ci = 0; ci < 4; ++ci) {
+      int nb = concs[ci];
+      for (int b = 0; b < nb; ++b)
+        for (int r = 0; r < RPB; ++r) {
+          if (mode == 0) rows_h[b*RPB + r] = r;
+          if (mode == 1) rows_h[b*RPB + r] = (b*RPB + r) % 4096;
+          if (mode == 2) rows_h[b*RPB + r] = (b*RPB + r) % NROWS;
+        }
+      CK(cudaMemcpy(rows_d, rows_h, nb*RPB*4, cudaMemcpyHostToDevice));
+      redg_kernel<<<nb, 256>>>(buf, rows_d, RPB, FPR, 1, cyc2); // warmup
+      CK(cudaDeviceSynchronize());
+      CK(cudaEventRecord(ev0));
+      redg_kernel<<<nb, 256>>>(buf, rows_d, RPB, FPR, riters, cyc2);
+      CK(cudaEventRecord(ev1));
+      CK(cudaDeviceSynchronize());
+      float ms; CK(cudaEventElapsedTime(&ms, ev0, ev1));
+      double per_block_us_per_iter = ms * 1e3 / riters;             // one drain-equivalent
+      double bytes = (double)nb * RPB * FPR * 4 * riters;
+      printf("REDG %-9s conc=%-3d  per_block_us_per_tile_drain=%.3f  aggr_GBps=%.1f\n",
+             nm, nb, per_block_us_per_iter, bytes / (ms * 1e-3) / 1e9);
+    }
   }
   printf("PROBE_DONE\n");
   return 0;
