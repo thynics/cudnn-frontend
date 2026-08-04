@@ -122,3 +122,8 @@
     L3 score 前置连发（S(0..3) bundle 头背靠背，解 S 稀释斜坡 ~10µs/bundle 税后）。
   (5·基础设施注记)：haifa 短暂死亡期间建成 computelab 直连三通道（computelab-runner 前端 drop-box / b200-runner 持卡容器 drop-box / ~/proxy Codex 委托协议）；harness 聚合器对 v5.2 拒收（缺退役的 dQ_ISSUE(i,r) 契约 span）——原始解码 JSON 不受影响，本地账本管线为权威；若需 harness 表格，后续在 trace-prepare 里给 offload span 起 dQ_ISSUE 别名即可。
 [v5.2-r10-S案终审] S_ISSUE 斜坡全案告破（三轮悬案结案）：S_ISSUE 窗=31 条 gemm 入队（16 G1+15 G2 交错，SCORE_D_PIECES=8×k_blocks=2；dP_ISSUE=最后 1 条 G2）。逐条价：t0=0.038µs/条（空队裸价）→ t3=0.208µs/条 ≡ dVdK 单条恒定价 0.2µs。机制：bundle 末 36µs 停摆排空 UMMA 队列+TC 闲置 → t0 免费；bundle 内 MMA 积压令队列饱和 → 入队速率被钳到 TC 退队速率。斜坡=队列充满过程的影子，停摆重置 ⇒ "逐 t 恶化+每 bundle 归零+跨重构不变"三特征全解。鉴别器：dP_ISSUE 全程平坦（稀释假说要求同比拉长→死刑）；并发-斜坡零相关（t2 并发最低 5.4 warp 却次长）。含义：t3 非浪费（TC 满载真活）；真浪费=36µs 停摆期 TC 空转（bundle 级 TC 利用率 ~50%）；L3 score 前置从解药降级为无效药（重排不减 TC 总量）；L1/L2 聚焦度提升——砍停摆即摊平 TC 工作。旧"队列论证伪"之误：假设了 TC 跟得上入队。
+[v5.3-L1-证伪] r11 判决（correctness 4/4 ✓；释放版 36.516ms vs r10 35.653 = +2.4% 倒退；已 git revert）：
+  (1·trace-释放悖论)：trace 周期 69.4→56.4µs(−19%)、DQ_EPI 1.88→0.78µs——但释放版反涨。唯一解：观测税 ×1.72→×1.37，r10 的 offload LDG 等待被插桩系统性放大（wait 型 span 膨胀 = 已归档陷阱，本次实踩）。**r10"drain 供需失衡 3.97 vs 1.9"账本大部为插桩幻影**——释放版里 LDG 延迟本被其他 warp 隐藏。drain 节奏 3.97→3.98 纹丝不动 = drain 从来不被 offload LDG 定步。
+  (2·真实损因)：8 条标量 red.f32 挤入 dkv 已饱和的 L2 原子管道（WAIT_dK +45%、REDUCE_ATOMIC +5% 方向吻合），换掉的却是可向量化为 2×LDG.128+2×STG.128 的普通访存——4 宽访存换 8 标量原子，事前可算的坏交易。
+  (3·战役级重定罪——v5 释放版真实约束)：释放 bundle ≈41.2µs vs TC 工作估算 176 MMA×0.2µs≈35µs ⇒ **TC 占用 ~85%，释放版近乎 tensor core 吞吐钉死**。0.2µs/条 vs 小原子理论峰值 ~15ns ⇒ 10×+ 小原子效率税——**tiling4 h32 细粒度的结构性代价**，亦解释 v17a（肥原子）6.5µs/64kv。含义：v5 线 drain/overlap 微优化封顶 ~15%；触及 v17a 水位需要肥化 score 原子/混合粒度（v6 级重构）。
+  (4·方法论教训 #18)：跨轮 trace 对账必须同时校观测税（release 锚定），wait 型 span 的绝对值禁止直接进供需算术。
