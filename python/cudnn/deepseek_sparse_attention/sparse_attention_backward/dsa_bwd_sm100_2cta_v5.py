@@ -12037,6 +12037,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         D = cute.round_up(problem_shape[2], 8)
         q_r = cute.round_up(total_seqlen_Q, 8)
         acc_bytes = self.acc_dtype.width // 8
+        # [fix-r8] LOUD allocation gate.  The PUBLIC interface
+        # (_interface_sm100.py) hardcodes the BASE class's
+        # _get_workspace_size_LSE_OdO at its torch.zeros allocation
+        # sites; if the caller's buffer was sized by that 8 B/entry
+        # rule, this carve would start EXACTLY at the old buffer's
+        # end (base_bytes == the old total) and EVERY eviction access
+        # would be out of bounds -- the r8 IMA signature.  The
+        # workspace tensor's byte cosize is static at trace time, so
+        # an under-allocation aborts the compile here with both
+        # numbers echoed instead of corrupting device memory.
+        assert cute.cosize(workspace_LSE_OdO.layout) >= (
+            (2 + D) * H * q_r * acc_bytes
+        ), (
+            cute.cosize(workspace_LSE_OdO.layout),
+            (2 + D) * H * q_r * acc_bytes,
+        )
         base_bytes = cute.assume(
             2 * H * q_r * acc_bytes,
             divby=64,
@@ -15400,8 +15416,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         (ACCUMULATE=False on the first atom): partial sums accumulate
         in the f32 dQ workspace via the reducer's RMW offload, never
         across bundles in TMEM.  Output column n of this block is
-        physical head (n//16)*64 + t*16 + (n%16), D row
-        r*128 + rank*64 + m (the offloader's decode contract).
+        physical head (n//16)*64 + t*16 + (n%16); the D rows are the
+        A operand's strips D[r_old*256 + rank*128 + d_half*64, +64)
+        ([fix-r8]: the legacy gen M-half interposes rank between
+        r_old and d_half -- see the offloader's decode contract).
         """
 
         mma = dq_tiled_mma.with_()
@@ -15678,9 +15696,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             terminal value -- f32 accumulation + ONE final rounding,
             the same numeric class as the retired TMEM epilogue);
           middle:       LDG + FADD + STG f32.
-        Decode contract (see _issue_dq_block_v52): value at fold
-        coordinate ((m, n_hi), n_low) is
-          d = r*128 + rank*64 + m,  head = n_hi*64 + t*16 + n_low.
+        Decode contract ([fix-r8] corrected): the block's D coverage
+        is dictated by the A operand -- the kdq gen holds the LEGACY
+        M-half slice D[r_old*256 + rank*128, +128), so its d_half
+        window is D[r_old*256 + rank*128 + d_half*64, +64): two
+        64-strips 128 apart per cluster block, NOT a contiguous
+        r*128 slab.  Value at fold coordinate ((m, n_hi), n_low) is
+          d = (r//2)*256 + rank*128 + (r%2)*64 + m,
+          head = n_hi*64 + t*16 + n_low
+        (r = 2*r_old + d_half; the eight (r_old, rank, d_half)
+        strips tile D512 bijectively).
         DQ_EPI(r) is the offload span now (payload b*16 + t*4 + r --
         semantic change logged in V5_BUILD_LOG).
         """
@@ -15764,8 +15789,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             if is_last:
                 for i in cutlass.range_constexpr(8):
                     d_g = Int32(
-                        r_index * 128
-                    ) + rank * Int32(64) + Int32(
+                        (r_index // 2) * 256
+                        + (r_index % 2) * 64
+                    ) + rank * Int32(128) + Int32(
                         cute.get(
                             thread_coordinates[i],
                             mode=[0, 0],
@@ -15792,8 +15818,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             else:
                 for i in cutlass.range_constexpr(8):
                     d_g = Int32(
-                        r_index * 128
-                    ) + rank * Int32(64) + Int32(
+                        (r_index // 2) * 256
+                        + (r_index % 2) * 64
+                    ) + rank * Int32(128) + Int32(
                         cute.get(
                             thread_coordinates[i],
                             mode=[0, 0],
@@ -15821,8 +15848,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             if is_last:
                 for i in cutlass.range_constexpr(8):
                     d_g = Int32(
-                        r_index * 128
-                    ) + rank * Int32(64) + Int32(
+                        (r_index // 2) * 256
+                        + (r_index % 2) * 64
+                    ) + rank * Int32(128) + Int32(
                         cute.get(
                             thread_coordinates[i],
                             mode=[0, 0],
@@ -15856,8 +15884,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             else:
                 for i in cutlass.range_constexpr(8):
                     d_g = Int32(
-                        r_index * 128
-                    ) + rank * Int32(64) + Int32(
+                        (r_index // 2) * 256
+                        + (r_index % 2) * 64
+                    ) + rank * Int32(128) + Int32(
                         cute.get(
                             thread_coordinates[i],
                             mode=[0, 0],
@@ -16429,7 +16458,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # order (r_old, t, d_half) -- the round ring holds one kdq gen pair at
 # a time (double-hold, double-release); rotating slot == d_half
 # (static block-ordinal parity).  Block (t, r) column n is head
-# (n//16)*64 + t*16 + (n%16), row r*128 + rank*64 + m.  A = kdq gen
+# (n//16)*64 + t*16 + (n%16), D rows = the A strips
+# D[r_old*256 + rank*128 + d_half*64, +64) ([fix-r8]: the legacy gen
+# M-half interposes rank; the eight strips tile D512).  A = kdq gen
 # d-half windows (2-stage auto layout, stage stride 4096 == legacy
 # m-half stride, order-(2,1,3) algebra); B = hand dq_b window view
 # ((16,(8,2)),1,4,(4,2)) : ((1,(64,512)),0,1024,(16,4096)), flat stage
