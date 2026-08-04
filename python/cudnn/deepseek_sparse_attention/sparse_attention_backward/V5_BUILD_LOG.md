@@ -107,3 +107,17 @@
   (2·1a 场外定罪——无需再烧硬件轮)：两条独立证据链合龙。证据一（sha 取证）：_interface_sm100.py 自 35fd7b0 起 git 无改动、工作区干净 ⇒ 全部轮次推送 sha=2da17a7f；而 validation 阶段（iket_instrumented=false、instrumentation_patch=null）staged sha=50b4aeba ≠ 推送值 ⇒ **staging 确以文本补丁改写 interface 换类**（非运行期 monkeypatch；补丁体在 harness 侧不可读）。证据二（IMA 排除法）：1b 旧解码 d_g 各变体上界 ≤575 < D=576 ⇒ 错址必在区域内，**只错数、不越界**——r8 的 IMA 无法由 1b 产生，唯一能给出 OOB 的是 1a（4MB 恰界重合 ⇒ 驱逐区全程越界）。⇒ 1a=实锤（补丁只换构造不换分配，情形 B），1b=并发的界内错址。
   (3·修法——分配点无条件扩容，对补丁风格免疫)：_interface_sm100.py 分配点（109 行前）加 entry 字节下限提升 `entry = max(impl_entry, 8 + round8(head_dim)*4)`——别名式补丁下 impl_entry 已=2312 为幂等 no-op；仅换构造式补丁下把基类 8B 提到 2312B；基类内核对该 workspace 纯平坦 iterator+字节偏移切分（dsa_bwd_sm100.py:195，从不读形状元组）⇒ 尾部扩容对基线阶段不可见、零语义扰动（代价：基线阶段多分配 ~1.2GB torch.zeros，memset ~200µs/调用，对 e2e 比值 <1% 且两侧对称）。v5 文件同步：_carve_dq_acc 撤门改注记（lesson #17 入档）、_get_workspace_size_LSE_OdO docstring 纠偏（"harness 走 impl_cls" 断言撤销，覆写降级为 correct-but-not-load-bearing）。残余风险：若 staging 为整文件替换（非 patch），本修法失效 ⇒ r10 仍 IMA 即为该情形的判决信号，届时唯一路线=候选类收缩回基类分配预算或改 harness。py_compile 待跑。
   (4·阻塞)：runner ssh 凭证 17:56–18:54 间过期（publickey denied，重试同败）——r10 待用户本地交互式 ssh 刷新凭证后投递。
+[v5.2-r10] 硬件终审（经 computelab 直连管线；harness 模板分配 bug 由 Codex 修复入库，新模板 sha 862d440f）：
+  (1·correctness)：四模式全 PASS（dense/lengths/holes/all_empty；dq_max≤0.012、dkv_max≤0.073）——1a（harness 分配）+1b（d_g 解码）双案终结，dQ 驱逐/4 槽/融合 drain 全套机器数学正确。R9/R11/R12 全部除名。
+  (2·性能)：candidate 35.653ms vs baseline 8.368ms（4.26×）；period=20.13µs/64kv，正中 v5.2 ADDENDUM 预言带 20-22µs。vs r4（28.2ms/15.9µs）回归 +4.2µs/64kv = 驱逐 drain 税 + 环深 4 认赔，皆为已登记账目。
+  (3·trace 账本，税率 ×1.72，稳态 8 bundle 窗)：
+    - 死因主刀：leader 每 bundle 一段 ~36µs 单一空转（dVdK_ISSUE(末) → 下一 bundle S_ISSUE），占周期 52%——下一 bundle 的 S 被"K 驻留单缓冲翻转"卡死：K(b+1) 填充必须等 K(b) 全部消费者（grads 链→融合 drain→offload）收尾。K 消费尾巴被驱逐服务链拖长 ⇒ 翻转晚 ⇒ S 晚。
+    - reduce 线 86% 负载：DQ_EPI offload 30µs/bundle/warp 为最大新账目（16 块 ×~1.9µs），LDG+FADD+STG 三段式 RMW 的载入延迟在链上。
+    - 融合对单价（WAIT_dK→ATOMIC 末）：中位 3.9µs 税后（~2.3µs 素颜）vs P0 门 1.05µs——**P0 门 FAIL ×2+**。
+    - S_ISSUE 斜坡跨重构复活：稳态 t0-t3 = 1.18/2.18/5.09/6.46µs，与 r4 同构 ⇒ 结构性，warp 稀释假说增强（MAT_ACQ 伞拆分：g2=13.1µs/g14=9.0µs/g22(kdq)=17.8µs 三巨头为信用等待，供应线 83% 时间蹲 acquire——供应不是算力瓶颈，是释放链反压）。
+    - math 线 80% 时间 WAIT_S——彻底饥饿，非瓶颈。
+  (4·v5.3 反攻清单，按杠杆排序)：
+    L1 dQ offload 改 red.global.add.f32（对齐 dkv drain 的 REDG 先例；dQ 行簇独占本不需要读回，LDG+FADD+STG → 单条 fire-and-forget，直接砍 reduce 线最大账目 + 缩 K 消费尾巴）；
+    L2 K 驻留部分双缓冲（8 片 D64 中前 2 片预填，+16KB SMEM 入预算，削 36µs 翻转空转的填充段）；
+    L3 score 前置连发（S(0..3) bundle 头背靠背，解 S 稀释斜坡 ~10µs/bundle 税后）。
+  (5·基础设施注记)：haifa 短暂死亡期间建成 computelab 直连三通道（computelab-runner 前端 drop-box / b200-runner 持卡容器 drop-box / ~/proxy Codex 委托协议）；harness 聚合器对 v5.2 拒收（缺退役的 dQ_ISSUE(i,r) 契约 span）——原始解码 JSON 不受影响，本地账本管线为权威；若需 harness 表格，后续在 trace-prepare 里给 offload span 起 dQ_ISSUE 别名即可。
