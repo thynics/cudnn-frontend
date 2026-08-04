@@ -111,8 +111,39 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.typing import BFloat16, Float32, Int32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 MBARRIER_MAX_ARRIVALS = 1_000_000  # 硬件 2^20-1, 留余量
+
+
+@dsl_user_op
+def _mbarrier_try_wait(
+    barrier: cute.Pointer,
+    phase: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Boolean:
+    """Poll one CTA-shared mbarrier generation without blocking a role.
+    (verbatim copy of the hardware-proven helper in dsa_bwd_sm100_2cta_v5)"""
+
+    barrier_i32 = barrier.toint(loc=loc, ip=ip).ir_value()
+    ready = llvm.inline_asm(
+        T.i32(),
+        [barrier_i32, phase.ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 "
+        "p, [$1], $2, 1;\n\t"
+        "selp.u32 $0, 1, 0, p;\n\t"
+        "}",
+        "=r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(ready) != Int32(0)
 
 
 def gpu_arch_flag() -> str:
@@ -131,7 +162,7 @@ class MmaAtomPriceBench:
     num_batches: Int32 与 stream。
     """
 
-    THREADS_PER_CTA = 32          # 单 warp/CTA: allocator warp == issue warp == warp 0
+    THREADS_PER_CTA = 32          # 遗留字面(勿用); 实际线程数见 self.threads_per_cta
     TMEM_COLUMNS = 512            # 一次性顶格分配, 省去逐 N 的合法性分档
     CLUSTER_SHAPE_MNK = (2, 1, 1)
     CLUSTER_MASK = 3              # tcgen05.commit 多播到 cluster 内两个 CTA
@@ -147,9 +178,16 @@ class MmaAtomPriceBench:
         idle: bool = False,
         dual_acc: bool = False,
         num_clusters: int = 1,
+        load_mode: str = "none",
     ):
         assert instr_n % 16 == 0 and 16 <= instr_n <= 256, f"bad N={instr_n}"
         assert batch_atoms >= 1 and k_chunks >= 1 and num_clusters >= 1
+        # 背景负载: smem = 双 CTA 的 warp1-3 对操作数区打 STS 风暴 (值恒 0,
+        # 与 MMA 读同 bank 竞争), 模拟内核里 TMA/pds/relay 对 CG2 跨 CTA
+        # 取数的压迫; none = 原始安静基线。
+        assert load_mode in ("none", "smem"), f"bad load_mode={load_mode}"
+        self.load_mode = load_mode
+        self.threads_per_cta = 128 if load_mode != "none" else 32
         if dual_acc:
             assert 2 * instr_n <= self.TMEM_COLUMNS, "dual-acc 放不进 512 列 TMEM"
         self.instr_n = instr_n
@@ -169,7 +207,7 @@ class MmaAtomPriceBench:
         self.shared_storage = None
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1,
-            num_threads=self.THREADS_PER_CTA,
+            num_threads=self.threads_per_cta,
         )
 
     # ------------------------------------------------------------------
@@ -234,7 +272,7 @@ class MmaAtomPriceBench:
                 1,
                 1,
             ),
-            block=[self.THREADS_PER_CTA, 1, 1],
+            block=[self.threads_per_cta, 1, 1],
             cluster=self.CLUSTER_SHAPE_MNK,
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
@@ -296,10 +334,10 @@ class MmaAtomPriceBench:
 
         # ---- 零填两侧操作数（吞吐 bench, 内容只求非 NaN/Inf 干扰之外的确定性） ----
         a_flat = storage.sA.get_tensor(cute.make_layout((cosize_a,)))
-        for element in cutlass.range(tidx, cosize_a, self.THREADS_PER_CTA):
+        for element in cutlass.range(tidx, cosize_a, self.threads_per_cta):
             a_flat[element] = self.element_dtype(0.0)
         b_flat = storage.sB.get_tensor(cute.make_layout((cosize_b,)))
-        for element in cutlass.range(tidx, cosize_b, self.THREADS_PER_CTA):
+        for element in cutlass.range(tidx, cosize_b, self.threads_per_cta):
             b_flat[element] = self.element_dtype(0.0)
         cute.arch.fence_view_async_shared()  # 泛型写 -> async proxy 可见
         cute.arch.barrier()
@@ -361,6 +399,28 @@ class MmaAtomPriceBench:
                         self.CLUSTER_MASK,
                         tcgen05.CtaGroup.TWO,
                     )
+
+        # ---- 背景负载: 双 CTA 的 warp1-3 对操作数区打 STS 风暴 ----
+        # 值恒 0.0 (操作数本就全零) => 不改 MMA 结果; 目标是与 UMMA 的
+        # SMEM 操作数取数 (含 CG2 跨 CTA B 读) 竞争 bank/端口。
+        # 退出: 轮询与发射端同一 done mbar (parity 0), 完成后落回主收尾。
+        if cutlass.const_expr(self.load_mode == "smem"):
+            if warp_idx > 0:
+                lane = tidx - Int32(32)
+                offset = Int32(0)
+                storm_done = cutlass.Boolean(False)
+                while not storm_done:
+                    for i in cutlass.range_constexpr(32):
+                        a_flat[
+                            (lane * Int32(37) + offset + Int32(i * 96))
+                            % Int32(cosize_a)
+                        ] = self.element_dtype(0.0)
+                        b_flat[
+                            (lane * Int32(37) + offset + Int32(i * 96))
+                            % Int32(cosize_b)
+                        ] = self.element_dtype(0.0)
+                    offset = offset + Int32(1)
+                    storm_done = _mbarrier_try_wait(done_mbar, Int32(0))
 
         # ---- 收尾: 两 CTA 都等自己本地 mbar（多播到达）, 再 cluster 同步 ----
         cute.arch.mbarrier_wait(done_mbar, Int32(0))
@@ -428,6 +488,10 @@ def parse_args() -> argparse.Namespace:
                    help="SMEM K 深度 chunk 数(rotate 模式轮转其间)")
     p.add_argument("--dual-acc", type=int, choices=[0, 1], default=0,
                    help="1=两个 TMEM 累加器交替(排除同累加器链)")
+    p.add_argument("--load-mode", choices=["none", "smem", "both"],
+                   default="none",
+                   help="背景负载: smem=双 CTA warp1-3 对操作数区 STS 风暴"
+                        "(CG2 跨 CTA 取数争抢探针); both=对照两测")
     p.add_argument("--clusters", type=int, default=1,
                    help="并发 cluster 数(>1 仅作时间不变性 sanity check; "
                         "计时/原子数仍按单 cluster 报)")
@@ -466,11 +530,16 @@ def main() -> int:
     print(header)
     print("-" * len(header))
 
+    load_modes = (
+        ["none", "smem"] if args.load_mode == "both" else [args.load_mode]
+    )
     rows = []
-    for mode in modes:
+    for load_mode in load_modes:
+      for mode in modes:
         for n in n_list:
             row = {"mode": mode, "N": n, "batch_atoms": args.batch_atoms,
-                   "k_chunks": args.k_chunks, "dual_acc": args.dual_acc}
+                   "k_chunks": args.k_chunks, "dual_acc": args.dual_acc,
+                   "load_mode": load_mode}
             try:
                 bench = MmaAtomPriceBench(
                     instr_n=n,
@@ -480,6 +549,7 @@ def main() -> int:
                     idle=False,
                     dual_acc=bool(args.dual_acc),
                     num_clusters=args.clusters,
+                    load_mode=load_mode,
                 )
                 compiled = cute.compile(
                     bench, Int32(1), stream, options=f"--gpu-arch {arch}"
