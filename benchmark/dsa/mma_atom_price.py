@@ -20,6 +20,7 @@ RUNBOOK
     python3 mma_atom_price.py --mode rotate          # 8 chunk 轮转(模拟真实描述符步进)
     python3 mma_atom_price.py --dual-acc 1           # 双累加器交替(排除同累加器链式依赖)
     python3 mma_atom_price.py --n-list 64,128 --atoms 131072 --json out.json
+    python3 mma_atom_price.py --load-mode all       # none/smem/t2r 三档背景负载对照
 
 预期输出（stdout）:
     每行一个测点:
@@ -90,6 +91,41 @@ R6. `cutlass.range(tidx, cosize, 32)` 动态起点零填循环 与
     摊到每原子 1/batch_atoms, 视为协议成本的一部分, 不另外扣。
 10. N=16 的 CG2 SS 形状合法性以任务书为准（N%16 全合法）；若个别 N 编译被
     IR 校验拒绝, host 按 N 粒度 try/except, 继续扫其余点。
+
+--------------------------------------------------------------------------------
+t2r 背景负载档追加（none/smem 已 B200 验证通过后新增, 未经编译验证）
+--------------------------------------------------------------------------------
+设计要点: t2r 档 threads_per_cta=256; warp0=发射, warps4-7=T2R warpgroup
+    (dp_idx = tidx-128 ∈ [0,128)), warps1-3 全程 idle 直落收尾等待。目标
+    TMEM 列区 [2N, 2N+64)（恒避开双累加器区 [0,2N); __init__ 断言
+    2N+64<=512）, (128DP x 64col) f32 视图。T2R 机器逐件抄 v5 现役形态:
+    Ld16x256bOp(Repetition(2)) + make_tmem_copy + get_slice(dp_idx) +
+    partition_S/partition_D + make_rmem_tensor + copy +
+    fence_view_async_tmem_load（v5 教训#15: 几何只在原子族内派生;
+    TMEM 指针禁 align()）。退出协议与 smem 档相同（try_wait 轮询 done mbar,
+    每轮 >= 一次完整 128DPx64col 读）。
+R11. TMEM 视图 layout 为手写 (128,64):(2^16,1)：lane 步长 2^16 取自 v5
+     zone3 phys_layout 注释（"TMEM-ENCODED strides (lane stride 2^16)"),
+     列步长 1 与现存 dual-acc `tmem_ptr + N` 列偏移约定一致, DSL
+     find_tmem_tensor_col_offset 的 0xFFFF 列掩码亦印证。若 make_tmem_copy
+     拒收平铺 (128,64) 形状或分区错位: 回退为 v5 同款嵌套 ((64,2),64)
+     regroup, 或改从 make_fragment_C 布局同族派生。
+R12. T2R 读值即弃, 存在 tcgen05.ld 被编译器/ptxas 消除的理论风险。已加
+     防 DCE 锚: `if num_batches == 0`（host 断言 nb>=1, 运行时永不触发,
+     谓词不可证伪）内把全部 64 个 rmem 元素存回 SMEM => 所有目的寄存器
+     保活。若 SASS 复核仍见 ld 被删: 改为真实累加 sink + 循环外单次落存。
+R13. warp-DP 象限假设: warps4-7 构成对齐 warpgroup, 组内 warp w 只可访问
+     DP lanes [32w, 32w+32)（tcgen05.ld 硬件限制）, 与 get_slice(tidx-128)
+     的映射一致。若 make_tmem_copy 线程枚举与该假设冲突会在编译/运行期报
+     非法 TMEM 访问: 届时改用 4 组 Ld32x32bOp 每 warp 自管 32DP 的降档。
+R14. t2r 档 N=256 越界(2*256+64>512)属预期: __init__ assert 在 host 抛出,
+     主循环 try/except 记 ERROR 行继续扫其余 N; 若必须测 N=256, 需缩列宽
+     或单累加器模式下改列偏移, 本档不做。
+R15. 目标列区从未被写, T2R 读到未初始化 TMEM（可能含 NaN 位型）: 值不参与
+     任何计算/比较, tcgen05.ld 本身不触发 FP 异常, 无害。寄存器开销 +64
+     f32/线程(仅 warps4-7), 无 setmaxnreg（约束#1）, 单 SM 单 CTA 常驻,
+     预计不构成占用瓶颈; 若 ptxas 报寄存器超限: Repetition 降为 x1 并把
+     列宽减半(32col)分两轮读。
 ================================================================================
 """
 
@@ -164,6 +200,9 @@ class MmaAtomPriceBench:
 
     THREADS_PER_CTA = 32          # 遗留字面(勿用); 实际线程数见 self.threads_per_cta
     TMEM_COLUMNS = 512            # 一次性顶格分配, 省去逐 N 的合法性分档
+    T2R_DP = 128                  # t2r 档: T2R 视图 datapath 数(整 warpgroup)
+    T2R_COLS = 64                 # t2r 档: T2R 视图列数(f32: 1 元素 = 1 列)
+    T2R_LANE_STRIDE = 1 << 16     # TMEM 编码 DP-lane 步长(v5 phys_layout 同款)
     CLUSTER_SHAPE_MNK = (2, 1, 1)
     CLUSTER_MASK = 3              # tcgen05.commit 多播到 cluster 内两个 CTA
     INSTR_M = 128                 # CG2 只测 M128
@@ -184,10 +223,18 @@ class MmaAtomPriceBench:
         assert batch_atoms >= 1 and k_chunks >= 1 and num_clusters >= 1
         # 背景负载: smem = 双 CTA 的 warp1-3 对操作数区打 STS 风暴 (值恒 0,
         # 与 MMA 读同 bank 竞争), 模拟内核里 TMA/pds/relay 对 CG2 跨 CTA
-        # 取数的压迫; none = 原始安静基线。
-        assert load_mode in ("none", "smem"), f"bad load_mode={load_mode}"
+        # 取数的压迫; t2r = 双 CTA 的 warps4-7 整 warpgroup 对 TMEM 空闲
+        # 列区持续 tcgen05.ld (T2R), 复现内核里 math/reduce 读流量与 TC
+        # 累加器写全程并发的 TMEM 端口争抢; none = 原始安静基线。
+        assert load_mode in ("none", "smem", "t2r"), f"bad load_mode={load_mode}"
         self.load_mode = load_mode
-        self.threads_per_cta = 128 if load_mode != "none" else 32
+        self.threads_per_cta = {"none": 32, "smem": 128, "t2r": 256}[load_mode]
+        if load_mode == "t2r":
+            # 目标列区 [2N, 2N+64): 恒避开双累加器区 [0, 2N), 不越 512 列。
+            assert 2 * instr_n + self.T2R_COLS <= self.TMEM_COLUMNS, (
+                f"t2r 列区 [{2 * instr_n}, {2 * instr_n + self.T2R_COLS}) "
+                f"越界 TMEM {self.TMEM_COLUMNS} 列 (N={instr_n} 过大)"
+            )
         if dual_acc:
             assert 2 * instr_n <= self.TMEM_COLUMNS, "dual-acc 放不进 512 列 TMEM"
         self.instr_n = instr_n
@@ -422,6 +469,55 @@ class MmaAtomPriceBench:
                     offset = offset + Int32(1)
                     storm_done = _mbarrier_try_wait(done_mbar, Int32(0))
 
+        # ---- 背景负载: 双 CTA 的 warps4-7 整 warpgroup 持续 T2R 读 TMEM ----
+        # 复现内核结构: math/reduce 的 tcgen05.ld 读流量与 TC 累加器写全程
+        # 并发（TMEM 端口争抢主嫌探针）。目标列区 [2N, 2N+64) 恒避开双累加
+        # 器区; (128DP x 64col) f32 视图, DP-lane 编码步长 2^16（v5 zone3
+        # phys_layout 同款; DSL find_tmem_tensor_col_offset 的 0xFFFF 列掩
+        # 码印证列域在低 16 位, f32 一元素 = 一列）。T2R 机器逐件抄 v5 现役
+        # 形态（教训#15: 几何只在 Ld16x256b 原子族内派生; TMEM 指针不 align）。
+        # warp1-3 此档全程 idle, 直接落到收尾 mbarrier_wait。
+        # 退出协议与 smem 档相同: 每轮一次完整拷贝 + fence 后轮询 done mbar。
+        if cutlass.const_expr(self.load_mode == "t2r"):
+            if warp_idx >= 4:
+                dp_idx = tidx - Int32(128)  # warpgroup 内相对 DP 索引 0..127
+                t_t2r = cute.make_tensor(
+                    tmem_ptr + 2 * self.instr_n,
+                    cute.make_layout(
+                        (self.T2R_DP, self.T2R_COLS),
+                        stride=(self.T2R_LANE_STRIDE, 1),
+                    ),
+                )
+                t2r_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(2)),
+                    self.acc_dtype,
+                )
+                tiled_t2r = tcgen05.make_tmem_copy(t2r_atom, t_t2r)
+                thread_t2r = tiled_t2r.get_slice(dp_idx)
+                t2r_source = thread_t2r.partition_S(t_t2r)
+                t2r_coordinates = thread_t2r.partition_D(
+                    cute.make_identity_tensor((self.T2R_DP, self.T2R_COLS))
+                )
+                r_t2r = cute.make_rmem_tensor(
+                    t2r_coordinates.shape, self.acc_dtype
+                )
+                # 128DP x 64col / 128 线程 = 每线程 64 f32（漂移即编译期报）
+                assert cute.size(r_t2r) == (
+                    self.T2R_DP * self.T2R_COLS // 128
+                ), str(t2r_coordinates.shape)
+                storm_done = cutlass.Boolean(False)
+                while not storm_done:
+                    cute.copy(tiled_t2r, t2r_source, r_t2r)
+                    cute.arch.fence_view_async_tmem_load()
+                    # 防 DCE 锚: host 已断言 num_batches >= 1, 此分支运行时
+                    # 永不触发; 但谓词对编译器不可证伪 => 全部 T2R 目的寄存
+                    # 器保活, tcgen05.ld 不可被消除。读到的值即弃（不参与
+                    # 任何计算/计时路径）。
+                    if num_batches == Int32(0):
+                        for i in cutlass.range_constexpr(cute.size(r_t2r)):
+                            a_flat[Int32(i)] = self.element_dtype(r_t2r[i])
+                    storm_done = _mbarrier_try_wait(done_mbar, Int32(0))
+
         # ---- 收尾: 两 CTA 都等自己本地 mbar（多播到达）, 再 cluster 同步 ----
         cute.arch.mbarrier_wait(done_mbar, Int32(0))
         cute.arch.barrier()
@@ -488,10 +584,13 @@ def parse_args() -> argparse.Namespace:
                    help="SMEM K 深度 chunk 数(rotate 模式轮转其间)")
     p.add_argument("--dual-acc", type=int, choices=[0, 1], default=0,
                    help="1=两个 TMEM 累加器交替(排除同累加器链)")
-    p.add_argument("--load-mode", choices=["none", "smem", "both"],
+    p.add_argument("--load-mode",
+                   choices=["none", "smem", "t2r", "both", "all"],
                    default="none",
                    help="背景负载: smem=双 CTA warp1-3 对操作数区 STS 风暴"
-                        "(CG2 跨 CTA 取数争抢探针); both=对照两测")
+                        "(CG2 跨 CTA 取数争抢探针); t2r=双 CTA warps4-7 整 "
+                        "warpgroup 对 TMEM 空闲列持续 T2R(端口争抢探针); "
+                        "both=none+smem 双测; all=none+smem+t2r 三档全测")
     p.add_argument("--clusters", type=int, default=1,
                    help="并发 cluster 数(>1 仅作时间不变性 sanity check; "
                         "计时/原子数仍按单 cluster 报)")
@@ -530,9 +629,12 @@ def main() -> int:
     print(header)
     print("-" * len(header))
 
-    load_modes = (
-        ["none", "smem"] if args.load_mode == "both" else [args.load_mode]
-    )
+    if args.load_mode == "both":
+        load_modes = ["none", "smem"]
+    elif args.load_mode == "all":
+        load_modes = ["none", "smem", "t2r"]
+    else:
+        load_modes = [args.load_mode]
     rows = []
     for load_mode in load_modes:
       for mode in modes:
