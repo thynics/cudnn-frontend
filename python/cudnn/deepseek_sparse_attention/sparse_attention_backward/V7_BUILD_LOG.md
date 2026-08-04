@@ -43,3 +43,4 @@
   (4) **案1终审定罪：v11 时代配额表 × v7 新角色**：leader 家族 wg（w16-19）在 decrease(48) 桶（13555 行），v7 leader 工作量在 48 reg 下溢出 → 发射环 LDL 重载 → 共驻活跃时 L1 冲刷 → 100ns/条（沉睡时 spill 行驻 L1 → 28ns）。微基准七连无罪终解：小内核不溢出。约束：setmaxnreg warpgroup 粒度 + 8 倍数 + 池 640×96。DSL API 存在且在用（setmaxregister_increase/decrease）。
   (5) 时钟 1.837GHz 稳定（93.5% 额定）排除降频。
   → 配额网格编译扫描（每角色 spill 计数）+ 条件性 v7r2 已委托。
+[v7-r2+配额网格终审] (1) 配额路线证伪：6 配置网格（B200 编译+SASS spill 计数），现状 A（leader48）全指标最优——任何加大 leader 配额的配置 leader spill 反增（335→426-446，ptxas 全局分配耦合），STACK 亦增。案 1 修复只剩结构路线。(2) v7r2 复测 21.97ms（稳定）。(3) 12.7% 热环判读：融合 drain 的 kv_index 解码 + reduce 组内 barrier 停靠 = 设计性 WAIT_dK，非 bug。(4) 周期残余解剖（release ~24.8µs/bundle）：math 串行链（softmax/pds ~3µs×4 slice ≈12-14µs）= grads 相位深层 pacer；leader 带税发射 5-7µs；尾部 K 翻转+credits ~7µs。(5) 下一杠杆序：L-D pds STS 7.3-way bank 冲突 swizzle（NCU 估 8%，直击 math 关键链，但触冻结 slab 消费者需正规 spec）→ L-C math 双 warpgroup 化（12→6µs，v8 级手术，通往 baseline 的主路）→ L-B D128 肥化（S 面条数再减半）。
