@@ -194,6 +194,10 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     # v5.2 class sets (128, 32, 64) and evicts per-(t, r) blocks).
     DQ_EVICT_TILER = None
     STATIONARY_TILE_H = H_TILE_CTA
+    # v6 hook: the stationary (Q/dO strip) box D depth.  None keeps
+    # the full D_HEAD box (every pre-v6 schedule); the v6 fat-atom
+    # class sets 256 (the [h32 x D256] re-boxed strip, amendment #1).
+    STATIONARY_TILE_D = None
     STATIONARY_STAGES = 1
     DKV_A_MAJOR = OperandMajorMode.MN
     DKV_B_MAJOR = OperandMajorMode.K
@@ -487,16 +491,20 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
                 stationary_tiler[:2],
             )
         else:
-            # v3.2: the panel is the (zero-copy) score-B operand and its
-            # box is 32 rows.  MmaF16BF16Op forbids M=32, so the helper
-            # MMA carries the box on its N-mode instead ((M=64, N=32) is
+            # v3.2: the panel is the (zero-copy) score-B operand.
+            # MmaF16BF16Op forbids M=32, so the helper MMA carries the
+            # box on its N-mode instead ((M=64, N=STATIONARY_TILE_H) is
             # legal; the M-mode is a dummy -- only the B fraction of
             # this MMA is ever used, for the panel SMEM layout, the Q/dO
-            # TMA atoms, and the kernel-side partition_B).
+            # TMA atoms, and the kernel-side partition_B).  v6: the box
+            # K depth is the STATIONARY_TILE_D hook (None -> D_HEAD;
+            # the fat-atom class re-boxes the strip to [h32 x D256]).
             stationary_tiler = (
                 self.H_TILE_CTA,
                 self.STATIONARY_TILE_H,
-                self.D_HEAD,
+                self.STATIONARY_TILE_D
+                if self.STATIONARY_TILE_D is not None
+                else self.D_HEAD,
             )
             stationary_tiled_mma = sm100_utils.make_trivial_tiled_mma(
                 self.element_dtype,
@@ -11713,39 +11721,61 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     REDUCE_THREAD_BEGIN = REDUCE_WARP_BEGIN * 32
     REDUCE_THREADS = REDUCE_WARPS * 32
 
-    # v5 tiling4 score plane (V5_TILING4_DEMO_SPEC Z1/Z3).
+    # v6 FAT-ATOM score plane (V6_FAT_ATOM_SPEC + amendment #1, R-B).
     #
     # G1/G2 score plane (S^T = K.Q^T / dP^T = V.dO^T), CG2:
-    #   (M,N,K) = (kv128, h32-sub-tile, D64-piece), head-outer: pass t
-    #   re-streams the SAME eight chased K/V pieces (L2-hot for t >= 1)
-    #   and each piece feeds G1(t), G2(t) only (V==K single fetch).  B
-    #   is the resident Q/dO panel through a K-major zero-copy h16
-    #   window per CTA (the N-half of the N32 MMA).
+    #   (M,N,K) = (kv128, h64-sub-tile, D64-piece), head-outer: TWO
+    #   passes per bundle over the SAME resident K/V pieces, each pass
+    #   ONE genuine N=64 atom per (piece, k_block, plane) -- 64 enqueues
+    #   per bundle vs v5's 128 (the ~180 ns/atom enqueue tax thesis).
+    #   B is the streamed Q/dO strip pair through the auto 8-stage
+    #   [n32 x k64] score-B layout (window index == piece; the CTA's
+    #   N-half is h32).
     #
-    # Sub-tile head map (forced by the FROZEN panel residency -- CTA r
-    # holds H[c*64+r*32 : +32) for c in {0,1} -- and the hardware CG2
-    # B N-half split): sub-tile t = (c, j) with c = t//2, j = t%2;
-    # fragment column n in [0,32) is head
-    #   head(t, n) = c*64 + (n//16)*32 + j*16 + (n%16),
-    # i.e. columns [0,16) come from CTA0's panel rows [j*16,+16) of
-    # panel stage c and columns [16,32) from CTA1's.  Every sub-tile is
-    # two h16 boxes, 32 heads apart, inside the NATURAL h64 chunk image
-    # -- which is what keeps the P/dS slab chunk images, the dq_b
-    # image, and the 8,192 B relay payload byte-identical to v32 (the
-    # frozen relay/G5/epilogue paths' precondition).
-    SCORE_MMA_TILER = (128, 32, 64)
-    SCORE_MMA_N = 32
+    # v6 head map is NATURAL: sub-tile t covers chunk t, fragment
+    # column n in [0,64) is head
+    #   head(t, n) = t*64 + n
+    # (CTA r's B N-half supplies n in [r*32, +32) = heads
+    # [t*64 + r*32, +32), the [h32 x D256] strip content).  The MATH
+    # side still consumes h32 SLICES (production/consumption split,
+    # the v6 core thesis): slice s = 2*t + j (j in {0,1}) reads the
+    # 16-column TMEM window at slot offset 16*j, whose (DP, col) ->
+    # head image is IDENTICAL to the v5 sub-tile (c=t, j) -- two h16
+    # boxes, 32 heads apart, inside the NATURAL h64 chunk image (the
+    # N-parametric CG2 fold col = n % (N/2), DP-half = n // (N/2)
+    # makes the algebra exact).  P/dS slab chunk images, the dq_b
+    # image, and the 8,192 B relay payload stay byte-identical to v32
+    # (the frozen relay/G5/epilogue paths' precondition).
+    SCORE_MMA_TILER = (128, 64, 64)
+    SCORE_MMA_N = 64
     SCORE_D_PIECES = 8
     # SCORE_H_CHUNKS survives as the CONTAINER count (2 natural h64
-    # chunk images: panel stages, P/dS slab images); the SCHEDULING
-    # unit is now the h32 sub-tile (SUB_TILES).
+    # chunk images: P/dS slab images); in v6 the SCHEDULING unit (the
+    # h64 sub-tile) coincides with the chunk.
     SCORE_H_CHUNKS = 2
-    SUB_TILES = 4
-    SUB_TILE_H = 32
+    SUB_TILES = 2
+    SUB_TILE_H = 64
+    # v6 MATH consumption granularity (FROZEN by the spec's core
+    # discipline: register budget zero-change).  One h64 sub-tile is
+    # consumed as MATH_SLICES h32 slices; slice s = 2*t + j carries
+    # the ENTIRE v5 sub-tile machinery verbatim (T2R 16-column window,
+    # softmax pair lookups, (16,2) publish boxes, J-sliced store
+    # domain):
+    #   MATH_SLICE_H   = slice width (v5 SUB_TILE_H value);
+    #   MATH_SLICE_BOX = h16 publish box width inside a slice (the v5
+    #                    SUB_TILE_BOX value; also the 32-heads-apart
+    #                    box separation via the fold, x MATH_SLICE_H);
+    #   MATH_SLICE_VALS = per-thread values per slice T2R fragment
+    #                    ((kv64 x h32) f32 folded to 128 DP x 16 TMEM
+    #                    columns = 2,048 values / 128 math threads).
+    MATH_SLICES = 2
+    MATH_SLICE_H = 32
+    MATH_SLICE_BOX = 16
+    MATH_SLICE_VALS = 16
+    # LEGACY alias, value-locked to MATH_SLICE_BOX: kept ONLY so the
+    # FROZEN v5.2 dQ offload helper's (128,32) fold asserts stay
+    # byte-identical (freeze contract).  New code uses MATH_SLICE_BOX.
     SUB_TILE_BOX = 16
-    # Per-thread math fragment: (kv64 x h32) f32 folded to 128 DP x 16
-    # TMEM columns = 2,048 values / 128 math threads.
-    SUB_TILE_VALS = 16
 
     # v3.2 host-builder contract overrides (see the base-class block):
     # the chase is score A (2-slot ring of [own-kv64 x D64] pieces), the
@@ -11763,24 +11793,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # -75% gather traffic) under a single 1-stage completion gate
     # (pipe_kres); every score pass window-reads the same residency.
     SCORE_A_STAGES = 8
-    # v5.1b (item 6): the score-B container is now the 2-stage Q/dO
-    # STRIP buffer (the one-shot dual panels retire).  One strip =
-    # [h16 x D512] (16,384 B) = the pass's own CTA window, double-
-    # buffered (stage = t % 2).  Byte identity, same algebra as the v5
-    # panel windows: a strip stage's k64 blocks are 1,024-element
-    # units, so the 16-stage [n16 x k64] score-B layout binds the
-    # WHOLE 2-strip buffer at its base and the fragment stage index is
-    #   (t % 2) * 8 + piece
-    # (strip stage picks the 8,192-element half, piece the k64 block).
-    SCORE_B_STAGES = 16
+    # v6 (amendment #1, R-B): the score-B container stays the 2-stage
+    # Q/dO strip buffer, RE-BOXED to [h32 x D256] per strip (same
+    # 16,384 B/box, same 4 generations per bundle).  One strip = the
+    # pass's own CTA h32 window x one D-half; gen g = (t = g//2,
+    # dhalf = g%2), stage = g % 2 = dhalf.  The auto 8-stage
+    # [n32 x k64] score-B layout (make_smem_layout_b of the N64 MMA)
+    # binds the WHOLE 2-strip buffer at its base BYTE-IDENTICALLY:
+    # score-B stage s sits at s*2,048 elements, and strip stage d's
+    # k64 block kb sits at d*8,192 + kb*2,048 = (4d + kb)*2,048 --
+    # the identity s = 4*dhalf + kb.  Fragment window index == piece
+    # (8-wide last mode; pieces 0-3 read strip stage 0, pieces 4-7
+    # stage 1 -- the pass releases stage 0 EARLY at the piece-4
+    # boundary so W17 refills it under the D-hi reads).
+    SCORE_B_STAGES = 8
     SCORE_A_MAX_ELEMENTS = 32768
     SCORE_B_MAX_ELEMENTS = 32768
     DKV_A_MAJOR = OperandMajorMode.K
     DKV_B_MAJOR = OperandMajorMode.MN
     DKV_A_STAGES = 2
-    # v5.1 (pair batching): the streamed grad gen returns to FULL h64
-    # width -- pair P = {t=2P, t=2P+1} unions to EXACTLY chunk P's
-    # natural h64 head interval (the two sub-tiles' h16 boxes tile it),
+    # v5.1 (pair batching): the streamed grad gen is FULL h64
+    # width -- pair P = {s=2P, s=2P+1} (v6: the two math SLICES of
+    # sub-tile P) unions to EXACTLY chunk P's natural h64 head
+    # interval (the two slices' h16 boxes tile it),
     # so one gen = [h64 x own-D64] (8,192 B, ONE TMA box, the v32
     # single-stage box form) serves BOTH accumulate chains of one
     # (pair, r, tensor) block.  One stage per gen; gen k16-block kb
@@ -11798,19 +11833,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # score-plane transposition changes NOTHING here: keep the v17a
     # epilogue orientation.
     DQ_EPI_TRANSPOSED = False
-    # v5.1b: the stationary box is one [h16 x D512] STRIP (the pass's
-    # CTA window); STATIONARY_STAGES = 2 now means the strip DOUBLE
-    # BUFFER (stage = t % 2), streamed per bundle by W17 through
-    # pipe_strip -- not the old one-shot panel chunk boxes.
-    STATIONARY_TILE_H = 16
+    # v6 (amendment #1): the stationary box is one [h32 x D256] STRIP
+    # (the pass's CTA h32 window x one D-half; 16,384 B, unchanged);
+    # STATIONARY_STAGES = 2 stays the strip DOUBLE BUFFER (stage =
+    # g % 2 = dhalf), streamed per bundle by W17 through pipe_strip.
+    # STATIONARY_TILE_D is the new D-half box depth (the base-class
+    # hook defaults to None -> D_HEAD, keeping the dormant classes'
+    # host layouts byte-identical).
+    STATIONARY_TILE_H = 32
+    STATIONARY_TILE_D = 256
     STATIONARY_STAGES = 2
 
     # Head-axis chunking (fixed, static, NATURAL): h-chunk c covers
     # heads H[c*64:(c+1)*64).  The G1/G2 B N-halves are hardware-
-    # assigned per CTA rank; the strip for pass t = (c, j) holds the
-    # CTA's h16 window H[c*64 + rank*32 + j*16 : +16) (gmem h16-tile
-    # 4c + 2*rank + j).  P/dS slab K-axes, the streamed dO/Q gen rows,
-    # the softmax stat indices, dq_b columns (own-H64 =
+    # assigned per CTA rank; the strip for gen g = (t = g//2,
+    # dhalf = g%2) holds the CTA's h32 window
+    # H[t*64 + rank*32 : +32) x D[dhalf*256 : +256) (gmem h32-tile
+    # 2t + rank, d-tile dhalf).  P/dS slab K-axes, the streamed dO/Q
+    # gen rows, the softmax stat indices, dq_b columns (own-H64 =
     # H[rank*64:(rank+1)*64)) and the dQ epilogue all use natural head
     # order -- no permutation anywhere.
     HEAD_CHUNK_GROUP = 32
@@ -11864,15 +11904,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     PDS_BLOCK_ELEMENTS = 4_096
     PDS_BLOCK_BYTES = 8_192
 
-    # v5.2 TMEM 512-column map (all f32, per CTA), allocated UNGUARDED
-    # ([fix-r7] structural: 32 + 64 + 256 = 352 <= 512, [352,512)
-    # free -- 160 columns of unallocated headroom, booked):
+    # v6 TMEM 512-column map (all f32, per CTA), allocated UNGUARDED
+    # (structural: 32 + 64 + 64 + 256 = 416 <= 512, [416,512) free --
+    # 96 columns of unallocated headroom, booked):
     #   dQ rot [0,32):   2 x 16-column ROTATING eviction slots (block
     #                    g -> slot g%2; 16 blocks/bundle, even => the
     #                    slot pattern restarts per bundle, static);
-    #   S pp [32,64) / dP pp [64,96): 2 stages x 16 cols each (M128
-    #                    CG2 fold => 128 DP x 16 columns per h32);
-    #   dV/dK army [96,352): FOUR 64-column slots.  [fix-r7]: 16
+    #   S pp [32,96) / dP pp [96,160): 2 stages x 32 cols each (M128
+    #                    CG2 fold => 128 DP x 32 columns per h64
+    #                    sub-tile; math T2Rs the two 16-column h32
+    #                    slice windows at +16*j inside each slot);
+    #   dV/dK army [160,416): FOUR 64-column slots.  [fix-r7]: 16
     #                    blocks/bundle mod 4 == 0, so the slot phase
     #                    resets every bundle and block k = pair*8 +
     #                    2r + p gives slot = k % 4 = (2r + p) % 4 --
@@ -11889,14 +11931,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     TMEM_DQ_SLOT0 = 0
     TMEM_DQ_SLOT1 = 16
     TMEM_S_OFFSET = 32
-    TMEM_S1_OFFSET = 48
-    TMEM_DP_OFFSET = 64
-    TMEM_DP1_OFFSET = 80
-    TMEM_DKV_BASE = 96
+    TMEM_S1_OFFSET = 64
+    TMEM_DP_OFFSET = 96
+    TMEM_DP1_OFFSET = 128
+    TMEM_DKV_BASE = 160
     TMEM_DKV_SLOT_COLS = 64
     TMEM_DKV_SLOTS = 4
-    # TMEM budget echo-assert (host side, __call__).
-    TMEM_BUDGET = 32 + 64 + 4 * 64
+    # TMEM budget echo-assert (host side, __call__): v6 fat-atom
+    # account 32 (dQ) + 2*32 (S) + 2*32 (dP) + 4*64 (dkv) = 416.
+    TMEM_BUDGET = 32 + 2 * 32 + 2 * 32 + 4 * 64
 
     # v7: S/dP TMEM double-buffer depth (cross-chunk: S(c+1) no longer
     # waits for math's T2R of S(c)).
@@ -11981,8 +12024,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         thread-value ownership; the default (non-16-DP) choice made it
         fall back to CopyUniversalOp -- the v8 SASS showed 96 scalar
         STS.U16 + 96 PRMT per warp per tile (~4.6 us real) and ZERO
-        stmatrix.  The v5 sub-tile fragment is 128 DP x 16 TMEM columns
-        (h32 fold), so the SAME Ld16x256b family carries Repetition(2):
+        stmatrix.  The v6 math T2R unit stays the v5 h32 slice: the
+        fragment is 128 DP x 16 TMEM columns (one 16-column window at
+        +16*s inside the N64 slot), so the SAME Ld16x256b family
+        carries Repetition(2):
         one op = 16 DP x (256b = 8 f32) x 2 reps = the full 16-column
         window (lesson #15: derive within the family, never hand-write
         the T2R geometry).  DSL source verified (blackwell_helpers
@@ -12081,8 +12126,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     ):
         element_dtype = self.element_dtype
 
-        # v5.1b byte-exact plan (per CTA), cap 232,448 (item 7):
-        #   Q strip double buffer (2 x [h16 x D512])   32,768
+        # v6 byte-exact plan (per CTA), cap 232,448 (byte-identical
+        # to v5.1b; the strip re-box [h16 x D512] -> [h32 x D256]
+        # changes CONTENT layout only, never a buffer size):
+        #   Q strip double buffer (2 x [h32 x D256])   32,768
         #   dO strip double buffer                     32,768
         #   K residency [own-kv64 x D512] (8 pieces)   65,536
         #   round region (2 x 16,384)                  32,768
@@ -12149,9 +12196,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
-            # v5.1b: Q/dO strip double buffers (2 x [h16 x D512]
-            # per tensor, 32,768 B each -- the one-shot panels are
-            # retired).
+            # v6: Q/dO strip double buffers (2 x [h32 x D256]
+            # per tensor, 32,768 B each -- byte counts unchanged from
+            # v5.1b, content re-boxed per amendment #1).
             stationary_q: cute.struct.Align[
                 cute.struct.MemRange[element_dtype, 16384],
                 1024,
@@ -12698,14 +12745,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             stationary_a_layout_staged.outer,
             swizzle=stationary_a_layout_staged.inner,
         )
-        # v5.1b zero-copy score-B STRIP views (item 6).  One strip
-        # stage ([h16 x D512] K-major box, 16,384 B) is byte-identical
-        # to eight contiguous [n16 x k64] score-B stages (1,024-element
-        # blocks -- same algebra as the v5 panel windows), so the
-        # 16-stage score-B layout binds the WHOLE 2-strip buffer at its
-        # base: fragment stage index = (t % 2) * 8 + piece.  One view
-        # per tensor; the old per-chunk +16,384 second view retires
-        # with the panels.
+        # v6 zero-copy score-B STRIP views (amendment #1).  One strip
+        # stage ([h32 x D256] K-major box, 16,384 B) is byte-identical
+        # to four contiguous [n32 x k64] score-B stages (2,048-element
+        # blocks, 4 n-atoms each at 512-element stride on both sides),
+        # so the auto 8-stage N64 score-B layout binds the WHOLE
+        # 2-strip buffer at its base: score-B stage s sits at s*2,048
+        # elements = strip stage s//4, k64 block s%4 -- fragment
+        # window index == piece.  One view per tensor.
         # V32-TODO(audit): host-probe the byte identity (same SW128B
         # K-major atom on both sides; cosize equality is asserted in
         # __call__, the atom identity is not).
@@ -12834,16 +12881,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             score_store_layout.inner
             == dq_b_layout_staged.inner
         )
-        # v5 sub-tile publish domain (spec Z4).  The publish target
-        # stays the NATURAL [own-kv64 x h64] chunk image (the frozen
-        # relay payload / dq_b / G3-A byte forms all require natural
-        # head order), but one math pass covers only the sub-tile's
-        # TWO h16 column boxes, 32 heads apart.  The column mode is
-        # regrouped (16, 2):(1, 32) -- box-local head, box-hi -- and
-        # the window mode J = (2):(16) sits at TOP-LEVEL domain mode 1
-        # ([fix-r1]; see the placement note at the construction):
-        # slicing the partitioned tensor at J = t%2 selects the
-        # sub-tile's boxes.  The offset rides the LAYOUT coordinates
+        # v6 h32-SLICE publish domain (v5 sub-tile machinery verbatim;
+        # slice s = 2*sub_tile + j carries the v5 sub-tile role).  The
+        # publish target stays the NATURAL [own-kv64 x h64] chunk
+        # image (the frozen relay payload / dq_b / G3-A byte forms all
+        # require natural head order), but one math SLICE covers only
+        # its TWO h16 column boxes, 32 heads apart.  The column mode
+        # is regrouped (16, 2):(1, 32) -- box-local head, box-hi --
+        # and the window mode J = (2):(16) sits at TOP-LEVEL domain
+        # mode 1 ([fix-r1]; see the placement note at the
+        # construction): slicing the partitioned tensor at J = s%2
+        # selects the slice's boxes.  The offset rides the LAYOUT
+        # coordinates
         # (never the pointer), so the SW128B swizzle stays anchored at
         # the 1,024 B-aligned image base (a raw +32 B pointer offset
         # would NOT commute with the swizzle).
@@ -12896,7 +12945,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             (
                 (
                     score_store_layout.outer.shape[0],
-                    (self.SUB_TILE_BOX, 2),
+                    (self.MATH_SLICE_BOX, 2),
                 ),
                 2,
                 1,
@@ -12905,9 +12954,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             stride=(
                 (
                     score_store_layout.outer.stride[0],
-                    (1, self.SUB_TILE_H),
+                    (1, self.MATH_SLICE_H),
                 ),
-                self.SUB_TILE_BOX,
+                self.MATH_SLICE_BOX,
                 0,
                 0,
             ),
@@ -12916,13 +12965,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.cosize(score_store_domain)
             == self.PDS_BLOCK_ELEMENTS
         )
-        # Publish-domain width contract (spec Z4, asserted explicitly):
-        # each J slice of the domain exposes EXACTLY the h32 sub-tile
-        # -- SUB_TILE_H columns as (16, 2) boxes -- and the top-level
+        # Publish-domain width contract (asserted explicitly): each J
+        # slice of the domain exposes EXACTLY one h32 math slice --
+        # MATH_SLICE_H columns as (16, 2) boxes -- and the top-level
         # J window mode carries the two slices.
         assert (
             cute.size(score_store_domain, mode=[0, 1])
-            == self.SUB_TILE_H
+            == self.MATH_SLICE_H
         ), str(score_store_domain)
         assert cute.size(score_store_domain, mode=[1]) == 2, str(
             score_store_domain
@@ -13047,16 +13096,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             softmax_stats[None, 1]
         )
 
-        # v3.2: the panel boxes are STATIONARY_TILE_H(32)-row B-operand
-        # tiles (the TMA coordinates 2c + rank walk FOUR 32-row gmem
-        # H-tiles), partitioned through the helper MMA's B fraction.
+        # v6 (amendment #1): the strip boxes are [h32 x D256] B-operand
+        # tiles -- the gmem grid is FOUR h32 H-tiles x TWO D-halves;
+        # gen g addresses (h32-tile 2*(g//2) + rank, d-tile g%2) --
+        # partitioned through the helper MMA's B fraction.
         g_q = cute.local_tile(
             tma_tensor_q,
             cute.select(
                 (
                     self.H_TILE_CTA,
                     self.STATIONARY_TILE_H,
-                    self.D_HEAD,
+                    self.STATIONARY_TILE_D,
                 ),
                 mode=[1, 2],
             ),
@@ -13068,7 +13118,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 (
                     self.H_TILE_CTA,
                     self.STATIONARY_TILE_H,
-                    self.D_HEAD,
+                    self.STATIONARY_TILE_D,
                 ),
                 mode=[1, 2],
             ),
@@ -13092,15 +13142,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.group_modes(rank_g_do, 0, 3),
         )
 
-        rank_score_mma = score_tiled_mma.get_slice(rank)
         rank_dkv_mma = dkv_tiled_mma.get_slice(rank)
         rank_dq_mma = dq_tiled_mma.get_slice(rank)
-        # v5: the score C tile is one h32 sub-tile (kv128 x 32); the
-        # coordinate mode [1] value n is the FRAGMENT column -- the
-        # physical head is head(t, n) (see the class head-map note).
-        rank_score_coordinates = rank_score_mma.partition_C(
+        # v6: the math T2R unit stays the h32 SLICE (kv128 x 32), so
+        # the coordinate identity keeps the v5 (128, 32) domain -- but
+        # the score MMA atom is now N64 and cannot partition a 32-wide
+        # C tile.  The (M128, N32) CG2 f32 accumulator fold depends
+        # only on (M, N, dtype, cta_group) -- operand majorness never
+        # enters fragment_C -- so the dQ-eviction MMA ((128, 32) CG2,
+        # hardware-validated in v5.2 r10) partitions the slice domain
+        # with the EXACT v5 fold.  The coordinate mode [1] value n is
+        # the slice-local FRAGMENT column; the physical head is
+        # head(s, n) with slice s = 2*sub_tile + j (class head-map
+        # note).
+        rank_slice_mma = dq_evict_tiled_mma.get_slice(rank)
+        rank_score_coordinates = rank_slice_mma.partition_C(
             cute.make_identity_tensor(
-                (self.H_TILE_CLUSTER, self.SUB_TILE_H)
+                (self.H_TILE_CLUSTER, self.MATH_SLICE_H)
             )
         )
         rank_dkv_coordinates = rank_dkv_mma.partition_C(
@@ -13297,9 +13355,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # v5.1b (item 5): the K residency completion gate replaces the
         # 2-slot chase ring -- ONE generation per bundle:
         #   producer_acquire (gather) <- empty: the leader's release,
-        #     tcgen05-tracked, fires when score(3)(i-1)'s reads
-        #     complete (the "K(i+1) gather gate = score(3)(i)
-        #     completion edge" contract);
+        #     tcgen05-tracked, fires when the LAST score pass
+        #     (i-1)'s reads complete (the "K(i+1) gather gate = last
+        #     score pass completion edge" contract; score(1) in v6);
         #   producer_commit (gather, all 256 threads) -> full: the
         #     leader's bundle-head consumer_wait.
         pipe_kres = pipeline.PipelineAsyncUmma.create(
@@ -13310,14 +13368,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        # v5.1b (item 6): the Q/dO strip stream -- one generation =
-        # the pass's Q+dO strip pair, 4 generations per bundle,
-        # stage = t % 2:
+        # v6 (amendment #1): the Q/dO strip stream -- one generation =
+        # one [h32 x D256] Q+dO strip pair, 4 generations per bundle
+        # (gen g = (t = g//2, dhalf = g%2)), stage = g % 2:
         #   producer_acquire (W17 elect) <- empty: the leader's
-        #     release, tcgen05-tracked, fires when score(t-2)'s reads
-        #     complete;
+        #     release, tcgen05-tracked -- pass t releases stage 0
+        #     EARLY at its piece-4 boundary (D-lo reads done) and
+        #     stage 1 at its tail, so gen g's gate is pass (g-2)//2's
+        #     matching release;
         #   producer_commit (W17 elect, after its own TMA-completion
-        #     mbar wait) -> full: the score pass's strip wait.
+        #     mbar wait) -> full: the score pass's per-stage strip
+        #     wait (stage 0 at the pass head, stage 1 before piece 4).
+        # Account: 4 produced = 4 consumed per bundle (2 passes x 2
+        # stage waits/releases).
         pipe_strip = pipeline.PipelineAsyncUmma.create(
             num_stages=2,
             producer_group=load_elect_group,
@@ -13334,11 +13397,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        # v5 (spec Z4): the pds handoff becomes SUB-TILE granular --
-        # 2 stages, 4 generations/bundle, and MATH is the producer
-        # (v12's relay-commit form encoded the bundle-level handoff;
-        # the per-sub-tile cadence must commit right after each
-        # sub-tile publish, which only math can order).  Both CTAs'
+        # The pds handoff is SLICE granular (v5's sub-tile cadence
+        # verbatim) -- 2 stages, 4 generations/bundle, and MATH is
+        # the producer (v12's relay-commit form encoded the bundle-
+        # level handoff; the per-slice cadence must commit right
+        # after each slice publish, which only math can order).  Both CTAs'
         # math threads arrive the leading CTA's full mbar, so the
         # producer count carries the atom_thr_size factor exactly like
         # the s_done/dp_done consumer groups (lesson #10's cousin on
@@ -13445,9 +13508,25 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
+        # v6: the LEADER-facing accumulator layout is the N64 fat-atom
+        # fragment_C ((128, 64) CG2 fold -> 128 DP x 32 columns per
+        # CTA); one slot per done-pipeline stage.
         score_c_layout = score_tiled_mma.make_fragment_C(
             score_tiled_mma.partition_shape_C(
                 (self.H_TILE_CLUSTER, self.SUB_TILE_H)
+            )
+        ).layout
+        # v6: the MATH-facing h32 SLICE layout ((128, 32) CG2 fold ->
+        # 128 DP x 16 columns) -- the EXACT v5 score_c_layout.
+        # fragment_C depends only on (M, N, acc dtype, cta_group), so
+        # the dQ-eviction MMA (same (128, 32) CG2 f32 shape, operand
+        # majorness never enters C) derives it; slice s = 2*t + j
+        # reads the window at plane base + 16*s columns (S slots
+        # [32,96), dP slots [96,160), slices tile them contiguously:
+        # stage t at +32*t, j at +16*j).
+        score_slice_c_layout = dq_evict_tiled_mma.make_fragment_C(
+            dq_evict_tiled_mma.partition_shape_C(
+                (self.H_TILE_CLUSTER, self.MATH_SLICE_H)
             )
         ).layout
         dkv_c_layout = dkv_tiled_mma.make_fragment_C(
@@ -13483,6 +13562,49 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         t_dp_pp = cute.make_tensor(
             tmem_ptr + self.TMEM_DP1_OFFSET,
             score_c_layout,
+        )
+        # v6 math T2R slice sources: FOUR static 16-column windows per
+        # plane at base + 16*s (s = 2*sub_tile + j; v32 static-offset
+        # slot precedent, alignment folds automatically).  Window s
+        # aliases the accumulator slot sub_tile = s//2 at column
+        # offset 16*(s%2); the (128, 32) slice fold's (DP, col) ->
+        # head image inside the N64 slot is exactly the v5 sub-tile
+        # (see the class head-map note).
+        t_score_slices = (
+            cute.make_tensor(
+                tmem_ptr + self.TMEM_S_OFFSET,
+                score_slice_c_layout,
+            ),
+            cute.make_tensor(
+                tmem_ptr + (self.TMEM_S_OFFSET + 16),
+                score_slice_c_layout,
+            ),
+            cute.make_tensor(
+                tmem_ptr + (self.TMEM_S_OFFSET + 32),
+                score_slice_c_layout,
+            ),
+            cute.make_tensor(
+                tmem_ptr + (self.TMEM_S_OFFSET + 48),
+                score_slice_c_layout,
+            ),
+        )
+        t_dp_slices = (
+            cute.make_tensor(
+                tmem_ptr + self.TMEM_DP_OFFSET,
+                score_slice_c_layout,
+            ),
+            cute.make_tensor(
+                tmem_ptr + (self.TMEM_DP_OFFSET + 16),
+                score_slice_c_layout,
+            ),
+            cute.make_tensor(
+                tmem_ptr + (self.TMEM_DP_OFFSET + 32),
+                score_slice_c_layout,
+            ),
+            cute.make_tensor(
+                tmem_ptr + (self.TMEM_DP_OFFSET + 48),
+                score_slice_c_layout,
+            ),
         )
         # v5.2 rotating dQ eviction slots (block g -> slot g%2,
         # static: 16 blocks/bundle is even).
@@ -13613,9 +13735,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 for loop_iter in cutlass.range(tile_count):
                     bundle_idx = tile_count - Int32(1) - loop_iter
                     # edge: the leader's kres release -- tcgen05-
-                    # tracked score(3)(b-1) READ completion (the
-                    # "K(i+1) gather gate = score(3)(i) completion
-                    # edge" contract); bundle 0 eats the init credit.
+                    # tracked LAST-score-pass(b-1) READ completion
+                    # (the "K(i+1) gather gate = last score pass
+                    # completion edge" contract; score(1) in v6);
+                    # bundle 0 eats the init credit.
                     # The wait sits OUTSIDE the LOAD_K span so the
                     # span reads as pure fill time.
                     pipe_kres.producer_acquire(gather_state)
@@ -13770,36 +13893,86 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 1,
             )
 
+            # v6: FOUR h32-slice T2R windows per plane (slice s =
+            # 2*sub_tile + j at plane base + 16*s columns).  Each
+            # window carries the EXACT v5 per-sub-tile copy machinery
+            # (identical static slice layouts at static bases -- the
+            # v7 ping-pong precedent, x2); slice tensors were built in
+            # the prologue over score_slice_c_layout.
             score_copy = tcgen05.make_tmem_copy(
                 score_tmem_load,
-                t_score,
+                t_score_slices[0],
             )
             score_thread = score_copy.get_slice(mtx)
-            score_source = score_thread.partition_S(t_score)
             score_coordinates = score_thread.partition_D(
                 rank_score_coordinates
             )
+            score_copy_1 = tcgen05.make_tmem_copy(
+                score_tmem_load,
+                t_score_slices[1],
+            )
+            score_copy_2 = tcgen05.make_tmem_copy(
+                score_tmem_load,
+                t_score_slices[2],
+            )
+            score_copy_3 = tcgen05.make_tmem_copy(
+                score_tmem_load,
+                t_score_slices[3],
+            )
+            score_copies = (
+                score_copy,
+                score_copy_1,
+                score_copy_2,
+                score_copy_3,
+            )
+            score_sources = (
+                score_thread.partition_S(t_score_slices[0]),
+                score_copy_1.get_slice(mtx).partition_S(
+                    t_score_slices[1]
+                ),
+                score_copy_2.get_slice(mtx).partition_S(
+                    t_score_slices[2]
+                ),
+                score_copy_3.get_slice(mtx).partition_S(
+                    t_score_slices[3]
+                ),
+            )
             dp_copy = tcgen05.make_tmem_copy(
                 score_tmem_load,
-                t_dp,
+                t_dp_slices[0],
             )
-            dp_thread = dp_copy.get_slice(mtx)
-            dp_source = dp_thread.partition_S(t_dp)
-            # v7 ping-pong: identical static layouts at the stage-1 bases.
-            score_copy_pp = tcgen05.make_tmem_copy(
+            dp_copy_1 = tcgen05.make_tmem_copy(
                 score_tmem_load,
-                t_score_pp,
+                t_dp_slices[1],
             )
-            score_source_pp = score_copy_pp.get_slice(
-                mtx
-            ).partition_S(t_score_pp)
-            dp_copy_pp = tcgen05.make_tmem_copy(
+            dp_copy_2 = tcgen05.make_tmem_copy(
                 score_tmem_load,
-                t_dp_pp,
+                t_dp_slices[2],
             )
-            dp_source_pp = dp_copy_pp.get_slice(
-                mtx
-            ).partition_S(t_dp_pp)
+            dp_copy_3 = tcgen05.make_tmem_copy(
+                score_tmem_load,
+                t_dp_slices[3],
+            )
+            dp_copies = (
+                dp_copy,
+                dp_copy_1,
+                dp_copy_2,
+                dp_copy_3,
+            )
+            dp_sources = (
+                dp_copy.get_slice(mtx).partition_S(
+                    t_dp_slices[0]
+                ),
+                dp_copy_1.get_slice(mtx).partition_S(
+                    t_dp_slices[1]
+                ),
+                dp_copy_2.get_slice(mtx).partition_S(
+                    t_dp_slices[2]
+                ),
+                dp_copy_3.get_slice(mtx).partition_S(
+                    t_dp_slices[3]
+                ),
+            )
             smem_store_atom = sm100_utils.get_smem_store_op(
                 utils.LayoutEnum.ROW_MAJOR,
                 self.element_dtype,
@@ -13824,15 +13997,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 score_copy,
             )
             thread_copy_r2s = tiled_copy_r2s.get_slice(mtx)
-            # v5 publish targets (spec Z4): sub-tile t = (c, j) publishes
+            # v6 publish targets: slice s = 2*sub_tile + j publishes
             # its [own-kv64 x h32] fragment as the TWO h16 column boxes
-            # of the NATURAL chunk-c image selected by the J-mode slice
-            # (j = t % 2; see the score_store_domain note).  The CG2
-            # accumulator is M-half x FULL N, so every math warp owns
-            # local rows only; the only cross-CTA payload is still the
-            # relay's bundle-level dq_b peer push, byte-identical to
-            # v32 because the chunk images assemble in natural order
-            # from the j = 0 / j = 1 publishes.
+            # of the NATURAL chunk-sub_tile image selected by the
+            # J-mode slice (j = s % 2; see the score_store_domain
+            # note) -- the v5 sub-tile publish machinery verbatim.
+            # The CG2 accumulator is M-half x FULL N, so every math
+            # warp owns local rows only; the only cross-CTA payload is
+            # still the relay's bundle-level dq_b peer push, byte-
+            # identical to v32 because the chunk images assemble in
+            # natural order from the j = 0 / j = 1 publishes.
             t_rs_p_0 = thread_copy_r2s.partition_D(p_store[0])
             t_rs_p_1 = thread_copy_r2s.partition_D(p_store[1])
             t_rs_ds_0 = thread_copy_r2s.partition_D(ds_store[0])
@@ -13854,10 +14028,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             assert cute.size(t_rs_dqb, mode=[2]) == 2, str(
                 t_rs_dqb.shape
             )
-            # Sub-tile store tiles, indexed by t: (chunk c = t//2 picks
-            # the tensor, window j = t%2 indexes the J mode at [2];
-            # the trailing size-1 passthrough modes stay, keeping the
-            # sliced arity at four modes exactly like v32's tiles).
+            # Slice store tiles, indexed by s = 2*sub_tile + j (chunk
+            # = sub_tile = s//2 picks the tensor, window j = s%2
+            # indexes the J mode at [2]; the trailing size-1
+            # passthrough modes stay, keeping the sliced arity at four
+            # modes exactly like v32's tiles).
             t_rs_p_tiles = (
                 t_rs_p_0[None, None, 0, None, None],
                 t_rs_p_0[None, None, 1, None, None],
@@ -13870,8 +14045,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 t_rs_ds_1[None, None, 0, None, None],
                 t_rs_ds_1[None, None, 1, None, None],
             )
-            # dq_b own-image windows: only the two sub-tiles with
-            # c == rank write here; their J windows are j = 0 / j = 1.
+            # dq_b own-image windows: only the two slices of the
+            # sub_tile == rank pass write here; their J windows are
+            # j = 0 / j = 1.
             t_rs_dqb_tiles = (
                 t_rs_dqb[None, None, 0, None, None],
                 t_rs_dqb[None, None, 1, None, None],
@@ -13893,29 +14069,43 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self.element_dtype,
             )
 
-            # v5 (spec Z4): one 128-token bundle per iteration with FOUR
-            # h32 sub-tile phases inside (done-pipeline stage == t % 2,
-            # so the T2R source select stays STATIC).  pds becomes a
-            # 2-stage pipeline with MATH as the producer: one acquire +
-            # one commit PER SUB-TILE (4/bundle), handing each sub-tile
-            # to the leader's grads(t) individually -- the t/t+1
-            # in-flight window that realizes the M(t) || G(t-1) overlap.
-            # The dq_b free wait stays bundle-level (t == 0 head): the
-            # leader pre-arms an initial-free commit, so no first-bundle
-            # branch.
+            # v6: one 128-token bundle per iteration with TWO h64
+            # sub-tile phases, each consumed as TWO h32 SLICES (the
+            # production/consumption split -- the fat-atom core
+            # thesis; slice s = 2*sub_tile + j carries the v5
+            # sub-tile machinery verbatim, T2R source select via
+            # STATIC tuple index).  Done pipes are per PASS now
+            # (2 commits/bundle, stage == sub_tile): the wait lands
+            # on the pass's first slice (j == 0) and the release
+            # after the second slice's T2R (j == 1, the 32-column
+            # slot fully read).  pds stays a 2-stage pipeline with
+            # MATH as the producer: one acquire + one commit PER
+            # SLICE (4/bundle, v5-identical), handing each slice to
+            # the leader's grads batch -- the in-flight window that
+            # realizes the M || G overlap.  The dq_b free wait stays
+            # bundle-level (s == 0 head): the leader pre-arms an
+            # initial-free commit, so no first-bundle branch.
             for loop_iter in cutlass.range(tile_count):
                 for sub_tile in cutlass.range_constexpr(
                     self.SUB_TILES
                 ):
+                  for slice_j in cutlass.range_constexpr(
+                      self.MATH_SLICES
+                  ):
+                    slice_idx = 2 * sub_tile + slice_j
                     chunk_payload = loop_iter * Int32(
-                        2 * self.SUB_TILES
-                    ) + Int32(2 * sub_tile)
+                        2 * self.SUB_TILES * self.MATH_SLICES
+                    ) + Int32(2 * slice_idx)
                     wait_s_token = _iket.range_start(
                         "WAIT_S(i)",
                         chunk_payload,
                     )
-                    # edge: leader S_ISSUE(t) commit (tcgen05-tracked).
-                    pipe_s_done.consumer_wait(s_state)
+                    # edge: leader S_ISSUE(sub_tile) commit (tcgen05-
+                    # tracked); one wait per PASS on its first slice
+                    # (the j == 1 span wraps nothing and reads ~0 in
+                    # the trace -- wait-free slice by construction).
+                    if cutlass.const_expr(slice_j == 0):
+                        pipe_s_done.consumer_wait(s_state)
                     _iket.range_end(
                         wait_s_token,
                         chunk_payload,
@@ -13924,19 +14114,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "T2R_S(i)",
                         chunk_payload,
                     )
-                    if cutlass.const_expr(sub_tile % 2 == 0):
-                        cute.copy(score_copy, score_source, r_score)
-                    else:
-                        cute.copy(
-                            score_copy_pp,
-                            score_source_pp,
-                            r_score,
-                        )
+                    cute.copy(
+                        score_copies[slice_idx],
+                        score_sources[slice_idx],
+                        r_score,
+                    )
                     cute.arch.fence_view_async_tmem_load()
-                    # edge -> leader's s acquire for pass t+2 (TMEM
-                    # ping-pong stage WAR).
-                    pipe_s_done.consumer_release(s_state)
-                    s_state.advance()
+                    # edge -> leader's s acquire for the next pass on
+                    # this stage (TMEM ping-pong WAR); released only
+                    # after the pass's SECOND slice T2R.
+                    if cutlass.const_expr(slice_j == 1):
+                        pipe_s_done.consumer_release(s_state)
+                        s_state.advance()
                     _iket.range_end(
                         t2r_s_token,
                         chunk_payload,
@@ -13946,8 +14135,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "WAIT_dP(i)",
                         chunk_payload,
                     )
-                    # edge: leader dP_ISSUE(t) commit.
-                    pipe_dp_done.consumer_wait(dp_state)
+                    # edge: leader dP_ISSUE(sub_tile) commit (per
+                    # pass, first slice only).
+                    if cutlass.const_expr(slice_j == 0):
+                        pipe_dp_done.consumer_wait(dp_state)
                     _iket.range_end(
                         wait_dp_token,
                         chunk_payload,
@@ -13956,14 +14147,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "T2R_dP(i)",
                         chunk_payload,
                     )
-                    if cutlass.const_expr(sub_tile % 2 == 0):
-                        cute.copy(dp_copy, dp_source, r_dp)
-                    else:
-                        cute.copy(dp_copy_pp, dp_source_pp, r_dp)
+                    cute.copy(
+                        dp_copies[slice_idx],
+                        dp_sources[slice_idx],
+                        r_dp,
+                    )
                     cute.arch.fence_view_async_tmem_load()
-                    # edge -> leader's dp acquire for pass t+2.
-                    pipe_dp_done.consumer_release(dp_state)
-                    dp_state.advance()
+                    # edge -> leader's dp acquire (second slice).
+                    if cutlass.const_expr(slice_j == 1):
+                        pipe_dp_done.consumer_release(dp_state)
+                        dp_state.advance()
                     _iket.range_end(
                         t2r_dp_token,
                         chunk_payload,
@@ -13973,11 +14166,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "MATH_PD(i)",
                         chunk_payload,
                     )
-                    # v5 math: same packed f32x2 pair schedule as v17a/
-                    # E2, but the constants index the PHYSICAL head of
-                    # fragment column n (class head-map note):
-                    #   head(t, n) = (t//2)*64 + (n//16)*32
-                    #              + (t%2)*16 + (n%16).
+                    # v6 math: same packed f32x2 pair schedule as
+                    # v17a/E2; the constants index the PHYSICAL head
+                    # of slice-fragment column n (class head-map
+                    # note; slice s = 2*sub_tile + j plays the v5
+                    # sub-tile role verbatim):
+                    #   head(s, n) = sub_tile*64 + (n//16)*32
+                    #              + j*16 + (n%16).
                     # Packed pairs remain per-value lookups with
                     # DISTINCT pair constants (the assumption-free
                     # shape), so the h16-box seam inside a pair needs
@@ -13985,8 +14180,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     phase_p_payload = chunk_payload
                     phase_ds_payload = chunk_payload + Int32(1)
                     head_base = Int32(
-                        (sub_tile // 2) * self.H_TILE_CTA
-                        + (sub_tile % 2) * self.SUB_TILE_BOX
+                        sub_tile * self.H_TILE_CTA
+                        + slice_j * self.MATH_SLICE_BOX
                     )
 
                     # --- P phase: packed softmax, then publish P. ---
@@ -13997,9 +14192,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     softmax_scale_log2_e = scale_softmax * Float32(
                         math.log2(math.e)
                     )
-                    assert cute.size(r_score) == self.SUB_TILE_VALS
+                    assert cute.size(r_score) == self.MATH_SLICE_VALS
                     for pair in cutlass.range_constexpr(
-                        self.SUB_TILE_VALS // 2
+                        self.MATH_SLICE_VALS // 2
                     ):
                         v0 = 2 * pair
                         v1 = v0 + 1
@@ -14017,15 +14212,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         )
                         head_0 = (
                             head_base
-                            + n_0 % Int32(self.SUB_TILE_BOX)
-                            + (n_0 // Int32(self.SUB_TILE_BOX))
-                            * Int32(self.SUB_TILE_H)
+                            + n_0 % Int32(self.MATH_SLICE_BOX)
+                            + (n_0 // Int32(self.MATH_SLICE_BOX))
+                            * Int32(self.MATH_SLICE_H)
                         )
                         head_1 = (
                             head_base
-                            + n_1 % Int32(self.SUB_TILE_BOX)
-                            + (n_1 // Int32(self.SUB_TILE_BOX))
-                            * Int32(self.SUB_TILE_H)
+                            + n_1 % Int32(self.MATH_SLICE_BOX)
+                            + (n_1 // Int32(self.MATH_SLICE_BOX))
+                            * Int32(self.MATH_SLICE_H)
                         )
                         s_0, s_1 = cute.arch.fma_packed_f32x2(
                             (r_score[v0], r_score[v1]),
@@ -14050,20 +14245,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         phase_p_payload,
                     )
 
-                    # ONE pds acquire per SUB-TILE (spec Z4, 2-stage):
-                    # edge: leader grads(t-2) consumer_release (UMMA-
-                    # tracked -- the previous user of pds stage t%2;
-                    # its G3/G4 reads of the slab bytes this publish
-                    # may overwrite are a subset, see the stage note
-                    # in the leader).  MATH_PDS_ACQ payload widens to
-                    # per-sub-tile (bundle*4 + t, spec Z8).
+                    # ONE pds acquire per SLICE (v5 cadence verbatim,
+                    # 2-stage, 4/bundle): edge: the PREVIOUS grads
+                    # batch's consumer_release of pds stage s%2 (UMMA-
+                    # tracked; its G3/G4 reads of the slab bytes this
+                    # publish may overwrite are a subset, see the
+                    # stage note in the leader).  MATH_PDS_ACQ payload
+                    # stays bundle*4 + s.
                     math_pds_acq_token = _iket.range_start(
                         "MATH_PDS_ACQ(i)",
-                        loop_iter * Int32(self.SUB_TILES)
-                        + Int32(sub_tile),
+                        loop_iter * Int32(
+                            self.SUB_TILES * self.MATH_SLICES
+                        )
+                        + Int32(slice_idx),
                     )
                     pipe_pds.producer_acquire(pds_state)
-                    if cutlass.const_expr(sub_tile == 0):
+                    if cutlass.const_expr(slice_idx == 0):
                         # dq_b free gate, once per bundle and BEFORE
                         # any dq_b write on this CTA (the own stmatrix
                         # below; the relay peer push is transitively
@@ -14076,28 +14273,30 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         dqb_free_state.advance()
                     _iket.range_end(
                         math_pds_acq_token,
-                        loop_iter * Int32(self.SUB_TILES)
-                        + Int32(sub_tile),
+                        loop_iter * Int32(
+                            self.SUB_TILES * self.MATH_SLICES
+                        )
+                        + Int32(slice_idx),
                     )
 
                     math_store_token = _iket.range_start(
                         "MATH_STORE(i)",
                         phase_p_payload,
                     )
-                    # Publish the sub-tile's two h16 P boxes into the
+                    # Publish the slice's two h16 P boxes into the
                     # NATURAL chunk image (J-mode pre-sliced target).
                     r_p_store = thread_copy_r2s.retile(r_p)
                     assert (
-                        t_rs_p_tiles[sub_tile].shape
+                        t_rs_p_tiles[slice_idx].shape
                         == r_p_store.shape
                     ), (
-                        str(t_rs_p_tiles[sub_tile].shape),
+                        str(t_rs_p_tiles[slice_idx].shape),
                         str(r_p_store.shape),
                     )
                     cute.copy(
                         tiled_copy_r2s,
                         r_p_store,
-                        t_rs_p_tiles[sub_tile],
+                        t_rs_p_tiles[slice_idx],
                     )
                     _iket.range_end(
                         math_store_token,
@@ -14112,7 +14311,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # Column-axis delta, per-value lookup (distinct
                     # pair constants, same rationale as the P phase).
                     for pair in cutlass.range_constexpr(
-                        self.SUB_TILE_VALS // 2
+                        self.MATH_SLICE_VALS // 2
                     ):
                         v0 = 2 * pair
                         v1 = v0 + 1
@@ -14130,15 +14329,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         )
                         head_0 = (
                             head_base
-                            + n_0 % Int32(self.SUB_TILE_BOX)
-                            + (n_0 // Int32(self.SUB_TILE_BOX))
-                            * Int32(self.SUB_TILE_H)
+                            + n_0 % Int32(self.MATH_SLICE_BOX)
+                            + (n_0 // Int32(self.MATH_SLICE_BOX))
+                            * Int32(self.MATH_SLICE_H)
                         )
                         head_1 = (
                             head_base
-                            + n_1 % Int32(self.SUB_TILE_BOX)
-                            + (n_1 // Int32(self.SUB_TILE_BOX))
-                            * Int32(self.SUB_TILE_H)
+                            + n_1 % Int32(self.MATH_SLICE_BOX)
+                            + (n_1 // Int32(self.MATH_SLICE_BOX))
+                            * Int32(self.MATH_SLICE_H)
                         )
                         ds_0, ds_1 = cute.arch.add_packed_f32x2(
                             (r_dp[v0], r_dp[v1]),
@@ -14167,34 +14366,34 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         phase_ds_payload,
                     )
                     r_ds_store = thread_copy_r2s.retile(r_ds)
-                    # Sub-tile dS publish into the natural chunk image
-                    # (chunk (t//2)'s J window; chunk (1-rank) doubles
-                    # as half of the relay's 8,192 B DSM payload once
-                    # both its windows have landed).
+                    # Slice dS publish into the natural chunk image
+                    # (chunk sub_tile's J window; chunk (1-rank)
+                    # doubles as half of the relay's 8,192 B DSM
+                    # payload once both its windows have landed).
                     assert (
-                        t_rs_ds_tiles[sub_tile].shape
+                        t_rs_ds_tiles[slice_idx].shape
                         == r_ds_store.shape
                     ), (
-                        str(t_rs_ds_tiles[sub_tile].shape),
+                        str(t_rs_ds_tiles[slice_idx].shape),
                         str(r_ds_store.shape),
                     )
                     cute.copy(
                         tiled_copy_r2s,
                         r_ds_store,
-                        t_rs_ds_tiles[sub_tile],
+                        t_rs_ds_tiles[slice_idx],
                     )
                     # dq_b own-half image (addendum section 1): the
-                    # sub-tiles with c == rank carry ONLY own-H64
-                    # columns, so the same register fragment re-stores
-                    # into dq_b sub_img[rank]'s J window -- zero TMEM
-                    # re-read, natural head order preserved ("4x h16
-                    # box" granularity, spec Z4).  The free gate was
-                    # taken at the t == 0 phase.
-                    if Int32(sub_tile // 2) == rank:
+                    # slices of the sub_tile == rank pass carry ONLY
+                    # own-H64 columns, so the same register fragment
+                    # re-stores into dq_b sub_img[rank]'s J window --
+                    # zero TMEM re-read, natural head order preserved
+                    # ("4x h16 box" granularity).  The free gate was
+                    # taken at the s == 0 phase.
+                    if Int32(sub_tile) == rank:
                         cute.copy(
                             tiled_copy_r2s,
                             r_ds_store,
-                            t_rs_dqb_tiles[sub_tile % 2],
+                            t_rs_dqb_tiles[slice_j],
                         )
 
                     # No validity mask (baseline-identical invariant
@@ -14205,11 +14404,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # predicates (global_n < topk, kv_index >= 0).
 
                     cute.arch.fence_view_async_shared()
-                    # Sub-tile pds commit (spec Z4: math is the pds
-                    # producer now; 4 commits/bundle).  edge -> leader
-                    # grads(t) consumer_wait; the fence above orders
-                    # the P/dS/dq_b stmatrix stores before the
-                    # leader's descriptor reads.
+                    # Slice pds commit (math is the pds producer;
+                    # 4 commits/bundle, v5 cadence verbatim).  edge ->
+                    # leader grads batch consumer_wait; the fence
+                    # above orders the P/dS/dq_b stmatrix stores
+                    # before the leader's descriptor reads.
                     pipe_pds.producer_commit(pds_state)
                     pds_state.advance()
                     _iket.range_end(
@@ -14221,11 +14420,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         chunk_payload,
                     )
                 # Once per BUNDLE: the DSM push and dqb gate arming
-                # belong to the relay warp (W18); the pds commit moved
-                # to the per-sub-tile cadence above (spec Z4).  Each
-                # math thread hands off with one release-semantics
-                # mbarrier arrive after its own fenced stores (covers
-                # all four sub-tile publishes AND the dq_b own image).
+                # belong to the relay warp (W18); the pds commit is
+                # per-slice above.  Each math thread hands off with
+                # one release-semantics mbarrier arrive after its own
+                # fenced stores (covers all four slice publishes AND
+                # the dq_b own image).
                 # edge -> relay's pds_ready wait (bundle-level).
                 math_bar1_token = _iket.range_start(
                     "MATH_BAR1(i)",
@@ -14388,8 +14587,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Producer,
                     self.SCORE_DONE_STAGES,
                 )
-                # v5.1b: strip stream consumer (stage = t % 2) and
-                # the 1-stage K residency gate.
+                # v6: strip stream consumer -- each pass waits/
+                # releases BOTH stages (D-lo then D-hi; the state
+                # advances twice inside the helper) -- and the
+                # 1-stage K residency gate.
                 strip_cons = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer,
                     2,
@@ -14402,7 +14603,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Consumer,
                     self.ROUND_STAGES,
                 )
-                # v5: pds is 2-stage, consumed per grads(t) sub-tile.
+                # pds is 2-stage; each grads batch double-waits both
+                # stages (math slices {2t, 2t+1}) up front and
+                # double-releases at its tail (frozen pair-helper
+                # protocol).
                 pds_cons = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer,
                     2,
@@ -14438,28 +14642,28 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     grad_fragment_a,
                     grad_fragment_b,
                 )
-                # v5.1 pair-batched bundle schedule (change order
-                # v5.1 item 1, total order):
-                #   score(0); score(1); score(2); grads(pair0={t0,t1});
-                #   score(3); grads(pair1={t2,t3}); G5 r0; G5 r1;
-                #   dq_b free group-commit.
-                # The score/math sub-tile pipeline is UNTOUCHED (math
-                # commits pds per sub-tile, 4/bundle); only the grads
-                # consumption batches to pair granularity -- protocol
-                # tax redemption: 8 blocks/pair with ONE dkv+round
-                # handshake set per block, drains 32 -> 16/bundle.
-                # grads(pair0) waits BOTH pds stages (math(0)+math(1))
-                # up front; math(2)/math(3) publish over grads(pair0)
-                # execution and gate grads(pair1).  v5.2: the bundle
-                # tail is the 16-block dQ EVICTION plane (rotating
-                # 2x16-column slots, offloaded by the reducers); the
-                # single-FIFO round ring keeps the kdq generations
-                # behind the 16 grad gens (see ROUND_GENS_PER_TILE).
-                # v5.1b: K is RESIDENT -- the
-                # bundle-head kres wait admits the gather's single
-                # 8-piece fill, and the release after score(3) is the
-                # tcgen05-tracked completion edge that gates the
-                # gather's NEXT-bundle fill.
+                # v6 fat-atom bundle schedule (spec item 4, amendment
+                # #1 order):
+                #   score(0); { score(1); kres release;
+                #   grads(batch0=chunk0) }; grads(batch1=chunk1);
+                #   G5 r0; G5 r1; dq_b free group-commit.
+                # One v6 grads batch == one v5.1 pair (the h64
+                # sub-tile IS the chunk), so the FROZEN pair helper
+                # serves verbatim: batch(t) double-waits pds stages
+                # {0,1} = math slices {2t, 2t+1}; math slices (1,j)
+                # publish over batch0's MMA window and gate batch1.
+                # v5.2: the bundle tail is the 16-block dQ EVICTION
+                # plane (rotating 2x16-column slots, offloaded by the
+                # reducers); the single-FIFO round ring keeps the kdq
+                # generations behind the 16 grad gens (see
+                # ROUND_GENS_PER_TILE).  K is RESIDENT -- the bundle-
+                # head kres wait admits the gather's single 8-piece
+                # fill; the release moves INSIDE the pass loop, right
+                # after score(1) and BEFORE the grads batch, so its
+                # tcgen05 tracked set is EXACTLY S(0)+S(1) (all K
+                # readers) and the gather's next-bundle fill overlaps
+                # batch0/batch1/G5 -- the "K(i+1) gather gate = last
+                # score pass completion edge" contract, sharpened.
                 for loop_iter in cutlass.range(tile_count):
                     dqb_parity = loop_iter & Int32(1)
 
@@ -14477,15 +14681,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         self.SUB_TILES
                     ):
                         strip_cons, s_prod, dp_prod = (
-                            self._issue_score_pass_v5(
+                            self._issue_score_pass_v6(
                                 sub_tile,
                                 score_tiled_mma,
                                 dp_tiled_mma,
                                 t_score
-                                if sub_tile % 2 == 0
+                                if sub_tile == 0
                                 else t_score_pp,
                                 t_dp
-                                if sub_tile % 2 == 0
+                                if sub_tile == 0
                                 else t_dp_pp,
                                 score_k_fragment,
                                 dp_k_fragment,
@@ -14500,11 +14704,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 loop_iter,
                             )
                         )
-                        if cutlass.const_expr(sub_tile == 2):
-                            # v5.1 rotation point: grads(pair0) issues
-                            # here; score(3) follows immediately and
-                            # its execution overlaps pair0's MMA
-                            # window (math(2)/math(3) publish over it).
+                        if cutlass.const_expr(
+                            sub_tile == self.SUB_TILES - 1
+                        ):
+                            # K residency release right after the LAST
+                            # score pass and BEFORE the grads batch:
+                            # tcgen05-tracked, so the tracked set ends
+                            # at S(1) (grads MMAs would only delay the
+                            # empty edge) and fires when score(1)(i)'s
+                            # reads complete -- the gather's K(i+1)
+                            # fill gate.
+                            pipe_kres.consumer_release(kres_cons)
+                            kres_cons.advance()
+                            # v6 rotation point (spec item 4):
+                            # grads(batch0) issues here, hidden under
+                            # score(1)'s execution window (math slices
+                            # (1, j) publish over it and gate batch1).
                             pds_cons, dkv_prod, round_cons = (
                                 self._issue_grads_pair_v51(
                                     0,
@@ -14526,17 +14741,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     loop_iter,
                                 )
                             )
-                    # v5.1b: K residency release AFTER score(3) --
-                    # tcgen05-tracked, so the empty edge fires when
-                    # score(3)(i)'s reads complete: exactly the
-                    # "K(i+1) gather gate = score(3)(i) completion
-                    # edge" contract.  Issued before grads(pair1) so
-                    # the gather's next-bundle fill overlaps the whole
-                    # grads/G5 tail.
-                    pipe_kres.consumer_release(kres_cons)
-                    kres_cons.advance()
 
-                    # grads(pair1): the bundle's last pair has no
+                    # grads(batch1): the bundle's last batch has no
                     # score to hide under (score(0) of bundle b+1
                     # cannot start before G5(b) frees the TMEM/ring
                     # order -- bundle boundary shape unchanged).
@@ -14650,10 +14856,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
 
         elif warp_idx == Int32(self.LOAD_WARP):
-            # --- load, v5.1b: the Q/dO STRIP stream (item 6; the
-            # one-shot panels are retired) + 20 round gens per bundle.
-            # Per bundle: 4 strip-pair gens (stage = t % 2, one Q+dO
-            # [h16 x D512] pair per score pass, synchronous TMA on the
+            # --- load, v6 (amendment #1): the Q/dO STRIP stream +
+            # 20 round gens per bundle.  Per bundle: 4 strip-pair gens
+            # (gen g = (pass g//2, d-half g%2), stage = g % 2, one
+            # Q+dO [h32 x D256] pair per gen, synchronous TMA on the
             # reused stationary mbar), then g0..g15 the 16 full-wide
             # (pair, D-round) x (dO, Q) gradient gens (software-
             # pipelined over two rotating barriers), then g16/g17 kdq
@@ -14679,11 +14885,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             tma_phase_0 = Int32(0)
             tma_phase_1 = Int32(0)
             strip_tma_phase = Int32(0)
-            # One strip = [h16 x D512] bf16 (16,384 B); a strip-pair
-            # gen carries Q + dO on one completion mbar.
+            # One strip = [h32 x D256] bf16 (16,384 B, amendment #1);
+            # a strip-pair gen carries Q + dO on one completion mbar.
             strip_stage_bytes = (
                 self.STATIONARY_TILE_H
-                * self.D_HEAD
+                * self.STATIONARY_TILE_D
                 * (self.element_dtype.width // 8)
             )
             if tile_count > Int32(0):
@@ -14691,42 +14897,51 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_index = (
                         tile_count - Int32(1) - loop_iter
                     )
-                    # v5.1b (item 6): the strip-pair stream -- four
-                    # generations per bundle, stage = t % 2, filled
-                    # ahead of the round gens (the score passes at the
-                    # bundle head are the earliest consumers).  Strip
-                    # t holds the CTA's window rows
-                    # H[(t//2)*64 + rank*32 + (t%2)*16 : +16)
-                    # = gmem h16-tile 4*(t//2) + (t%2) + 2*rank.
+                    # v6 (amendment #1): the strip-pair stream -- FOUR
+                    # generations per bundle (2*SUB_TILES; the count
+                    # decouples from the pass count), stage = g % 2,
+                    # filled ahead of the round gens (the score passes
+                    # at the bundle head are the earliest consumers).
+                    # Gen g = (t = g//2, dhalf = g%2) holds the CTA's
+                    # window rows
+                    # H[(g//2)*64 + rank*32 : +32) x D[(g%2)*256:+256)
+                    # = gmem (h32-tile 2*(g//2) + rank, d-tile g%2).
+                    # Pass t consumes gens {2t, 2t+1} = stages {0, 1}
+                    # (pieces 0-3 from stage 0, 4-7 from stage 1) and
+                    # releases stage 0 EARLY at its piece-4 boundary,
+                    # so gen 2t+2 refills stage 0 under the pass's
+                    # D-hi reads -- the v5 supply overlap form.
                     # Synchronous per gen: expect_tx covers the Q+dO
                     # pair on the (reused) stationary mbar, W17 waits
                     # its own TMA, then commits the strip generation.
                     # LOAD_QDO span name survives with per-gen payload
-                    # bundle*4 + t.
-                    for strip_t in cutlass.range_constexpr(
-                        self.SUB_TILES
+                    # bundle*4 + g.
+                    for strip_g in cutlass.range_constexpr(
+                        2 * self.SUB_TILES
                     ):
                         load_qdo_token = _iket.range_start(
                             "LOAD_QDO",
-                            loop_iter * Int32(self.SUB_TILES)
-                            + Int32(strip_t),
+                            loop_iter * Int32(2 * self.SUB_TILES)
+                            + Int32(strip_g),
                         )
                         # edge: leader's strip release -- tcgen05-
-                        # tracked score(t-2) B-read completion (init
-                        # credits cover t = 0, 1 of bundle 0).
+                        # tracked B-read completion of the PREVIOUS
+                        # occupant of stage g%2 (score pass (g-2)//2's
+                        # early/tail release; init credits cover
+                        # g = 0, 1 of bundle 0).
                         # v5.2 MAT_ACQ probe (gen ordinals: strips
                         # 0-3, wide 4-19, kdq 20-23).
                         mat_acq_token = _iket.range_start(
                             "MAT_ACQ(m,g)",
                             loop_iter * Int32(32)
-                            + Int32(strip_t),
+                            + Int32(strip_g),
                         )
                         pipe_strip.producer_acquire(strip_acq)
                         strip_acq.advance()
                         _iket.range_end(
                             mat_acq_token,
                             loop_iter * Int32(32)
-                            + Int32(strip_t),
+                            + Int32(strip_g),
                         )
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(
@@ -14737,28 +14952,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             tma_atom_q,
                             t_q_gmem[
                                 None,
-                                Int32(
-                                    4 * (strip_t // 2)
-                                    + strip_t % 2
-                                )
-                                + Int32(2) * rank,
-                                0,
+                                Int32(2 * (strip_g // 2)) + rank,
+                                Int32(strip_g % 2),
                             ],
-                            t_q_smem[None, strip_t % 2],
+                            t_q_smem[None, strip_g % 2],
                             tma_bar_ptr=stationary_tma_mbars,
                         )
                         cute.copy(
                             tma_atom_do,
                             t_do_gmem[
                                 None,
-                                Int32(
-                                    4 * (strip_t // 2)
-                                    + strip_t % 2
-                                )
-                                + Int32(2) * rank,
-                                0,
+                                Int32(2 * (strip_g // 2)) + rank,
+                                Int32(strip_g % 2),
                             ],
-                            t_do_smem[None, strip_t % 2],
+                            t_do_smem[None, strip_g % 2],
                             tma_bar_ptr=stationary_tma_mbars,
                         )
                         cute.arch.mbarrier_wait(
@@ -14771,8 +14978,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         strip_com.advance()
                         _iket.range_end(
                             load_qdo_token,
-                            loop_iter * Int32(self.SUB_TILES)
-                            + Int32(strip_t),
+                            loop_iter * Int32(2 * self.SUB_TILES)
+                            + Int32(strip_g),
                         )
                     # g0..g15: FULL-WIDE round-gen B TMA fills, one
                     # gen per (pair, D-round, tensor), pair-major
@@ -14781,7 +14988,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # box (expect_tx = 8,192 B, GMEM-natural [H,D]
                     # rows through the transposed [D,H] view at
                     # h64-tile P == chunk P -- the pair's two h32
-                    # sub-tile head sets tile it exactly).  Software-
+                    # math-slice head sets tile it exactly).  Software-
                     # pipelined exactly like v17a/v32: issue gen q,
                     # then wait/commit gen q-1 on the other barrier,
                     # so no barrier is re-armed while pending.
@@ -15086,7 +15293,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         tmem.free(tmem_ptr)
 
     @cute.jit
-    def _issue_score_pass_v5(
+    def _issue_score_pass_v6(
         self,
         sub_tile: cutlass.Constexpr[int],
         score_tiled_mma: cute.TiledMma,
@@ -15105,37 +15312,56 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dp_producer_state: pipeline.PipelineState,
         issue_seq: Int32,
     ):
-        """v5.1b head-outer score pass t: 8 window reads x (S_t, dP_t).
+        """v6 FAT-ATOM head-outer score pass t: 8 window reads x
+        (S_t, dP_t), each ONE genuine N=64 CG2 atom -- 32 enqueues
+        per pass, 64/bundle vs v5's 128 (the enqueue-tax thesis).
 
-        A operand (item 5): the RESIDENT K image -- fragment stage ==
-        D-piece (8 stages); no per-piece gate (the bundle-level
-        pipe_kres wait/release lives in the leader, K(i+1)'s gather
-        gate = this pass sequence's last completion edge).
-        B operand (item 6): the Q/dO STRIP double buffer -- fragment
-        stage index = (t%2)*8 + piece (strip stage t%2 holds THIS
-        pass's h16 window, filled by W17 under pipe_strip).
-          strip consumer_wait  <- edge: W17's strip-pair(t) commit
-                                  (TMA landed + fenced);
-          strip consumer_release-> edge: W17's strip acquire for pass
-                                  t+2 (tcgen05-tracked: fires when
-                                  this pass's B reads complete).
-        Done-pipeline cadence unchanged from v5: one (s, dp) stage
-        pair (stage == t%2) acquired up front, committed after the
-        pass, 4 commits/bundle; S(t+1) issuable while math T2Rs S(t).
-        ACCUMULATE=False on the pass's first k-block.  RETURNS the
-        advanced (strip, s, dp) states (lesson #14 return-and-
-        reassign across the @cute.jit boundary).
+        A operand: the RESIDENT K image -- fragment stage == D-piece
+        (8 stages, N-independent, byte-identical to v5); no per-piece
+        gate (the bundle-level pipe_kres wait/release lives in the
+        leader; K(i+1)'s gather gate = the LAST pass's completion
+        edge).
+        B operand (amendment #1): the re-boxed [h32 x D256] Q/dO
+        STRIP double buffer through the auto 8-stage [n32 x k64]
+        score-B layout -- fragment window index == piece (pieces 0-3
+        live in strip stage 0 = this pass's D-lo gen 2t, pieces 4-7
+        in stage 1 = gen 2t+1).  Per-stage strip protocol (2 waits +
+        2 releases per pass, 4 = 4 per bundle):
+          consumer_wait(stage 0)  at the pass head
+                                  <- edge: W17 gen 2t commit;
+          consumer_release(stage 0) at the piece-4 boundary, EARLY
+                                  (tcgen05-tracked: fires when the
+                                  D-lo B reads complete) -> edge:
+                                  W17's acquire for gen 2t+2 (the
+                                  NEXT pass's D-lo refills under
+                                  this pass's D-hi reads -- the v5
+                                  supply-overlap form);
+          consumer_wait(stage 1)  at the piece-4 boundary
+                                  <- edge: W17 gen 2t+1 commit
+                                  (trace note: this wait sits INSIDE
+                                  S_ISSUE(i); a supply starve shows
+                                  as a mid-span gap at the D-half
+                                  boundary, cross-check LOAD_QDO);
+          consumer_release(stage 1) at the pass tail -> W17 gen 2t+3.
+        Done-pipeline cadence (v6): ONE (s, dp) stage pair acquired
+        up front, committed after the pass -- 2 commits/bundle
+        (stage == t; math waits it at slice 2t and releases after
+        slice 2t+1's T2R).  ACCUMULATE=False on the pass's first
+        k-block.  RETURNS the advanced (strip, s, dp) states (lesson
+        #14 return-and-reassign across the @cute.jit boundary; strip
+        advances TWICE).
         """
 
         s_done_pipeline.producer_acquire(s_producer_state)
         dp_done_pipeline.producer_acquire(dp_producer_state)
-        # edge: W17 strip-pair(t) TMA complete (stage t % 2).
+        # edge: W17 gen 2t (this pass's D-lo strip pair) TMA complete
+        # (stage 0).
         strip_pipeline.consumer_wait(strip_consumer_state)
         # Canonical-name contract (harness trace-prepare requires
-        # S_ISSUE/dP_ISSUE): payload = bundle * 4 + t (spec Z8).  The
-        # window-read pass interleaves both planes, so S_ISSUE covers
-        # pass start .. the last G1 atom and dP_ISSUE the residual dP
-        # tail; the two tile the pass window exactly.
+        # S_ISSUE/dP_ISSUE): payload = bundle * 2 + t (v6 spec item
+        # 5).  The window-read pass interleaves both planes, so
+        # S_ISSUE covers pass start .. the last G1 atom and dP_ISSUE
+        # the residual dP tail; the two tile the pass window exactly.
         pass_payload = issue_seq * Int32(self.SUB_TILES) + Int32(
             sub_tile
         )
@@ -15150,19 +15376,26 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             if cutlass.const_expr(piece == 0):
                 s_mma.set(tcgen05.Field.ACCUMULATE, False)
                 dp_mma.set(tcgen05.Field.ACCUMULATE, False)
+            if cutlass.const_expr(
+                piece == self.SCORE_D_PIECES // 2
+            ):
+                # D-half boundary: EARLY stage-0 release (UMMA-
+                # tracked over the D-lo gemms above), then admit the
+                # D-hi strip (gen 2t+1).
+                strip_pipeline.consumer_release(
+                    strip_consumer_state
+                )
+                strip_consumer_state.advance()
+                strip_pipeline.consumer_wait(strip_consumer_state)
             for k_block in cutlass.range_constexpr(k_blocks):
-                # G1(t): S^T sub-tile accumulator (A = resident K
-                # piece window; B = strip window).
+                # G1(t): S^T h64 sub-tile accumulator (A = resident K
+                # piece window; B = [n32 x k64] strip window; one
+                # N64 atom).
                 cute.gemm(
                     s_mma,
                     t_s,
                     k_fragment[None, None, k_block, piece],
-                    q_fragment[
-                        None,
-                        None,
-                        k_block,
-                        (sub_tile % 2) * 8 + piece,
-                    ],
+                    q_fragment[None, None, k_block, piece],
                     t_s,
                 )
                 if cutlass.const_expr(
@@ -15177,18 +15410,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "dP_ISSUE(i)",
                         pass_payload,
                     )
-                # G2(t): dP^T sub-tile accumulator (V == K: the SAME
-                # resident piece window is the A operand).
+                # G2(t): dP^T h64 sub-tile accumulator (V == K: the
+                # SAME resident piece window is the A operand).
                 cute.gemm(
                     dp_mma,
                     t_dp,
                     dp_k_fragment[None, None, k_block, piece],
-                    do_fragment[
-                        None,
-                        None,
-                        k_block,
-                        (sub_tile % 2) * 8 + piece,
-                    ],
+                    do_fragment[None, None, k_block, piece],
                     t_dp,
                 )
                 s_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -15198,11 +15426,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             pass_payload,
         )
         cute.arch.fence_view_async_tmem_store()
-        # Strip stage release: W17 may refill stage t%2 for pass t+2
-        # once this pass's B reads complete (UMMA-tracked).
+        # Strip stage-1 release: W17 may refill it (gen 2t+3) once
+        # this pass's D-hi B reads complete (UMMA-tracked).
         strip_pipeline.consumer_release(strip_consumer_state)
         strip_consumer_state.advance()
-        # Sub-tile stage commits (stage == t % 2, one pair per pass).
+        # Sub-tile stage commits (stage == t, one pair per pass, 2
+        # commits/bundle).
         s_done_pipeline.producer_commit(s_producer_state)
         s_producer_state.advance()
         dp_done_pipeline.producer_commit(dp_producer_state)
@@ -16320,7 +16549,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 #     placement itself.
 #   * N32 CG2 MMA fold: the (64,(16,2)):(1,(128,64)) interleaved atom
 #     is assumed legal per spec ("MMA N32 legal tier"); make_fragment_C
-#     shape asserts (SUB_TILE_VALS) and the layout report catch a
+#     shape asserts (MATH_SLICE_VALS) and the layout report catch a
 #     mismatch at trace-prepare.
 #   * score-B 16-stage byte identity: algebra in the SCORE_B_STAGES
 #     note; the cosize/atom asserts hold host-side, the block-order
@@ -16534,4 +16763,98 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # cadence appears at the bundle tails.  R7/R8 (residency window /
 # strip descriptor layouts) remain the prime suspects for the r4
 # S_ISSUE slope -- MAT_ACQ is the cross-examination probe.
+# ======================================================================
+# ======================================================================
+# ======================================================================
+# V6 FAT-ATOM ADDENDUM (V6_FAT_ATOM_SPEC + amendment #1 "R-B",
+# 2026-08-04; supersedes the v5 addenda's score-plane geometry, TMEM
+# map, strip supply, and payload table -- everything else inherits)
+# ======================================================================
+#
+# Thesis: PRODUCTION granularity decouples from CONSUMPTION.  The
+# score planes produce h64 sub-tiles (genuine N=64 CG2 atoms -- the
+# r11 verdict priced the v5 release at ~85% TC time pinned by 176
+# small-atom enqueues at ~0.2 us/each); the math side keeps consuming
+# h32 slices with ZERO register-budget change.  Enqueue budget:
+# score 64 (2 passes x 8 pieces x 2 k_blocks x G1G2) + grads 64
+# (16 blocks x 4 kb-gemms, frozen) + evict 32 (16 blocks x 2 waves,
+# frozen) = 160 vs v5's 224 as counted by the same ruler (the spec's
+# 112-vs-176 used block-level counting; the score-plane halving is
+# the invariant claim either way).
+#
+# Score plane: (M,N,K) = (kv128, h64, D64), SCORE_MMA_TILER
+# (128,64,64), 2 passes/bundle.  Head map is NATURAL: head(t, n) =
+# t*64 + n (CTA r's B N-half supplies n in [r*32,+32)).  S/dP TMEM:
+# 2-stage x 32-column slots -- S [32,96), dP [96,160), dkv army
+# moves to [160,416), budget 416 <= 512 (echo-assert in __call__).
+#
+# Strip supply (amendment #1, W17 un-frozen as zone 1.5): strips
+# re-box [h16 x D512] -> [h32 x D256] (same 16,384 B/box, same 4
+# gens/bundle, same SMEM byte plan).  Gen g = (pass g//2, d-half
+# g%2) -> stage g%2; gmem window = heads [ (g//2)*64 + rank*32, +32)
+# x D[(g%2)*256, +256).  score-B = AUTO make_smem_layout_b(N64,
+# (128,64,64), 8 stages) bound at the strip base -- byte identity
+# s*2048 = (s//4)*8192 + (s%4)*2048 (score-B stage s == strip stage
+# s//4, k64 block s%4), descriptors fully canonical.  Fragment
+# window index == piece (8-wide last mode; the spec's original
+# 16-wide index form died with the h16-strip premise, see
+# V6_BUILD_LOG [z6]).
+#
+# Strip protocol (4 produced = 4 consumed / bundle): pass t waits
+# stage 0 at its head and stage 1 at the piece-4 boundary; it
+# releases stage 0 EARLY at that same boundary (UMMA-tracked over
+# the D-lo gemms) so W17's gen 2t+2 refills stage 0 under the
+# pass's D-hi reads -- the v5 supply-overlap form survives re-boxing.
+# Trace note: the stage-1 wait sits INSIDE S_ISSUE(i); a supply
+# starve shows as a mid-span gap at the D-half boundary
+# (cross-examine LOAD_QDO / MAT_ACQ strips 0-3).
+#
+# Math consumption (core discipline, register budget zero-change):
+# slice s = 2*sub_tile + j carries the ENTIRE v5 sub-tile machinery
+# verbatim -- the N-parametric CG2 fold (col = n % (N/2), DP-half =
+# n // (N/2)) makes the 16-column window at slot offset 16*j
+# pointwise head-identical to the v5 sub-tile (c = sub_tile, j):
+# head(s, n) = sub_tile*64 + (n//16)*32 + j*16 + (n%16).  The slice
+# T2R sources are FOUR static 16-column windows per plane at
+# base + 16*s over score_slice_c_layout (the (128,32) CG2 fold,
+# derived through the dQ-eviction MMA -- fragment_C ignores operand
+# majorness; hardware-validated shape).  Publish domain, J-mode
+# store tiles, softmax pair lookups, pds cadence (4/bundle): all v5
+# forms with s as the index.
+#
+# Pipeline cadence deltas (everything else inherits v5.2):
+#   s/dp done: 2 commits/bundle (stage == pass t, static); math
+#     waits at slice j == 0, releases after slice j == 1's T2R (the
+#     32-column slot fully read).  The j == 1 WAIT_S/WAIT_dP spans
+#     wrap nothing and read ~0 by construction.
+#   strip: 4 = 4 with the early-release form above.
+#   kres: release moves INSIDE the pass loop, right after score(1)
+#     and BEFORE grads(batch0), so the tcgen05 tracked set is
+#     EXACTLY S(0)+S(1) -- the gather's K(i+1) fill overlaps
+#     batch0/batch1/G5.
+#   pds / round / dkv_done / dq_evict / dqb_free: byte-identical
+#     protocols (grads batch == v5.1 pair == chunk == v6 sub-tile;
+#     the frozen pair helper's double-wait pairs with math slices
+#     {2t, 2t+1} naturally).
+# Leader total order: score(0); { score(1); kres release;
+# grads(batch0) }; grads(batch1); G5 r0; G5 r1; dq_b free commit.
+#
+# Payload table (deltas only; names UNCHANGED, 28 + provenance =
+# 29/29): S_ISSUE/dP_ISSUE = b*2 + t; WAIT_S/T2R_S/WAIT_dP/T2R_dP/
+# MATH_PD = 8b + 2s (SOFTMAX/STORE phases +0/+1) with s the h32
+# slice -- v5-identical encoding; MATH_PDS_ACQ = 4b + s; LOAD_QDO =
+# 4b + g; MAT_ACQ = 32b + ordinal (strips 0-3, wide 4-19, kdq
+# 20-23, table unchanged); dVdK_ISSUE / WAIT_dK / REDUCE_* / DQ_EPI
+# / LOAD_K / ROUTE_K / MATH_BAR1 / ROUTE_dS: unchanged.
+#
+# Verdict hooks (pre-registered): release e2e must fall
+# significantly below v5's 35.653 ms (prophecy band 20-25 ms);
+# S_ISSUE per-pass window ~31 -> ~15 enqueue slots at ~2x the
+# per-atom cost cap (the fat atom pays FLOPs x2 per instruction);
+# leader's ~36 us bundle stall shortens with the K-release
+# sharpening; TC occupancy re-estimate against the 0.2 us/atom
+# small-atom tax curve.  Correctness gate: bit-exactness NOT
+# expected (S accumulation order changes with atom shape); f32
+# full-precision accumulate + single terminal rounding class is
+# unchanged (tolerance gate adjudicates).
 # ======================================================================
