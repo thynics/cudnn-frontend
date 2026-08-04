@@ -11749,9 +11749,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # makes the algebra exact).  P/dS slab chunk images, the dq_b
     # image, and the 8,192 B relay payload stay byte-identical to v32
     # (the frozen relay/G5/epilogue paths' precondition).
-    SCORE_MMA_TILER = (128, 64, 64)
+    # [v9-LB] D128 K-fattening: the 8xD64 and 4xD128 auto layouts are
+    # the SAME byte function (recon [lb-recon-z3]: offset(p,m,d) =
+    # p*4096 + (m//8)*512 + (m%8)*64 + d; new stage s == old piece
+    # pair {2s,2s+1} in place) -- the re-boxing is a physical no-op;
+    # only descriptor window hops halve (16 -> 8 per plane per pass).
+    SCORE_MMA_TILER = (128, 64, 128)
     SCORE_MMA_N = 64
-    SCORE_D_PIECES = 8
+    SCORE_D_PIECES = 4
     # SCORE_H_CHUNKS survives as the CONTAINER count (2 natural h64
     # chunk images: P/dS slab images); in v6 the SCHEDULING unit (the
     # h64 sub-tile) coincides with the chunk.
@@ -11784,8 +11789,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # stationary panel becomes the zero-copy score-B view (8 D64 piece
     # windows), the gradient stream moves to the dkv-B operand (GMEM-
     # natural [H,D] TMA), and the dq epilogue stores the transposed tile.
-    K_CHUNK = 64
-    K_CHUNKS = 8
+    K_CHUNK = 128
+    K_CHUNKS = 4
     SCORE_A_IS_STATIONARY = False
     # v5.1b (item 5): K RESIDENCY.  The 2-slot chase ring retires; the
     # score-A buffer becomes one resident [own-kv64 x D512] image per
@@ -11794,7 +11799,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # per bundle (the v5 per-pass re-gather retires with the ring:
     # -75% gather traffic) under a single 1-stage completion gate
     # (pipe_kres); every score pass window-reads the same residency.
-    SCORE_A_STAGES = 8
+    SCORE_A_STAGES = 4
     # v6 (amendment #1, R-B): the score-B container stays the 2-stage
     # Q/dO strip buffer, RE-BOXED to [h32 x D256] per strip (same
     # 16,384 B/box, same 4 generations per bundle).  One strip = the
@@ -11808,7 +11813,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # (8-wide last mode; pieces 0-3 read strip stage 0, pieces 4-7
     # stage 1 -- the pass releases stage 0 EARLY at the piece-4
     # boundary so W17 refills it under the D-hi reads).
-    SCORE_B_STAGES = 8
+    SCORE_B_STAGES = 4
     SCORE_A_MAX_ELEMENTS = 32768
     SCORE_B_MAX_ELEMENTS = 32768
     DKV_A_MAJOR = OperandMajorMode.K
@@ -13608,10 +13613,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self._chase_slot_rows_v32(k_chase, 1),
                 self._chase_slot_rows_v32(k_chase, 2),
                 self._chase_slot_rows_v32(k_chase, 3),
-                self._chase_slot_rows_v32(k_chase, 4),
-                self._chase_slot_rows_v32(k_chase, 5),
-                self._chase_slot_rows_v32(k_chase, 6),
-                self._chase_slot_rows_v32(k_chase, 7),
             )
             if tile_count > Int32(0):
                 for loop_iter in cutlass.range(tile_count):
