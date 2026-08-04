@@ -13,3 +13,4 @@
 [10] drains + dQ epilogue wiring (_drain_dkv_block_v32 x8/bundle, epilogue kept v17a-orientation, staging moved to round bufs) done, py_compile OK, ~240 lines
 [12] V32 SELF-AUDIT trailer + dormant-helper deletion (-462 lines) + IKET budget (26 static names <= 29) done, py_compile OK
 [13] final sweep: stale-comment fixes, build complete at 14992 lines, py_compile OK
+[14] rotation surgery: prologue score(0) + guarded score(t+1) per iter (probe-A 67% backpressure verdict); gather co-rotation: r1(prev) kdq moved out of the piece-2 boundary to after the chase loop (three-axis audit caught the four-role cycle); trace-reading note: S_ISSUE/dP_ISSUE payload=scored bundle b, wall-clock now lands in leader iteration b-1 (b=0 in prologue) -- pair ad-hoc probes with payload-1. py_compile OK

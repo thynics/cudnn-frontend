@@ -13135,10 +13135,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # piece 0 acquire succeeds exactly when the leader,
                 # waiting at G3(c1,0)(t), has drained the score plane of
                 # bundle t -- the pinned-issue contract of the design.
-                # The bundle-t kdq fills run AFTER the next bundle's
-                # score chase (v8 inheritance: their round credits free
-                # near the end of grads(t-1), so the credit-gated kdq
-                # never delays the next score gather).
+                # ROTATED-leader co-rotation (audit: the old in-loop
+                # r1(prev) rendezvous at the piece-2 boundary closed a
+                # four-role cycle once the leader consumes chase(t+1)
+                # BEFORE releasing bundle t's round credits -- leader
+                # blocked in score(t+1) piece 2, gather blocked in the
+                # r1(t) barrier, W17 blocked on g2(t)'s ring credit,
+                # whose release IS the blocked leader).  The kdq fills
+                # of bundle t now run AFTER this bundle's chase loop:
+                # chase(t) -> r1(t-1) -> r0(t).  Forward proof: r1(t-1)
+                # needs W17's g10/g11(t-1) acquire <- grads(t-1)'s
+                # g8/g9 release, and the rotated leader runs grads(t-1)
+                # after score(t) in the SAME iteration -- reachable
+                # before gather leaves chase(t).
                 for loop_iter in cutlass.range(tile_count):
                     bundle_idx = tile_count - Int32(1) - loop_iter
                     load_k_token = _iket.range_start(
@@ -13148,30 +13157,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     for piece in cutlass.range_constexpr(
                         self.SCORE_D_PIECES
                     ):
-                        if cutlass.const_expr(piece == 2):
-                            # The 2-slot ring banks only TWO cross-
-                            # bundle credits (score(prev)'s last two
-                            # releases); piece 2 blocks on score(this).
-                            # The r1(prev) rendezvous must run BEFORE
-                            # that block, or leader step (4) of prev
-                            # never unblocks (audit: four-role cycle,
-                            # tile_count >= 2 deterministic deadlock).
-                            if loop_iter > Int32(0):
-                                self._gather_kdq_v8(
-                                    mKV,
-                                    mTopkIdxs,
-                                    gather_kd_rows_0,
-                                    gather_kd_rows_1,
-                                    token_idx,
-                                    batch_idx,
-                                    bundle_idx + Int32(1),
-                                    Int32(1),
-                                    topk,
-                                    rank,
-                                    tidx,
-                                    kv_copy_atom,
-                                    kv_thread_copy,
-                                )
                         pipe_kscore.producer_acquire(gather_state)
                         if cutlass.const_expr(piece % 2 == 0):
                             self._load_chase_piece_v32(
@@ -13212,8 +13197,26 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         load_k_token,
                         loop_iter,
                     )
-                    # (r1(prev) kdq now runs inside the chase loop, at
-                    # the piece-2 boundary -- see the audit note there.)
+                    # Round-1 kdq of the PREVIOUS bundle (g10/g11 --
+                    # its ring credits free when the rotated leader's
+                    # grads(prev) releases g8/g9, later in the same
+                    # leader iteration that issued score(this)).
+                    if loop_iter > Int32(0):
+                        self._gather_kdq_v8(
+                            mKV,
+                            mTopkIdxs,
+                            gather_kd_rows_0,
+                            gather_kd_rows_1,
+                            token_idx,
+                            batch_idx,
+                            bundle_idx + Int32(1),
+                            Int32(1),
+                            topk,
+                            rank,
+                            tidx,
+                            kv_copy_atom,
+                            kv_thread_copy,
+                        )
                     # Round-0 kdq of THIS bundle (g0/g1, feeds the G5 r0
                     # waves that run right after the score plane).
                     self._gather_kdq_v8(
@@ -13897,25 +13900,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     grad_fragment_a,
                     grad_fragment_b,
                 )
-                # v3.2 dr-major bundle schedule (chunk innermost -- the
-                # only deadlock-free order per the design's audit):
-                #   (1) score plane, K-outer over 8 chase pieces;
+                # v3.2 ROTATED bundle schedule (probe-A verdict: 67% of
+                # the W17 lane was ring-credit backpressure mirroring
+                # the leader's serial bundle -- the v12 rotation returns):
+                #   prologue: score(0);
+                #   iter t: (1') score(t+1) -- overlaps math(t)'s
+                #           T2R/compute window instead of exposing it;
                 #   (2) G5 D-round 0 waves (gens g0/g1);
-                #   (3) gradient rounds r0..r3 (gens g2..g9), one
-                #       dkv_done generation per completed block;
-                #   (4) G5 D-round 1 waves (gens g10/g11) + the dq_b
-                #       free group-commit.
-                # The chase pieces of bundle t+1 fill DURING (2)-(4):
-                # every ring credit they need was released inside (1),
-                # so by the time the leader stalls at the first grads
-                # wait -- the design's G3(c1,0)(t) pin point -- the
-                # gather is already streaming t+1's pieces.
-                for loop_iter in cutlass.range(tile_count):
-                    dqb_parity = loop_iter & Int32(1)
-
-                    # The @cute.jit boundary re-materializes state
-                    # arguments: the helper's advances must come back
-                    # through the return (rev3 dominance failure).
+                #   (3) gradient rounds r0..r3 (gens g2..g9);
+                #   (4) G5 D-round 1 waves (gens g10/g11) + free commit.
+                # Forward-only proof sketch: score(t+1)'s up-front
+                # s/dp_done acquires wait math(t)'s T2R releases (math
+                # needs only score(t)'s MMA completion, issued one
+                # iteration earlier); pds/mb_dqb/dqb_free edges keep
+                # their positions relative to grads(t)/G5(t).  The
+                # last-tile guard keeps score(N) from consuming chase
+                # pieces the gather never produces.
+                if tile_count > Int32(0):
                     kscore_cons, s_prod, dp_prod = (
                         self._issue_score_pieces_v32(
                             score_tiled_mma,
@@ -13936,9 +13937,41 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             s_prod,
                             pipe_dp_done,
                             dp_prod,
-                            loop_iter,
+                            Int32(0),
                         )
                     )
+                for loop_iter in cutlass.range(tile_count):
+                    dqb_parity = loop_iter & Int32(1)
+
+                    # (1') next bundle's score plane, hidden under
+                    # math(t).  The @cute.jit boundary re-materializes
+                    # state arguments (rev3), so the advanced states
+                    # come back through the return; the dynamic guard
+                    # is a type-stable join (states pre-initialized).
+                    if loop_iter < tile_count - Int32(1):
+                        kscore_cons, s_prod, dp_prod = (
+                            self._issue_score_pieces_v32(
+                                score_tiled_mma,
+                                dp_tiled_mma,
+                                t_score,
+                                t_score_pp,
+                                t_dp,
+                                t_dp_pp,
+                                score_k_fragment,
+                                dp_k_fragment,
+                                score_q_fragments[0],
+                                score_q_fragments[1],
+                                score_do_fragments[0],
+                                score_do_fragments[1],
+                                pipe_kscore,
+                                kscore_cons,
+                                pipe_s_done,
+                                s_prod,
+                                pipe_dp_done,
+                                dp_prod,
+                                loop_iter + Int32(1),
+                            )
+                        )
 
                     # (2) G5 D-round 0: gated per wave on the mb_dqb[w]
                     # cluster gates armed by the relays during THIS
