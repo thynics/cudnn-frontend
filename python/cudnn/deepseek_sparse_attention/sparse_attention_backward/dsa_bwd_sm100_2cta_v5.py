@@ -12625,12 +12625,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # head order), but one math pass covers only the sub-tile's
         # TWO h16 column boxes, 32 heads apart.  The column mode is
         # regrouped (16, 2):(1, 32) -- box-local head, box-hi -- and
-        # the image's degenerate stage slot is REUSED as the window
-        # mode J = (2):(16): slicing the partitioned tensor at J = t%2
-        # selects the sub-tile's boxes.  The offset rides the LAYOUT
-        # coordinates (never the pointer), so the SW128B swizzle stays
-        # anchored at the 1,024 B-aligned image base (a raw +32 B
-        # pointer offset would NOT commute with the swizzle).
+        # the window mode J = (2):(16) sits at TOP-LEVEL domain mode 1
+        # ([fix-r1]; see the placement note at the construction):
+        # slicing the partitioned tensor at J = t%2 selects the
+        # sub-tile's boxes.  The offset rides the LAYOUT coordinates
+        # (never the pointer), so the SW128B swizzle stays anchored at
+        # the 1,024 B-aligned image base (a raw +32 B pointer offset
+        # would NOT commute with the swizzle).
         # Strides derive from the epi layout family; the column
         # premise is asserted SEMANTICALLY (fix-r0): the hardware r0
         # gate showed the epi outer as
@@ -12660,14 +12661,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         assert cute.size(score_store_layout.outer, mode=[2]) == 1, str(
             score_store_layout.outer
         )
+        # [fix-r1] J placement: the hardware r1 gate showed that
+        # partition_D consumes domain mode 0 ENTIRELY -- with J inside
+        # mode 0 the 4,096-element bundle divided against the copy's
+        # 2,048-element D-tile and the tile-iteration factor (== J)
+        # FOLDED into the rest mode ((8,1),(2,2),1,1,1: mode[1] became
+        # (in-tile 2, J 2), sub-mode order machinery-internal), while
+        # the top-level padding modes 1..3 passed through verbatim to
+        # output modes 2..4 (both the v32 slice-at-mode-4 precedent
+        # and the r1 echo confirm this passthrough law).  So J lives
+        # at TOP-LEVEL domain mode 1 (shape 2, stride 16): mode 0 is
+        # then EXACTLY the copy tile (2,048 = 64 rows x 32 cols,
+        # v32-congruent where mode 0 == tile == 4,096), no folding,
+        # and J passes through deterministically to output mode [2].
+        # The J offset still rides the LAYOUT coordinates (never the
+        # pointer), so the SW128B swizzle stays anchored at the
+        # 1,024 B-aligned image base -- the Z3b contract is intact.
         score_store_domain = cute.make_layout(
             (
                 (
                     score_store_layout.outer.shape[0],
                     (self.SUB_TILE_BOX, 2),
-                    2,
                 ),
-                1,
+                2,
                 1,
                 1,
             ),
@@ -12675,9 +12691,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 (
                     score_store_layout.outer.stride[0],
                     (1, self.SUB_TILE_H),
-                    self.SUB_TILE_BOX,
                 ),
-                0,
+                self.SUB_TILE_BOX,
                 0,
                 0,
             ),
@@ -12688,13 +12703,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         # Publish-domain width contract (spec Z4, asserted explicitly):
         # each J slice of the domain exposes EXACTLY the h32 sub-tile
-        # -- SUB_TILE_H columns as (16, 2) boxes -- and the J window
-        # mode carries the two slices.
+        # -- SUB_TILE_H columns as (16, 2) boxes -- and the top-level
+        # J window mode carries the two slices.
         assert (
             cute.size(score_store_domain, mode=[0, 1])
             == self.SUB_TILE_H
         ), str(score_store_domain)
-        assert cute.size(score_store_domain, mode=[0, 2]) == 2, str(
+        assert cute.size(score_store_domain, mode=[1]) == 2, str(
             score_store_domain
         )
         # Per h-chunk stmatrix targets (static sub-image bases).
@@ -13523,37 +13538,43 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             t_rs_ds_0 = thread_copy_r2s.partition_D(ds_store[0])
             t_rs_ds_1 = thread_copy_r2s.partition_D(ds_store[1])
             t_rs_dqb = thread_copy_r2s.partition_D(dqb_own_store)
-            # The J window mode must survive partitioning at mode 4
-            # (the old degenerate stage slot); echo the shape if the
-            # partition machinery placed it elsewhere.
-            assert cute.size(t_rs_p_0, mode=[4]) == 2, str(
+            # [fix-r1] The J window is a TOP-LEVEL domain mode now
+            # (mode 1), and top-level modes 1..3 pass through
+            # partition_D verbatim to output modes 2..4 (empirical law
+            # from the v32 slice-at-mode-4 precedent plus the r1 echo,
+            # where the in-mode-0 J folded into the rest mode
+            # instead).  J must therefore surface at output mode [2];
+            # echo the shape if the machinery moved it.
+            assert cute.size(t_rs_p_0, mode=[2]) == 2, str(
                 t_rs_p_0.shape
             )
-            assert cute.size(t_rs_ds_0, mode=[4]) == 2, str(
+            assert cute.size(t_rs_ds_0, mode=[2]) == 2, str(
                 t_rs_ds_0.shape
             )
-            assert cute.size(t_rs_dqb, mode=[4]) == 2, str(
+            assert cute.size(t_rs_dqb, mode=[2]) == 2, str(
                 t_rs_dqb.shape
             )
             # Sub-tile store tiles, indexed by t: (chunk c = t//2 picks
-            # the tensor, window j = t%2 picks the J slice).
+            # the tensor, window j = t%2 indexes the J mode at [2];
+            # the trailing size-1 passthrough modes stay, keeping the
+            # sliced arity at four modes exactly like v32's tiles).
             t_rs_p_tiles = (
-                t_rs_p_0[None, None, None, None, 0],
-                t_rs_p_0[None, None, None, None, 1],
-                t_rs_p_1[None, None, None, None, 0],
-                t_rs_p_1[None, None, None, None, 1],
+                t_rs_p_0[None, None, 0, None, None],
+                t_rs_p_0[None, None, 1, None, None],
+                t_rs_p_1[None, None, 0, None, None],
+                t_rs_p_1[None, None, 1, None, None],
             )
             t_rs_ds_tiles = (
-                t_rs_ds_0[None, None, None, None, 0],
-                t_rs_ds_0[None, None, None, None, 1],
-                t_rs_ds_1[None, None, None, None, 0],
-                t_rs_ds_1[None, None, None, None, 1],
+                t_rs_ds_0[None, None, 0, None, None],
+                t_rs_ds_0[None, None, 1, None, None],
+                t_rs_ds_1[None, None, 0, None, None],
+                t_rs_ds_1[None, None, 1, None, None],
             )
             # dq_b own-image windows: only the two sub-tiles with
             # c == rank write here; their J windows are j = 0 / j = 1.
             t_rs_dqb_tiles = (
-                t_rs_dqb[None, None, None, None, 0],
-                t_rs_dqb[None, None, None, None, 1],
+                t_rs_dqb[None, None, 0, None, None],
+                t_rs_dqb[None, None, 1, None, None],
             )
             r_score = cute.make_rmem_tensor(
                 score_coordinates.shape,
@@ -15621,9 +15642,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # baseline.
 #
 # V5 residual risk register (audit before first hardware run):
-#   * partition_D J-mode position: asserted (mode[4] == 2, shape echo)
-#     -- if the tiled-copy machinery flattens the domain differently,
-#     the trace-prepare assert fires; fix is a one-line mode index.
+#   * partition_D J-mode position: asserted (mode[2] == 2, shape echo).
+#     [fix-r1] the r1 gate showed partition_D consumes domain mode 0
+#     entirely (an in-mode-0 J folded into the rest mode with
+#     machinery-internal sub-mode order); J now sits at TOP-LEVEL
+#     domain mode 1 -- mode 0 == the copy tile exactly (v32-congruent)
+#     -- and passes through to output mode [2] per the passthrough law
+#     confirmed by both hardware echoes.  Remaining exposure = the
+#     sliced-tile vs retile shape congruence (asserted with echo).
 #     [fix-r0] the upstream premise asserts were re-formed after the
 #     first hardware gate: the epi outer carries degenerate size-1
 #     sub-modes ((64,1):(1,0) columns), so the flat-leaf comparisons
