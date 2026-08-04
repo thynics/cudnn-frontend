@@ -13940,13 +13940,43 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 t_rs_dqb[None, None, 0, None, None],
                 t_rs_dqb[None, None, 1, None, None],
             )
-            r_score = cute.make_rmem_tensor(
-                score_coordinates.shape,
-                self.acc_dtype,
+            # [v8-LE] T2R fragment DOUBLE BUFFERS as static tuples
+            # (fix-r7 discipline: distinct tensors, constexpr tuple
+            # index only -- never runtime slot arithmetic).  Slot
+            # slice_j holds the fragment of the pass's j-th slice;
+            # slot 1 is the intra-pass prefetch target filled while
+            # slice 0 computes.  Register offset argument: fragments
+            # [0] make their LAST read in slice 0's dS math (the
+            # add/mul packed pairs), so their 32 f32 live ranges end
+            # before slice 1's compute begins -- the allocator recycles
+            # them into slice 1's temps and the j == 1 compute runs at
+            # baseline pressure.  Peak pressure sits in slice 0's dS
+            # phase (fragments [0] live + fragments [1] in flight);
+            # the compile resource check (coordinator, B200) is the
+            # backstop on the 128-reg / 156-84 spill red line.
+            # r_p/r_ds staging stays SINGLE: stmatrix reads registers
+            # at issue, so each slice's publish frees them before the
+            # next slice writes (v5 lifetime, unchanged).
+            assert self.MATH_SLICES == 2
+            r_score_pp = (
+                cute.make_rmem_tensor(
+                    score_coordinates.shape,
+                    self.acc_dtype,
+                ),
+                cute.make_rmem_tensor(
+                    score_coordinates.shape,
+                    self.acc_dtype,
+                ),
             )
-            r_dp = cute.make_rmem_tensor(
-                score_coordinates.shape,
-                self.acc_dtype,
+            r_dp_pp = (
+                cute.make_rmem_tensor(
+                    score_coordinates.shape,
+                    self.acc_dtype,
+                ),
+                cute.make_rmem_tensor(
+                    score_coordinates.shape,
+                    self.acc_dtype,
+                ),
             )
             r_p = cute.make_rmem_tensor(
                 score_coordinates.shape,
@@ -13981,6 +14011,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                       self.MATH_SLICES
                   ):
                     slice_idx = 2 * sub_tile + slice_j
+                    # [v8-LE] per-slice fragment binding (constexpr
+                    # tuple index; trace-time rebinding only).  The
+                    # softmax/pds/publish block below reads r_score/
+                    # r_dp by bare name and stays textually intact.
+                    r_score = r_score_pp[slice_j]
+                    r_dp = r_dp_pp[slice_j]
                     chunk_payload = loop_iter * Int32(
                         2 * self.SUB_TILES * self.MATH_SLICES
                     ) + Int32(2 * slice_idx)
@@ -14002,15 +14038,33 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "T2R_S(i)",
                         chunk_payload,
                     )
-                    cute.copy(
-                        score_copies[slice_idx],
-                        score_sources[slice_idx],
-                        r_score,
-                    )
+                    # [v8-LE] A-tier intra-pass T2R pipeline: only the
+                    # pass's FIRST slice issues its own S T2R here; the
+                    # second slice's fragment was PRE-ISSUED during
+                    # j == 0 (prefetch block at the tail of T2R_dP), so
+                    # at j == 1 this span is the reap fence alone.
+                    # NEW SPAN READING (name/payload unchanged):
+                    # tcgen05.wait::ld waits on ALL prior loads of the
+                    # thread, so the j == 1 T2R_S fence reaps BOTH
+                    # prefetched planes (S and dP) at once; the j == 1
+                    # T2R_dP fence below is then a structural no-op.
+                    # T2R_S(j == 1) therefore measures the RESIDUAL
+                    # prefetch latency not hidden by slice 0's compute
+                    # (~0 when the pipeline works), not a fresh T2R.
+                    if cutlass.const_expr(slice_j == 0):
+                        cute.copy(
+                            score_copies[slice_idx],
+                            score_sources[slice_idx],
+                            r_score,
+                        )
                     cute.arch.fence_view_async_tmem_load()
                     # edge -> leader's s acquire for the next pass on
                     # this stage (TMEM ping-pong WAR); released only
-                    # after the pass's SECOND slice T2R.
+                    # after the pass's SECOND slice fragment is fenced
+                    # into registers (the copy itself was pre-issued at
+                    # j == 0; the fence above is its completion proof,
+                    # so the release stays exactly as sound as v6's
+                    # copy->fence->release order).
                     if cutlass.const_expr(slice_j == 1):
                         pipe_s_done.consumer_release(s_state)
                         s_state.advance()
@@ -14035,12 +14089,47 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "T2R_dP(i)",
                         chunk_payload,
                     )
-                    cute.copy(
-                        dp_copies[slice_idx],
-                        dp_sources[slice_idx],
-                        r_dp,
-                    )
+                    # [v8-LE] j == 0 issues its own dP T2R; j == 1's
+                    # was pre-issued below and is already fenced by the
+                    # T2R_S(j == 1) bulk reap, so the j == 1 fence here
+                    # is a no-op kept for structure (per-T2R fence
+                    # discipline) and as a local completion proof ahead
+                    # of the dp release.
+                    if cutlass.const_expr(slice_j == 0):
+                        cute.copy(
+                            dp_copies[slice_idx],
+                            dp_sources[slice_idx],
+                            r_dp,
+                        )
                     cute.arch.fence_view_async_tmem_load()
+                    if cutlass.const_expr(slice_j == 0):
+                        # [v8-LE prefetch] pre-issue the pass's SECOND
+                        # slice T2R for BOTH planes (issue-only; no
+                        # fence -- the j == 1 spans reap).  Placed
+                        # AFTER this slice's fence so the j == 0 spans
+                        # keep measuring their own loads only (a fence
+                        # issued later would otherwise wait on these
+                        # too -- bulk tcgen05.wait::ld semantics).
+                        # LEGALITY: the pass's s_done/dp_done waits
+                        # (j == 0, above) cover the FULL 32-column
+                        # accumulator slot = both 16-column J windows,
+                        # so this crosses no pipeline wait (A-tier:
+                        # intra-pass only; cross-pass prefetch would
+                        # need next pass's wait first -- B-tier, not
+                        # here).  The loads fly while slice 0 runs
+                        # softmax/pds (~the whole compute window),
+                        # hiding the T2R latency chain NCU convicted
+                        # (F2FP stalls, 83% long_sb).
+                        cute.copy(
+                            score_copies[slice_idx + 1],
+                            score_sources[slice_idx + 1],
+                            r_score_pp[1],
+                        )
+                        cute.copy(
+                            dp_copies[slice_idx + 1],
+                            dp_sources[slice_idx + 1],
+                            r_dp_pp[1],
+                        )
                     # edge -> leader's dp acquire (second slice).
                     if cutlass.const_expr(slice_j == 1):
                         pipe_dp_done.consumer_release(dp_state)
@@ -16608,4 +16697,76 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 #      overlap); S(1) length is the case-1 natural experiment -- if
 #      the co-residency decay dies with reduce silence, the 100 ns/
 #      enqueue in-kernel tax was reduce-lane-induced.
+# ======================================================================
+# ======================================================================
+# V8-LE ADDENDUM (V8_MATH_PIPE_SPEC, 2026-08-05; A-tier ONLY.  Amends
+# the v6 addendum's math-consumption paragraph and the span-reading
+# notes for T2R_S/T2R_dP; every other paragraph above stays in force.)
+# ======================================================================
+#
+# Thesis: math's serial chain (~3.1 us x 4 slices/bundle) is the
+# deep pacer; NCU convicted the T2R latency chain (83% long_sb in the
+# math window, F2FP packing stalled on tcgen05.ld data).  V8-LE
+# software-pipelines the math inner loop WITHIN each pass (A-tier):
+# while slice j == 0 computes, slice j == 1's S/dP T2R fragments are
+# already in flight -- ILP hides the T2R latency of every second
+# slice (half the exposed chain; cross-pass B-tier would hide the
+# rest but moves pipeline waits, not attempted here).
+#
+# Mechanism (the only unfrozen zone -- math consumer inner loop):
+#   - T2R fragments are DOUBLE-BUFFERED static tuples r_score_pp /
+#     r_dp_pp (fix-r7: two distinct rmem tensors, constexpr index,
+#     no runtime slot arithmetic); slice_j binds r_score/r_dp so the
+#     softmax/pds/publish block is textually v6-identical.
+#   - j == 0: own S copy -> fence -> (WAIT_dP) -> own dP copy ->
+#     fence -> PREFETCH both planes of slice j == 1 (issue-only,
+#     copies[slice_idx + 1] -> *_pp[1]) -> compute.
+#   - j == 1: NO copies; the T2R_S fence is the reap point; releases
+#     (s_done/dp_done) keep their positions and their soundness (the
+#     fence directly above each release proves the full 32-column
+#     slot is in registers).
+#
+# Fence algebra (tcgen05.wait::ld is a BULK wait -- all prior loads
+# of the thread, no per-load token): the prefetch is issued AFTER
+# both j == 0 fences, so the j == 0 T2R spans measure their own
+# loads only; the j == 1 T2R_S fence necessarily reaps BOTH
+# prefetched planes at once, and the j == 1 T2R_dP fence is a
+# structural no-op (kept for per-T2R fence discipline and as the
+# release's local completion proof).
+#
+# NEW SPAN READING (names/payloads UNCHANGED, 28 + provenance =
+# 29/29): T2R_S(j == 1) = residual prefetch latency not hidden by
+# slice 0's compute (~0 when the pipeline works; it is NOT a fresh
+# T2R and now covers the dP plane too); T2R_dP(j == 1) ~ 0 (no-op
+# fence + release); T2R_dP(j == 0) additionally contains the two
+# prefetch ISSUES (async, no wait).  WAIT_S/WAIT_dP semantics
+# unchanged (pass-level, j == 0).
+#
+# Prefetch legality (A-tier contract): the pass's s_done/dp_done
+# waits (j == 0) cover the FULL 32-column accumulator slot = both
+# 16-column J windows, so the intra-pass prefetch crosses NO
+# pipeline wait.  TMEM WAR: the s/dp releases still happen only
+# after the j == 1 fence proves both windows read -- the leader's
+# ping-pong reissue window is untouched.  Register WAW across
+# passes: every prefetch issue site is preceded in program order by
+# the PREVIOUS pass's j == 1 reap fence over the same destination
+# registers.
+#
+# Register account (static; B200 compile check is the arbiter):
+# fragments [1] go live at the prefetch (during slice 0's compute)
+# while fragments [0] die at slice 0's last dS-math read -- worst
+# case +32 f32 live across slice 0's compute vs v6 (spec's +16 was
+# optimistic), recycled fully by slice 1 (baseline pressure there).
+# Offsets: r_p dies at the P publish (stmatrix reads at issue) and
+# head/exp temps are transient -- the allocator can fold them into
+# the peak.  Red line: 128 reg / spill <= 156 LDL + 84 STL.
+# REGISTERED FALLBACK if the line breaks: delay the dP prefetch to
+# after slice 0's dS-math loop (disjoint r_dp_pp live ranges, +16
+# peak) at the cost of residual dP latency at the j == 1 reap.
+#
+# Verdict hooks (pre-registered): math per-slice 3.1 -> ~2 us target
+# (T2R_S/T2R_dP j == 1 spans collapse toward 0; MATH_PD unchanged);
+# per-bundle math window shrinks ~2 x the hidden T2R latency;
+# correctness bit-class unchanged (same loads, same math, same
+# publish order -- only issue timing moves).
 # ======================================================================
