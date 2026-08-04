@@ -36,3 +36,10 @@
    R6 发射账 ruler 差异已在尾注注记（v6 160 为混合口径；v7 G5 按调用数 4/bundle 报账，不跨代直接比较）。
   py_compile：OK（逐区 + 终态复验）。不 commit（协调者权）；不投测试（proxy 归协调者）。验收门待硬件：correctness 4/4 → release 判决带 12-18ms → trace 四钩子（reduce 占用 89%→~50%、尾停摆 36µs→<8µs、grads 环 2 节流形态、S(1) 共驻衰减自然实验）。
 [v7-r1] 硬件判决（协调者）：correctness 4/4 全过；release 21.943ms vs v6 35.548 = **−38%（战役首次真突破）**；周期 12.39µs/64kv（税后 43.5µs/bundle）。四钩子：尾停摆 36→12.8µs（offload 实心块消灭 ✓）；reduce w8 79%（其中 WAIT_dK≈ATOMIC≈2µs/对——drain 一半时间在等 grads MMA 的 TC 退队）；drain 节奏 4.95µs/对（贴 STOP 门 5 未破，环 2 站住）；S(1) 恒 3.10µs 且 **S(0) 0.94→2.08µs**（周期缩短后失去全场沉睡窗——共驻税命中双 pass）。**格局反转：案 1 的内核内 TC 有效吞吐税（孤立价 3-4×）从 3% 小案升格为主 pacer**——账面：杀税后周期 →15-20µs ⇒ e2e 8-10ms ≈ baseline 量级。下一步：NCU 地面真相轮（stall 分类/TC 利用率/L1TEX/时钟）在飞。
+[v7-ncu] NCU 地面真相轮（--set full，41 replay，主 kernel 21.44ms 同量级）：
+  (1) stall 分类：No-Eligible 84.09%、long_sb 55.5%、barrier 23.8%；math/MIO/TEX throttle ≈0；热点 PC = mbarrier TRYWAIT+NANOSLEEP 环、named-barrier 环、以及一个 LDG 轮询环（12.7% 全核采样，疑 gather/topk 索引）——聚合停顿被设计性等待主导，需按角色拆分判读。
+  (2) **TC 实际活跃仅 11.5-17.6%**（≈纯 FLOPs 时间 5µs/43.5µs bundle）——"释放版 TC 钉死"论彻底埋葬；TC 跑起来就是全速，问题是喂不满。
+  (3) 溢出实锤：96 reg/线程发射基线，local spill 15.28MB/kernel + SMEM spill 3.44MB，43-51% LDL/STL 来自 spill，L1 命中 11.7%；NCU 估算 local 修复 +24%、SMEM store 7.3-way 冲突（pds 存储）修复 +8%。但 spill 指令处仅 0.2% 停顿采样——真伤在依赖消费点（long_sb 自旋分支）。
+  (4) **案1终审定罪：v11 时代配额表 × v7 新角色**：leader 家族 wg（w16-19）在 decrease(48) 桶（13555 行），v7 leader 工作量在 48 reg 下溢出 → 发射环 LDL 重载 → 共驻活跃时 L1 冲刷 → 100ns/条（沉睡时 spill 行驻 L1 → 28ns）。微基准七连无罪终解：小内核不溢出。约束：setmaxnreg warpgroup 粒度 + 8 倍数 + 池 640×96。DSL API 存在且在用（setmaxregister_increase/decrease）。
+  (5) 时钟 1.837GHz 稳定（93.5% 额定）排除降频。
+  → 配额网格编译扫描（每角色 spill 计数）+ 条件性 v7r2 已委托。
