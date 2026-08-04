@@ -226,9 +226,9 @@ class MmaAtomPriceBench:
         # 取数的压迫; t2r = 双 CTA 的 warps4-7 整 warpgroup 对 TMEM 空闲
         # 列区持续 tcgen05.ld (T2R), 复现内核里 math/reduce 读流量与 TC
         # 累加器写全程并发的 TMEM 端口争抢; none = 原始安静基线。
-        assert load_mode in ("none", "smem", "t2r"), f"bad load_mode={load_mode}"
+        assert load_mode in ("none", "smem", "t2r", "fma"), f"bad load_mode={load_mode}"
         self.load_mode = load_mode
-        self.threads_per_cta = {"none": 32, "smem": 128, "t2r": 256}[load_mode]
+        self.threads_per_cta = {"none": 32, "smem": 128, "t2r": 256, "fma": 256}[load_mode]
         if load_mode == "t2r":
             # 目标列区 [2N, 2N+64): 恒避开双累加器区 [0, 2N), 不越 512 列。
             assert 2 * instr_n + self.T2R_COLS <= self.TMEM_COLUMNS, (
@@ -469,6 +469,36 @@ class MmaAtomPriceBench:
                     offset = offset + Int32(1)
                     storm_done = _mbarrier_try_wait(done_mbar, Int32(0))
 
+        # ---- 背景负载: warps1-7 稠密 FMA 自旋（发射位稀释探针） ----
+        # 复现内核 pass-1 现场: math/reduce 共驻 warp 满负荷执行 ALU 流,
+        # 与 leader 的 gemm 入队指令争抢 SM warp 调度器发射位。纯寄存器
+        # FMA 链（每轮 128 条, 8 路独立累加链保 ILP), 不触 SMEM/TMEM/L2,
+        # 与 smem/t2r 档正交。退出协议同 smem 档。
+        if cutlass.const_expr(self.load_mode == "fma"):
+            if warp_idx > 0:
+                acc0 = Float32(1.0) + Float32(tidx) * Float32(1e-6)
+                acc1 = Float32(1.1); acc2 = Float32(1.2); acc3 = Float32(1.3)
+                acc4 = Float32(1.4); acc5 = Float32(1.5); acc6 = Float32(1.6)
+                acc7 = Float32(1.7)
+                storm_done = cutlass.Boolean(False)
+                while not storm_done:
+                    for _spin in cutlass.range_constexpr(16):
+                        acc0 = acc0 * Float32(1.0000001) + Float32(1e-7)
+                        acc1 = acc1 * Float32(1.0000002) + Float32(1e-7)
+                        acc2 = acc2 * Float32(1.0000003) + Float32(1e-7)
+                        acc3 = acc3 * Float32(1.0000004) + Float32(1e-7)
+                        acc4 = acc4 * Float32(1.0000005) + Float32(1e-7)
+                        acc5 = acc5 * Float32(1.0000006) + Float32(1e-7)
+                        acc6 = acc6 * Float32(1.0000007) + Float32(1e-7)
+                        acc7 = acc7 * Float32(1.0000008) + Float32(1e-7)
+                    storm_done = _mbarrier_try_wait(done_mbar, Int32(0))
+                # 防 DCE 锚: 不可证伪谓词内落存(运行时永不触发)。
+                if num_batches == Int32(0):
+                    a_flat[Int32(0)] = self.element_dtype(
+                        acc0 + acc1 + acc2 + acc3
+                        + acc4 + acc5 + acc6 + acc7
+                    )
+
         # ---- 背景负载: 双 CTA 的 warps4-7 整 warpgroup 持续 T2R 读 TMEM ----
         # 复现内核结构: math/reduce 的 tcgen05.ld 读流量与 TC 累加器写全程
         # 并发（TMEM 端口争抢主嫌探针）。目标列区 [2N, 2N+64) 恒避开双累加
@@ -585,7 +615,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dual-acc", type=int, choices=[0, 1], default=0,
                    help="1=两个 TMEM 累加器交替(排除同累加器链)")
     p.add_argument("--load-mode",
-                   choices=["none", "smem", "t2r", "both", "all"],
+                   choices=["none", "smem", "t2r", "fma", "both", "all"],
                    default="none",
                    help="背景负载: smem=双 CTA warp1-3 对操作数区 STS 风暴"
                         "(CG2 跨 CTA 取数争抢探针); t2r=双 CTA warps4-7 整 "
@@ -632,7 +662,7 @@ def main() -> int:
     if args.load_mode == "both":
         load_modes = ["none", "smem"]
     elif args.load_mode == "all":
-        load_modes = ["none", "smem", "t2r"]
+        load_modes = ["none", "smem", "t2r", "fma"]
     else:
         load_modes = [args.load_mode]
     rows = []
