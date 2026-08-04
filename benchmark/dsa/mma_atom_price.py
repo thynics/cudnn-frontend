@@ -218,6 +218,7 @@ class MmaAtomPriceBench:
         dual_acc: bool = False,
         num_clusters: int = 1,
         load_mode: str = "none",
+        t2r_target: str = "far",
     ):
         assert instr_n % 16 == 0 and 16 <= instr_n <= 256, f"bad N={instr_n}"
         assert batch_atoms >= 1 and k_chunks >= 1 and num_clusters >= 1
@@ -227,11 +228,13 @@ class MmaAtomPriceBench:
         # 列区持续 tcgen05.ld (T2R), 复现内核里 math/reduce 读流量与 TC
         # 累加器写全程并发的 TMEM 端口争抢; none = 原始安静基线。
         assert load_mode in ("none", "smem", "t2r", "fma"), f"bad load_mode={load_mode}"
+        assert t2r_target in ("far", "near", "acc"), f"bad t2r_target={t2r_target}"
+        self.t2r_target = t2r_target
         self.load_mode = load_mode
         self.threads_per_cta = {"none": 32, "smem": 128, "t2r": 256, "fma": 256}[load_mode]
         if load_mode == "t2r":
             # 目标列区 [2N, 2N+64): 恒避开双累加器区 [0, 2N), 不越 512 列。
-            assert 2 * instr_n + self.T2R_COLS <= self.TMEM_COLUMNS, (
+            assert (2 * instr_n if t2r_target == "far" else instr_n if t2r_target == "near" else 0) + self.T2R_COLS <= self.TMEM_COLUMNS, (
                 f"t2r 列区 [{2 * instr_n}, {2 * instr_n + self.T2R_COLS}) "
                 f"越界 TMEM {self.TMEM_COLUMNS} 列 (N={instr_n} 过大)"
             )
@@ -512,7 +515,9 @@ class MmaAtomPriceBench:
             if warp_idx >= 4:
                 dp_idx = tidx - Int32(128)  # warpgroup 内相对 DP 索引 0..127
                 t_t2r = cute.make_tensor(
-                    tmem_ptr + 2 * self.instr_n,
+                    tmem_ptr + {"far": 2 * self.instr_n, "near": self.instr_n, "acc": 0}[
+                        self.t2r_target
+                    ],
                     cute.make_layout(
                         (self.T2R_DP, self.T2R_COLS),
                         stride=(self.T2R_LANE_STRIDE, 1),
@@ -617,10 +622,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--load-mode",
                    choices=["none", "smem", "t2r", "fma", "both", "all"],
                    default="none",
-                   help="背景负载: smem=双 CTA warp1-3 对操作数区 STS 风暴"
-                        "(CG2 跨 CTA 取数争抢探针); t2r=双 CTA warps4-7 整 "
-                        "warpgroup 对 TMEM 空闲列持续 T2R(端口争抢探针); "
-                        "both=none+smem 双测; all=none+smem+t2r 三档全测")
+                   )
+    p.add_argument("--t2r-target", choices=["far", "near", "acc"],
+                   default="far",
+                   help="t2r 档目标列区: far=[2N,2N+64) 远列(原状); "
+                        "near=[N,N+64) 邻列; acc=[0,64) 直读活跃累加器区")
     p.add_argument("--clusters", type=int, default=1,
                    help="并发 cluster 数(>1 仅作时间不变性 sanity check; "
                         "计时/原子数仍按单 cluster 报)")
@@ -671,7 +677,7 @@ def main() -> int:
         for n in n_list:
             row = {"mode": mode, "N": n, "batch_atoms": args.batch_atoms,
                    "k_chunks": args.k_chunks, "dual_acc": args.dual_acc,
-                   "load_mode": load_mode}
+                   "load_mode": load_mode, "t2r_target": args.t2r_target}
             try:
                 bench = MmaAtomPriceBench(
                     instr_n=n,
@@ -682,6 +688,7 @@ def main() -> int:
                     dual_acc=bool(args.dual_acc),
                     num_clusters=args.clusters,
                     load_mode=load_mode,
+                    t2r_target=args.t2r_target,
                 )
                 compiled = cute.compile(
                     bench, Int32(1), stream, options=f"--gpu-arch {arch}"
