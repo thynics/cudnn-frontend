@@ -1,1 +1,2 @@
 # V6 build log (fork of v5 @ bd22106; spec V6_FAT_ATOM_SPEC.md)
+[atom-price·协调者] B200 实测原子价曲线（mma_atom_price.py，N 扫描，fixed≡rotate）：N32=11.2ns/条(5.61/n16)、N64=13.4(3.35)、N128=17.2(2.15)、N256=34.5(2.16，饱和)。判决：①固定税假说成立，h64=1.68×效率、h128=2.61×、N128 摊平；②累加器复用不串行；③孤立价 11-35ns vs 内核实测入队价 ~200ns = 15×差距，且内核里 G1 小原子与 dVdK 大原子同价 ⇒ 内核 0.2µs 为形状无关的每条前端/仲裁成本（嫌疑：UMMA 前端、TMEM 端口与 math/reduce T2R 争抢）⇒ v6 减条数收益直接兑现；同时标记 v7 级矿脉（200ns→孤立价 = MMA 面 5×+ 余量）。release 预测更新：h64 → ~14µs/64kv ≈ 25ms 档。
