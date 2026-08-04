@@ -14169,10 +14169,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "ROUTE_K(i)",
                         Int32(2) * loop_iter,
                     )
+                    # Probe A: ring-credit waits are the backpressure
+                    # signal (leader consumption pace); everything else
+                    # in the umbrella span is gather pace / TMA work.
+                    acq_token = _iket.range_start(
+                        "MAT_ACQ(m,g)",
+                        loop_iter * Int32(16),
+                    )
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
+                    _iket.range_end(
+                        acq_token,
+                        loop_iter * Int32(16),
+                    )
                     # v8: the gather warps write the K_dQ images (128
                     # threads vs 32).  Handshake A publishes "both stage
                     # credits held"; handshake B returns "both images
@@ -14210,8 +14221,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     for flat_gen in cutlass.range_constexpr(8):
                         grad_round = flat_gen // 2
                         tensor_kind = flat_gen % 2
+                        acq_token = _iket.range_start(
+                            "MAT_ACQ(m,g)",
+                            loop_iter * Int32(16)
+                            + Int32(flat_gen + 2),
+                        )
                         pipe_round.producer_acquire(round_acq)
                         round_acq.advance()
+                        _iket.range_end(
+                            acq_token,
+                            loop_iter * Int32(16)
+                            + Int32(flat_gen + 2),
+                        )
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(
                                 round_tma_mbars + tensor_kind,
@@ -14301,10 +14322,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "ROUTE_K(i)",
                         Int32(2) * loop_iter + Int32(1),
                     )
+                    acq_token = _iket.range_start(
+                        "MAT_ACQ(m,g)",
+                        loop_iter * Int32(16) + Int32(10),
+                    )
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
+                    _iket.range_end(
+                        acq_token,
+                        loop_iter * Int32(16) + Int32(10),
+                    )
                     self.kdq_barrier.arrive_and_wait()
                     self.kdq_barrier.arrive_and_wait()
                     cute.arch.fence_view_async_shared()
