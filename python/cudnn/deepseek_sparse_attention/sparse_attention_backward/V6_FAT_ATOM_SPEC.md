@@ -56,3 +56,16 @@ chase loader、dkv 槽算术、workspace 开凿。
 3. release e2e 对 v5 的 35.653ms 显著下降（预言带 20-25ms）；
 4. trace：S_ISSUE 逐条价（预期 ~0.22µs×31→高 N 下条数减半）、leader 大停摆、
    TC 占用率重估。
+
+## 修正案 #1（2026-08-04，用户批准 R-B）
+
+[v6-STOP] 裁决：采纳 R-B。strip 重装箱 [h16×D512]→[h32×D256]（同 16,384B/箱、
+同 4 gen/bundle，字节恒等式 s*2048=(s//4)*8192+(s%4)*2048，描述符 canonical），
+**W17 strip gen 区解除冻结、列为手术区 1.5**（约 30 行重写：gen g=(t6=g//2,
+dhalf=g%2)，gmem 窗 = 头 [t6*64+r*32,+32) × D[dhalf*256,+256)，h32-tile 索引
+2*(g//2)+rank）。score-B = auto make_smem_layout_b(N64,(128,64,64),8 stage) 直接
+绑定；B 窗索引合同以 R-B 为准（piece 8 宽末模），spec 原 16 宽字面式作废。
+pass 内早释放 stage0（piece3 后）保 W17 预填重叠；strip 管线 4 产=4 耗。
+手术序：zone1（常量+SUB_TILE_BOX 逐点+头解码乘数换钩）→ zone1.5（strip 重装箱）
+→ zone2（score 环）→ zone3（math）→ zone4/5。zone1 的 [z5] 处置一并批准。
+注：haifa 已弃用——建造者无需任何探针轮；测试统一由协调者经 ~/proxy 委托。
