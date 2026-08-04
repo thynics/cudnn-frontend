@@ -13148,15 +13148,58 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # g8/g9 release, and the rotated leader runs grads(t-1)
                 # after score(t) in the SAME iteration -- reachable
                 # before gather leaves chase(t).
+                # Head-start prologue (surgery B): pieces 0/1 of the
+                # FIRST bundle fill before the loop; every later
+                # bundle's pieces 0/1 prefill at the tail of the
+                # PREVIOUS gather iteration (into the two slots the
+                # just-finished score plane released), so the r1(prev)
+                # barrier wait no longer delays the next score's head.
+                # Credit identity: 2 + 6N + 2(N-1) = 8N fills.
+                for head_piece in cutlass.range_constexpr(2):
+                    pipe_kscore.producer_acquire(gather_state)
+                    if cutlass.const_expr(head_piece == 0):
+                        self._load_chase_piece_v32(
+                            mKV,
+                            mTopkIdxs,
+                            chase_rows_0,
+                            token_idx,
+                            batch_idx,
+                            tile_count - Int32(1),
+                            Int32(head_piece),
+                            topk,
+                            rank,
+                            tidx,
+                            kv_copy_atom,
+                            kv_thread_copy,
+                        )
+                    else:
+                        self._load_chase_piece_v32(
+                            mKV,
+                            mTopkIdxs,
+                            chase_rows_1,
+                            token_idx,
+                            batch_idx,
+                            tile_count - Int32(1),
+                            Int32(head_piece),
+                            topk,
+                            rank,
+                            tidx,
+                            kv_copy_atom,
+                            kv_thread_copy,
+                        )
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.fence_view_async_shared()
+                    pipe_kscore.producer_commit(gather_state)
+                    gather_state.advance()
                 for loop_iter in cutlass.range(tile_count):
                     bundle_idx = tile_count - Int32(1) - loop_iter
                     load_k_token = _iket.range_start(
                         "LOAD_K(i)",
                         loop_iter,
                     )
-                    for piece in cutlass.range_constexpr(
-                        self.SCORE_D_PIECES
-                    ):
+                    for tail_piece in cutlass.range_constexpr(6):
+                        piece = tail_piece + 2
                         pipe_kscore.producer_acquire(gather_state)
                         if cutlass.const_expr(piece % 2 == 0):
                             self._load_chase_piece_v32(
@@ -13193,6 +13236,51 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         cute.arch.fence_view_async_shared()
                         pipe_kscore.producer_commit(gather_state)
                         gather_state.advance()
+                    # Prefill pieces 0/1 of the NEXT bundle: their ring
+                    # credits are score(this)'s last two releases
+                    # (UMMA-tracked, already fired by the time the six
+                    # tail fills drain), and the fills consume gather
+                    # time that would otherwise be spent blocked in the
+                    # r1(prev) barrier below.  Forward-only: nothing
+                    # here depends on grads/G5 of any bundle.
+                    if loop_iter < tile_count - Int32(1):
+                        for head_piece in cutlass.range_constexpr(2):
+                            pipe_kscore.producer_acquire(gather_state)
+                            if cutlass.const_expr(head_piece == 0):
+                                self._load_chase_piece_v32(
+                                    mKV,
+                                    mTopkIdxs,
+                                    chase_rows_0,
+                                    token_idx,
+                                    batch_idx,
+                                    bundle_idx - Int32(1),
+                                    Int32(head_piece),
+                                    topk,
+                                    rank,
+                                    tidx,
+                                    kv_copy_atom,
+                                    kv_thread_copy,
+                                )
+                            else:
+                                self._load_chase_piece_v32(
+                                    mKV,
+                                    mTopkIdxs,
+                                    chase_rows_1,
+                                    token_idx,
+                                    batch_idx,
+                                    bundle_idx - Int32(1),
+                                    Int32(head_piece),
+                                    topk,
+                                    rank,
+                                    tidx,
+                                    kv_copy_atom,
+                                    kv_thread_copy,
+                                )
+                            cute.arch.cp_async_commit_group()
+                            cute.arch.cp_async_wait_group(0)
+                            cute.arch.fence_view_async_shared()
+                            pipe_kscore.producer_commit(gather_state)
+                            gather_state.advance()
                     _iket.range_end(
                         load_k_token,
                         loop_iter,
