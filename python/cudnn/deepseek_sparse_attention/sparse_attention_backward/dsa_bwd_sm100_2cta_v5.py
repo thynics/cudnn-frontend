@@ -11865,17 +11865,27 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     PDS_BLOCK_BYTES = 8_192
 
     # v5.2 TMEM 512-column map (all f32, per CTA), allocated UNGUARDED
-    # (change order Z1: 32 + 64 + 384 = 480 <= 512, [480,512) free):
+    # ([fix-r7] structural: 32 + 64 + 256 = 352 <= 512, [352,512)
+    # free -- 160 columns of unallocated headroom, booked):
     #   dQ rot [0,32):   2 x 16-column ROTATING eviction slots (block
     #                    g -> slot g%2; 16 blocks/bundle, even => the
     #                    slot pattern restarts per bundle, static);
     #   S pp [32,64) / dP pp [64,96): 2 stages x 16 cols each (M128
     #                    CG2 fold => 128 DP x 16 columns per h32);
-    #   dV/dK army [96,480): SIX 64-column slots, block g -> slot
-    #                    g%6 (16/bundle mod 6 != 0 => the slot index
-    #                    rides the 6-deep dkv_done pipeline state,
-    #                    RUNTIME tmem offset -- the standard
-    #                    accumulator-ring form).
+    #   dV/dK army [96,352): FOUR 64-column slots.  [fix-r7]: 16
+    #                    blocks/bundle mod 4 == 0, so the slot phase
+    #                    resets every bundle and block k = pair*8 +
+    #                    2r + p gives slot = k % 4 = (2r + p) % 4 --
+    #                    a COMPILE-TIME constant (pair*8 mod 4 == 0):
+    #                    dV slots {0,2,0,2}, dK slots {1,3,1,3} over
+    #                    the rounds.  Static offsets fold alignment
+    #                    automatically (the r7 DSL ruling forbids
+    #                    .align on TMEM pointers; runtime addressing
+    #                    is retired).  Four slots = the double-
+    #                    warpgroup pipeline's necessary floor (2 in
+    #                    drain + 2 in flight); the drain throughput
+    #                    is the pacer, so the 6-slot window's extra
+    #                    runway (~0.7 us/pair) is forfeit by ruling.
     TMEM_DQ_SLOT0 = 0
     TMEM_DQ_SLOT1 = 16
     TMEM_S_OFFSET = 32
@@ -11884,9 +11894,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     TMEM_DP1_OFFSET = 80
     TMEM_DKV_BASE = 96
     TMEM_DKV_SLOT_COLS = 64
-    TMEM_DKV_SLOTS = 6
+    TMEM_DKV_SLOTS = 4
     # TMEM budget echo-assert (host side, __call__).
-    TMEM_BUDGET = 32 + 64 + 6 * 64
+    TMEM_BUDGET = 32 + 64 + 4 * 64
 
     # v7: S/dP TMEM double-buffer depth (cross-chunk: S(c+1) no longer
     # waits for math's T2R of S(c)).
@@ -11909,12 +11919,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     ROUND_GENS_PER_TILE = 20
     ROUND_STAGES = 2
 
-    # v5.2 slot army: the dkv_done ring deepens to SIX (one generation
-    # per [own-kv64 x D128] block, slot == pipeline stage == runtime
-    # tmem offset).  Six slots decouple the leader's block issue from
-    # the drain by ~3 fused pairs of runway; the reducer consumes
-    # generations in (dV, dK) pairs (fused drain).
-    MMA_DONE_STAGES = 6
+    # v5.2 slot army, [fix-r7] FOUR-deep: one generation per
+    # [own-kv64 x D128] block, slot == pipeline stage == (2r + p) % 4
+    # (static; 16 blocks/bundle mod 4 == 0 keeps stage and slot in
+    # permanent lockstep).  The reducer consumes generations in
+    # (dV, dK) pairs (fused drain); 4 slots = 2 draining + 2 in
+    # flight, the double-warpgroup floor.
+    MMA_DONE_STAGES = 4
 
     # v9.3 hoisting is DISABLED for v3.2: the transposed plane's
     # constants live on the COLUMN axis, and the Ld16x256b(Rep4)
@@ -12098,9 +12109,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # v5 (spec Z4): pds is a 2-stage pipeline now (full+empty
             # per stage).
             pds_mbars: cute.struct.MemRange[cutlass.Int64, 4]
-            # v5.2 slot army: 6-stage dkv_done ring (full+empty per
-            # stage).
-            dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 12]
+            # v5.2 slot army ([fix-r7] 4-stage dkv_done ring,
+            # full+empty per stage).
+            dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 8]
             # v5.2: the dQ eviction handoff (2 stages, full+empty per
             # stage; leader UMMA producer -> reduce consumers).
             dq_evict_mbars: cute.struct.MemRange[cutlass.Int64, 4]
@@ -13473,13 +13484,39 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 dq_evict_c_layout,
             ),
         )
-        # v5.2 dkv slot army: SIX 64-column slots addressed at RUNTIME
-        # from the 6-deep dkv_done pipeline state (slot == stage ==
-        # generation % 6; 16 blocks/bundle mod 6 != 0, so the slot
-        # index cannot be static).  Roles rebuild the slot tensor per
-        # block from this base pointer + dkv_c_layout (the standard
-        # accumulator-ring form).
-        tmem_dkv_base = tmem_ptr + self.TMEM_DKV_BASE
+        # v5.2 dkv slot army, [fix-r7] FOUR static slots: 16 blocks/
+        # bundle mod 4 == 0 makes slot == stage == (2r + p) % 4 a
+        # COMPILE-TIME constant (pair*8 mod 4 == 0), so the slot
+        # tensors are plain static-offset views -- alignment folds
+        # automatically (the r7 DSL ruling forbids .align on TMEM
+        # pointers; the runtime-addressed 6-slot form is retired).
+        t_dkv_army = (
+            cute.make_tensor(
+                tmem_ptr + self.TMEM_DKV_BASE,
+                dkv_c_layout,
+            ),
+            cute.make_tensor(
+                tmem_ptr
+                + (self.TMEM_DKV_BASE + self.TMEM_DKV_SLOT_COLS),
+                dkv_c_layout,
+            ),
+            cute.make_tensor(
+                tmem_ptr
+                + (
+                    self.TMEM_DKV_BASE
+                    + 2 * self.TMEM_DKV_SLOT_COLS
+                ),
+                dkv_c_layout,
+            ),
+            cute.make_tensor(
+                tmem_ptr
+                + (
+                    self.TMEM_DKV_BASE
+                    + 3 * self.TMEM_DKV_SLOT_COLS
+                ),
+                dkv_c_layout,
+            ),
+        )
 
         if cutlass.const_expr(mTopkLength is not None):
             topk = mTopkLength[token_idx]
@@ -14267,9 +14304,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         # edge: leader dkv commits for (P, r, dV) and
                         # (P, r, dK) -- consumed as a pair from the
                         # 6-deep ring.
+                        # [fix-r7] static slot selection at the call
+                        # site: slot = (2r + p) % 4, pair-independent.
                         dkv_wait, dkv_rel = self._drain_dkv_fused_v52(
-                            tmem_dkv_base,
-                            dkv_c_layout,
+                            t_dkv_army[(2 * d_round) % 4],
+                            t_dkv_army[(2 * d_round + 1) % 4],
                             mdKV_acc,
                             mTopkIdxs,
                             tile_index,
@@ -14458,8 +14497,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 self._issue_grads_pair_v51(
                                     0,
                                     dkv_tiled_mma,
-                                    tmem_dkv_base,
-                                    dkv_c_layout,
+                                    t_dkv_army[0],
+                                    t_dkv_army[1],
+                                    t_dkv_army[2],
+                                    t_dkv_army[3],
                                     p_fragment,
                                     ds_fragment,
                                     grad_frags[0],
@@ -14491,8 +14532,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         self._issue_grads_pair_v51(
                             1,
                             dkv_tiled_mma,
-                            tmem_dkv_base,
-                            dkv_c_layout,
+                            t_dkv_army[0],
+                            t_dkv_army[1],
+                            t_dkv_army[2],
+                            t_dkv_army[3],
                             p_fragment,
                             ds_fragment,
                             grad_frags[0],
@@ -15208,8 +15251,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         self,
         pair: cutlass.Constexpr[int],
         dkv_tiled_mma: cute.TiledMma,
-        tmem_dkv_base,
-        dkv_c_layout,
+        t_dkv_s0: cute.Tensor,
+        t_dkv_s1: cute.Tensor,
+        t_dkv_s2: cute.Tensor,
+        t_dkv_s3: cute.Tensor,
         p_fragment: cute.Tensor,
         ds_fragment: cute.Tensor,
         gen_fragment_a: cute.Tensor,
@@ -15236,12 +15281,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                        fire when the pair's G3/G4
                                        descriptor reads complete).
         Per D-round r, dV then dK; each block:
-          dkv acquire  <- edge: reducer FUSED drain of the block six
-                          generations back (v5.2 slot army: 6-deep
-                          dkv_done ring, slot == stage == generation
-                          % 6 -- the accumulator TMEM address is
-                          rebuilt per block from the pipeline state's
-                          RUNTIME index, tmem_dkv_base + index*64);
+          dkv acquire  <- edge: reducer FUSED drain of the block FOUR
+                          generations back ([fix-r7] slot army: 4-deep
+                          dkv_done ring; slot == stage == (2r + p) % 4
+                          is a COMPILE-TIME constant since 16 blocks/
+                          bundle mod 4 == 0 -- static tuple selection,
+                          no runtime TMEM arithmetic);
           round wait   <- edge: W17 full-wide gen (pair*4 + r)*2 + p
                           landed (FIFO index);
           round release-> edge: W17's producer_acquire two gens ahead
@@ -15265,21 +15310,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ) + Int32(
                 (pair * self.DKV_D_ROUNDS + d_round) * 2
             )
-            # Runtime slot tensor (slot == the stage this acquire
-            # claims; .index read pre-advance).  [fix-r6] dynamic
-            # pointer arithmetic drops the compiler's alignment
-            # attribute to the 4 B default; declare the TRUE slot
-            # alignment (columns 96 + 64k -> bytes 384 + 256k, gcd
-            # 128 B) via Pointer.align -- the barrier_storage
-            # .align(min_align=8) precedent.
-            t_slot_dv = cute.make_tensor(
-                (
-                    tmem_dkv_base
-                    + dkv_producer_state.index
-                    * Int32(self.TMEM_DKV_SLOT_COLS)
-                ).align(min_align=128),
-                dkv_c_layout,
+            # [fix-r7] static slot selection: (2r + p) % 4, a
+            # Python int under the range_constexpr round loop.
+            slot_tensors = (
+                t_dkv_s0,
+                t_dkv_s1,
+                t_dkv_s2,
+                t_dkv_s3,
             )
+            t_slot_dv = slot_tensors[(2 * d_round) % 4]
             dkv_done_pipeline.producer_acquire(
                 dkv_producer_state
             )
@@ -15303,14 +15342,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             round_consumer_state.advance()
             dkv_done_pipeline.producer_commit(dkv_producer_state)
             dkv_producer_state.advance()
-            t_slot_dk = cute.make_tensor(
-                (
-                    tmem_dkv_base
-                    + dkv_producer_state.index
-                    * Int32(self.TMEM_DKV_SLOT_COLS)
-                ).align(min_align=128),
-                dkv_c_layout,
-            )
+            t_slot_dk = slot_tensors[(2 * d_round + 1) % 4]
             dkv_done_pipeline.producer_acquire(
                 dkv_producer_state
             )
@@ -15404,8 +15436,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     @cute.jit
     def _drain_dkv_fused_v52(
         self,
-        tmem_dkv_base,
-        dkv_c_layout,
+        t_slot_dv: cute.Tensor,
+        t_slot_dk: cute.Tensor,
         mdKV_acc: cute.Tensor,
         mTopkIdxs: cute.Tensor,
         tile_index: Int32,
@@ -15428,8 +15460,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         registers before the atomics halves the red.global traffic
         (expected ~1.2-1.4 us/pair vs the old 2 x ~2 us).  Both
         generations of the pair are waited up front (dV then dK,
-        consecutive stages of the 6-deep ring; slot tensors are
-        rebuilt from the RUNTIME state index, pre-advance), T2R'd
+        consecutive stages of the 4-deep ring; [fix-r7] the slot
+        tensors arrive as STATIC call-site selections -- slot ==
+        (2r + p) % 4, pair-independent), T2R'd
         back-to-back under one fence, released together, then the
         summed fragment runs the v32 decode verbatim (per-pair kv row
         + f32x2 atomics).  WAIT_dK/REDUCE_T2R/REDUCE_ATOMIC payloads
@@ -15440,27 +15473,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             "WAIT_dK(i,r)",
             issue_seq,
         )
-        # dV generation (slot index read pre-advance).  [fix-r6]
-        # declare the true 128 B slot alignment on the dynamic
-        # pointer (tmem_load x4 requires >= 8 B; dynamic arithmetic
-        # defaults the attribute to 4 B -- the r6 MLIR echo).
-        t_slot_dv = cute.make_tensor(
-            (
-                tmem_dkv_base
-                + wait_state.index * Int32(self.TMEM_DKV_SLOT_COLS)
-            ).align(min_align=128),
-            dkv_c_layout,
-        )
+        # dV generation, then the pair's second consecutive stage
+        # (dK).  [fix-r7]: the slot tensors are static call-site
+        # selections; only the pipeline generations are waited here.
         done_pipeline.consumer_wait(wait_state)
         wait_state.advance()
-        # dK generation (the pair's second consecutive stage).
-        t_slot_dk = cute.make_tensor(
-            (
-                tmem_dkv_base
-                + wait_state.index * Int32(self.TMEM_DKV_SLOT_COLS)
-            ).align(min_align=128),
-            dkv_c_layout,
-        )
         done_pipeline.consumer_wait(wait_state)
         wait_state.advance()
         _iket.range_end(
@@ -16403,8 +16420,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # relay/kdq are UNTOUCHED from v5.1b except the MAT_ACQ probes).
 # ======================================================================
 #
-# TMEM map: dQ rot 2x16 [0,32) | S pp [32,64) | dP pp [64,96) |
-# dV/dK army 6x64 [96,480) | [480,512) free (32+64+384 = 480).
+# TMEM map ([fix-r7]): dQ rot 2x16 [0,32) | S pp [32,64) | dP pp
+# [64,96) | dV/dK army 4x64 [96,352) | [352,512) FREE (160 columns
+# of booked headroom; 32+64+256 = 352).
 #
 # G5 eviction plane: (M,N,K) = (D128, h32, kv64) CG2, 16 blocks/bundle
 # = 4 D-rounds x 4 h32 windows, K chained over both kv waves; issue
@@ -16433,14 +16451,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # slack and the T2R machinery in place.
 #
 # Fused drain: the reducer consumes dkv_done generations in (dV, dK)
-# pairs from the SIX-slot ring (slot == stage == runtime state index;
-# tmem_dkv_base + index*64), sums the pair in registers (V == K =>
-# same destination), and issues ONE red.global f32x2 stream -- 8
+# pairs from the FOUR-slot ring ([fix-r7]: slot == stage ==
+# (2r + p) % 4, a COMPILE-TIME constant because 16 blocks/bundle mod
+# 4 == 0 resets the phase every bundle -- static tuple selection,
+# alignment folds automatically), sums the pair in registers (V == K
+# => same destination), and issues ONE red.global f32x2 stream -- 8
 # fused drains/bundle (the T3-HO4 P0 gate: expect ~1.2-1.4 us/pair vs
-# the old 2 x ~2 us).
+# the old 2 x ~2 us).  4 slots = 2 draining + 2 in flight (the
+# double-warpgroup floor); drain throughput is the pacer, so the
+# 6-slot runway (~0.7 us/pair) is forfeit by main-session ruling.
 #
 # Wait-graph deltas (all other edges unchanged from v5.1b):
-#   grads block  <- dkv empty [fused drain of gen n-6]
+#   grads block  <- dkv empty [fused drain of gen n-4, fix-r7]
 #   G5 block     <- dq_evict empty [offload of block n-2]
 #                <- round full [kdq gen pair r_old, double-hold]
 #                <- mb_dqb[0] AND mb_dqb[1] (hoisted: every block
@@ -16451,17 +16473,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # Liveness: leader G5 stalls at block 2 on evict credits until the
 # reducer finishes its 8 fused drains and starts offloading -- a
 # forward chain (drains depend only on already-issued grads commits),
-# no cycle; bundle-0 init credits: dkv 6, evict 2, ring/kres/strip as
-# before.
+# no cycle; bundle-0 init credits: dkv 4 ([fix-r7]), evict 2,
+# ring/kres/strip as before.
 #
-# [fix-r6] Runtime TMEM slot pointers (tmem_dkv_base + state.index *
-# 64 cols) carry an explicit .align(min_align=128) declaration: the
-# dynamic arithmetic drops MLIR's alignment attribute to the 4 B
-# default while tmem_load x4 requires >= 8 B (2 cols); the TRUE slot
-# alignment is 128 B (columns 96 + 64k -> bytes 384 + 256k, gcd 128).
-# Applied at all four runtime sites (grads-helper gemm accumulators
-# proactively included); the dQ rotating slots and G5 accumulators
-# are STATIC offsets (0/64 B folded by MLIR) and need no declaration.
+# [fix-r6 -> fix-r7] The r6 alignment attempt (.align(min_align) on
+# the runtime slot pointers) was struck down by the DSL itself
+# ("aligning a TMEM pointer is not supported", r7 gate).  Structural
+# resolution: the runtime addressing's root cause was 16 mod 6 != 0
+# (cross-bundle slot drift); with FOUR slots 16 mod 4 == 0, the slot
+# index is compile-time static and the whole alignment question
+# dissolves (static offsets fold, the v32 form).  The dQ rotating
+# slots and G5 accumulators were always static and unaffected.
 #
 # [fix-r5] The offload T2R atom is Ld16x256b Repetition(1) (16 DP x
 # 8 cols): split_wg splits the partitioned tensor's LAST (column-
