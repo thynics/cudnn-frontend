@@ -15681,26 +15681,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         wait_state: pipeline.PipelineState,
         release_state: pipeline.PipelineState,
     ):
-        """v5.2: offload ONE (t, r) dQ eviction block.
+        """v5.2: offload ONE (t, r) dQ eviction block, plain RMW.
 
-        The cluster owns its token's dQ rows exclusively, and each
-        workspace address is touched by exactly ONE thread per bundle
-        (static lane ownership, bundle-invariant decode), so ordering
-        is same-thread per-location program order throughout:
+        The cluster owns its token's dQ rows exclusively, so the
+        offload is ordinary LDG + FADD + STG on the f32 workspace
+        (deterministic same-cluster f32 order -- NO atomics):
           first bundle: STG only (initializes the buffer; also makes
             the kernel stateless across runs);
           last bundle:  LDG + FADD + single bf16 cast into mdQ (the
             terminal value -- f32 accumulation + ONE final rounding,
             the same numeric class as the retired TMEM epilogue);
-          middle:       red.global.add.f32 ([v5.3-L1] one-way traffic:
-            the r10 ledger convicted the retired LDG+FADD+STG chain's
-            load round-trip of overloading the reduce lanes -- drain
-            service 3.97us/pair vs 1.9us/pair demand -- which paced
-            the in-tile grads gaps AND the 36us end-of-bundle K-
-            turnover stall.  Same-thread same-address coherence keeps
-            the f32 accumulation order bit-identical, and the last
-            bundle's LDG observes every prior red by the same
-            per-location guarantee -- precision iron rule intact).
+          middle:       LDG + FADD + STG f32.
         Decode contract ([fix-r8] corrected): the block's D coverage
         is dictated by the A operand -- the kdq gen holds the LEGACY
         M-half slice D[r_old*256 + rank*128, +128), so its d_half
@@ -15910,18 +15901,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             mode=[1],
                         )
                     )
-                    # [v5.3-L1] fire-and-forget red.global.add.f32
-                    # (idiom: the fused dkv drain's atomic_add call).
-                    # batch stride is 0 in the carve -- omitted.
-                    destination_ptr = (
-                        mdQ_acc.iterator
-                        + head * mdQ_acc.stride[0]
-                        + d_g * mdQ_acc.stride[1]
-                        + token_idx * mdQ_acc.stride[2][0]
-                    )
-                    cute.arch.atomic_add(
-                        destination_ptr.llvm_ptr,
-                        thread_values[i],
+                    mdQ_acc[
+                        head,
+                        d_g,
+                        (token_idx, batch_idx),
+                    ] = (
+                        mdQ_acc[
+                            head,
+                            d_g,
+                            (token_idx, batch_idx),
+                        ]
+                        + thread_values[i]
                     )
         _iket.range_end(
             dq_epi_token,
