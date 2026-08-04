@@ -15680,8 +15680,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 ),
             ),
         )
+        # [fix-r5] Repetition(1), NOT (2): split_wg carves its input
+        # along mode [2] -- the COLUMN-iteration mode of the
+        # partitioned tensor -- by the warpgroup count (v8-era drain
+        # shape contract, hardware r5 echo).  A Rep(2) atom covers all
+        # 16 columns in one op (rest_col = 1, 1 // 2 == 0 -> the r5
+        # ValueError); Rep(1) covers 8 columns per op (rest_col = 2),
+        # so the two warpgroups split the block 8/8 column-wise
+        # exactly like the fused drain's Rep(4)-on-64 shape, and each
+        # warp still reads only its own 32-DP physical window.
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(2)),
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(1)),
             self.acc_dtype,
         )
         tiled_t2r = tcgen05.make_tmem_copy(
@@ -16428,6 +16437,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # forward chain (drains depend only on already-issued grads commits),
 # no cycle; bundle-0 init credits: dkv 6, evict 2, ring/kres/strip as
 # before.
+#
+# [fix-r5] The offload T2R atom is Ld16x256b Repetition(1) (16 DP x
+# 8 cols): split_wg splits the partitioned tensor's LAST (column-
+# iteration) mode by the warpgroup count, so the 16-column block
+# needs rest_col = 2 (Rep(2) collapses it to 1 -> the r5 gate).  The
+# two warpgroups split the block 8/8 column-wise, drain-congruent.
 #
 # Trace-readout deltas: DQ_EPI(r) is now the OFFLOAD span (payload
 # b*16 + t*4 + r; includes the evict wait -- rhythm visibility);
