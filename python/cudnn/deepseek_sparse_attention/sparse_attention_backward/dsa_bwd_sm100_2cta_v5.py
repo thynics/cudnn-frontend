@@ -12631,12 +12631,30 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # coordinates (never the pointer), so the SW128B swizzle stays
         # anchored at the 1,024 B-aligned image base (a raw +32 B
         # pointer offset would NOT commute with the swizzle).
-        # Strides derive from the epi layout family; the flat-column
-        # premise is asserted (echo on failure).
-        assert score_store_layout.outer.shape[1] == self.N_TILE, str(
+        # Strides derive from the epi layout family; the column
+        # premise is asserted SEMANTICALLY (fix-r0): the hardware r0
+        # gate showed the epi outer as
+        #   ((8,8),(64,1),(1,1)):((64,512),(1,0),(0,0)),
+        # i.e. tile_to_shape's coalesce keeps DEGENERATE size-1/
+        # stride-0 sub-modes inside the column and stage modes, so a
+        # naked shape[1]/stride[1] LEAF comparison is form-brittle
+        # ((64,1) != 64) even though the semantics -- 64 contiguous
+        # unit-stride columns -- are exactly the premise the J-mode
+        # domain needs.  Coalescing the column mode and pinning
+        # rank == 1, size == 64, cosize == 64 is mathematically
+        # equivalent to `layout == (64):(1)` (for a coalesced rank-1
+        # layout cosize = (size-1)*stride + 1), so this is the SAME
+        # contract in degenerate-robust form, not a loosening.
+        score_store_cols = cute.coalesce(
+            cute.select(score_store_layout.outer, mode=[1])
+        )
+        assert cute.rank(score_store_cols) == 1, str(
             score_store_layout.outer
         )
-        assert score_store_layout.outer.stride[1] == 1, str(
+        assert cute.size(score_store_cols) == self.N_TILE, str(
+            score_store_layout.outer
+        )
+        assert cute.cosize(score_store_cols) == self.N_TILE, str(
             score_store_layout.outer
         )
         assert cute.size(score_store_layout.outer, mode=[2]) == 1, str(
@@ -12667,6 +12685,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         assert (
             cute.cosize(score_store_domain)
             == self.PDS_BLOCK_ELEMENTS
+        )
+        # Publish-domain width contract (spec Z4, asserted explicitly):
+        # each J slice of the domain exposes EXACTLY the h32 sub-tile
+        # -- SUB_TILE_H columns as (16, 2) boxes -- and the J window
+        # mode carries the two slices.
+        assert (
+            cute.size(score_store_domain, mode=[0, 1])
+            == self.SUB_TILE_H
+        ), str(score_store_domain)
+        assert cute.size(score_store_domain, mode=[0, 2]) == 2, str(
+            score_store_domain
         )
         # Per h-chunk stmatrix targets (static sub-image bases).
         p_store = (
@@ -13740,6 +13769,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     assert (
                         t_rs_p_tiles[sub_tile].shape
                         == r_p_store.shape
+                    ), (
+                        str(t_rs_p_tiles[sub_tile].shape),
+                        str(r_p_store.shape),
                     )
                     cute.copy(
                         tiled_copy_r2s,
@@ -13821,6 +13853,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     assert (
                         t_rs_ds_tiles[sub_tile].shape
                         == r_ds_store.shape
+                    ), (
+                        str(t_rs_ds_tiles[sub_tile].shape),
+                        str(r_ds_store.shape),
                     )
                     cute.copy(
                         tiled_copy_r2s,
@@ -15589,6 +15624,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 #   * partition_D J-mode position: asserted (mode[4] == 2, shape echo)
 #     -- if the tiled-copy machinery flattens the domain differently,
 #     the trace-prepare assert fires; fix is a one-line mode index.
+#     [fix-r0] the upstream premise asserts were re-formed after the
+#     first hardware gate: the epi outer carries degenerate size-1
+#     sub-modes ((64,1):(1,0) columns), so the flat-leaf comparisons
+#     became coalesce+rank/size/cosize (semantically identical pin);
+#     the publish-domain width contract (32 cols/J-slice, 2 slices)
+#     is now asserted explicitly.  Remaining exposure = the partition
+#     placement itself.
 #   * N32 CG2 MMA fold: the (64,(16,2)):(1,(128,64)) interleaved atom
 #     is assumed legal per spec ("MMA N32 legal tier"); make_fragment_C
 #     shape asserts (SUB_TILE_VALS) and the layout report catch a
