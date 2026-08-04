@@ -13977,11 +13977,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     ):
                         pipe_dkv_done.producer_acquire(dkv_prod)
                         pipe_round.consumer_wait(round_cons)
+                        dkv_issue_token = _iket.range_start(
+                            "dVdK_ISSUE(i,r,p)",
+                            loop_iter * Int32(self.DKV_D_ROUNDS * 2)
+                            + Int32(d_round * 2),
+                        )
                         self._issue_dkv_round_v32(
                             dkv_tiled_mma,
                             t_dkv[0],
                             p_fragment,
                             grad_frags[0],
+                        )
+                        _iket.range_end(
+                            dkv_issue_token,
+                            loop_iter * Int32(self.DKV_D_ROUNDS * 2)
+                            + Int32(d_round * 2),
                         )
                         pipe_round.consumer_release(round_cons)
                         round_cons.advance()
@@ -13989,11 +13999,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         dkv_prod.advance()
                         pipe_dkv_done.producer_acquire(dkv_prod)
                         pipe_round.consumer_wait(round_cons)
+                        dkv_issue_token = _iket.range_start(
+                            "dVdK_ISSUE(i,r,p)",
+                            loop_iter * Int32(self.DKV_D_ROUNDS * 2)
+                            + Int32(d_round * 2 + 1),
+                        )
                         self._issue_dkv_round_v32(
                             dkv_tiled_mma,
                             t_dkv[1],
                             ds_fragment,
                             grad_frags[1],
+                        )
+                        _iket.range_end(
+                            dkv_issue_token,
+                            loop_iter * Int32(self.DKV_D_ROUNDS * 2)
+                            + Int32(d_round * 2 + 1),
                         )
                         pipe_round.consumer_release(round_cons)
                         round_cons.advance()
@@ -14456,8 +14476,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         s_done_pipeline.producer_acquire(s_state_c1)
         dp_done_pipeline.producer_acquire(dp_producer_state)
         dp_done_pipeline.producer_acquire(dp_state_c1)
+        # Canonical-name contract (harness trace-prepare requires
+        # S_ISSUE/dP_ISSUE): the K-outer score phase interleaves both
+        # planes, so S_ISSUE covers phase start .. the last G1 atom and
+        # dP_ISSUE covers the residual dP tail; the two tile the old
+        # SCORE_PIECES window exactly.
         score_issue_token = _iket.range_start(
-            "SCORE_PIECES(i)",
+            "S_ISSUE(i)",
             issue_seq,
         )
         s_mma = score_tiled_mma.with_()
@@ -14484,6 +14509,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     q_fragment_1[None, None, k_block, piece],
                     t_s_1,
                 )
+                if cutlass.const_expr(
+                    piece == self.SCORE_D_PIECES - 1
+                    and k_block == k_blocks - 1
+                ):
+                    _iket.range_end(
+                        score_issue_token,
+                        issue_seq,
+                    )
+                    score_issue_token = _iket.range_start(
+                        "dP_ISSUE(i)",
+                        issue_seq,
+                    )
                 # G2(c0), G2(c1): dP^T chunk accumulators (V == K: the
                 # SAME chase piece is the A operand).
                 cute.gemm(
