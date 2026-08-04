@@ -12010,12 +12010,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         """v5.2: extend each (h, q) workspace entry by one f32 D-row.
 
         Layout: [sum_OdO vectors][scaled_LSE vectors][dQ f32 partial
-        sums, D per (h, q)].  The harness allocates via
-        impl_cls._get_workspace_size_LSE_OdO (torch.zeros), so this
-        override is authoritative for the v5.2 runs; the public
-        wrapper path instantiates the baseline class and is
-        unaffected.  Cross-run safety does NOT rely on the zero fill:
-        the first bundle's eviction stores directly (no LDG).
+        sums, D per (h, q)].  [fix-r9] The claim that the harness
+        allocates via impl_cls was WRONG: sha forensics show staging
+        patches _interface_sm100.py with unknown class-wiring, and the
+        r8 IMA proves the base 8 B/entry sizing reached the allocator
+        (the decode bug alone cannot leave the region: d_g < D always).
+        Allocation sufficiency is now enforced at the interface's
+        torch.zeros site itself (entry = max(impl, 8 + D*4)); this
+        override remains correct-but-not-load-bearing.  Cross-run
+        safety does NOT rely on the zero fill: the first bundle's
+        eviction stores directly (no LDG).
         """
 
         d_r = (d + 7) // 8 * 8
@@ -12037,22 +12041,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         D = cute.round_up(problem_shape[2], 8)
         q_r = cute.round_up(total_seqlen_Q, 8)
         acc_bytes = self.acc_dtype.width // 8
-        # [fix-r8] LOUD allocation gate.  The PUBLIC interface
-        # (_interface_sm100.py) hardcodes the BASE class's
-        # _get_workspace_size_LSE_OdO at its torch.zeros allocation
-        # sites; if the caller's buffer was sized by that 8 B/entry
-        # rule, this carve would start EXACTLY at the old buffer's
-        # end (base_bytes == the old total) and EVERY eviction access
-        # would be out of bounds -- the r8 IMA signature.  The
-        # workspace tensor's byte cosize is static at trace time, so
-        # an under-allocation aborts the compile here with both
-        # numbers echoed instead of corrupting device memory.
-        assert cute.cosize(workspace_LSE_OdO.layout) >= (
-            (2 + D) * H * q_r * acc_bytes
-        ), (
-            cute.cosize(workspace_LSE_OdO.layout),
-            (2 + D) * H * q_r * acc_bytes,
-        )
+        # [fix-r9] No host-side allocation gate is possible here: the
+        # interface's compile_key excludes total_S_q, so the workspace
+        # layout is dynamic at trace time and cute.cosize(...) yields a
+        # dynamic Boolean that cannot enter host control flow (the r9
+        # compile abort; lesson #17).  Sufficiency is instead guaranteed
+        # at the allocation site: _interface_sm100.py sizes the entry as
+        # max(impl entry, 8 + D*4) unconditionally, so the dQ tail below
+        # exists no matter which impl class the harness staged.
         base_bytes = cute.assume(
             2 * H * q_r * acc_bytes,
             divby=64,

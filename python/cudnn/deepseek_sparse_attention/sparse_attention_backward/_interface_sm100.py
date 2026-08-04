@@ -106,6 +106,15 @@ def flash_attn_bwd_sm100(
         batch_size,
         acc_dtype,
     )
+    # The staged candidate impl may extend the per-(h, q) entry from 8 to
+    # 8 + D*4 bytes (f32 dQ partial-sum tail).  Size the allocation for the
+    # larger of the two so the buffer is sufficient regardless of which impl
+    # class the harness wires in here; every impl carves this workspace by
+    # flat byte offsets from the iterator and never reads the shape tuple,
+    # so the extra tail is invisible to impls that do not use it.
+    _dq_tail_entry_bytes = 2 * 4 + ((head_dim + 7) // 8 * 8) * 4
+    if ws_lse_odo_shape[-1] < _dq_tail_entry_bytes:
+        ws_lse_odo_shape = (*ws_lse_odo_shape[:-1], _dq_tail_entry_bytes)
     workspace_LSE_OdO = torch.zeros(
         *ws_lse_odo_shape,
         dtype=torch.uint8,
