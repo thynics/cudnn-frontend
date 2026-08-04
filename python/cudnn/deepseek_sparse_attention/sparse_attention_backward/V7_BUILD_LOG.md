@@ -35,3 +35,4 @@
    R5 s_dq_epi 复用 round_buf a+b 连体——WAR 由 dq_done 群提交传递闭合（G5 = 末代 round 读者，v5.1b 合同逐字）；W17 在末 bundle 后不再填充，无新写者。
    R6 发射账 ruler 差异已在尾注注记（v6 160 为混合口径；v7 G5 按调用数 4/bundle 报账，不跨代直接比较）。
   py_compile：OK（逐区 + 终态复验）。不 commit（协调者权）；不投测试（proxy 归协调者）。验收门待硬件：correctness 4/4 → release 判决带 12-18ms → trace 四钩子（reduce 占用 89%→~50%、尾停摆 36µs→<8µs、grads 环 2 节流形态、S(1) 共驻衰减自然实验）。
+[v7-r1] 硬件判决（协调者）：correctness 4/4 全过；release 21.943ms vs v6 35.548 = **−38%（战役首次真突破）**；周期 12.39µs/64kv（税后 43.5µs/bundle）。四钩子：尾停摆 36→12.8µs（offload 实心块消灭 ✓）；reduce w8 79%（其中 WAIT_dK≈ATOMIC≈2µs/对——drain 一半时间在等 grads MMA 的 TC 退队）；drain 节奏 4.95µs/对（贴 STOP 门 5 未破，环 2 站住）；S(1) 恒 3.10µs 且 **S(0) 0.94→2.08µs**（周期缩短后失去全场沉睡窗——共驻税命中双 pass）。**格局反转：案 1 的内核内 TC 有效吞吐税（孤立价 3-4×）从 3% 小案升格为主 pacer**——账面：杀税后周期 →15-20µs ⇒ e2e 8-10ms ≈ baseline 量级。下一步：NCU 地面真相轮（stall 分类/TC 利用率/L1TEX/时钟）在飞。
