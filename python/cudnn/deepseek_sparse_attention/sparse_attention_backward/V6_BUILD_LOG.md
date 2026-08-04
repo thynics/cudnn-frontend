@@ -45,3 +45,4 @@
    R6 j==1 的 WAIT_S/WAIT_dP 零宽 span——harness 聚合器容忍度未验（本地账本为权威，v5.2 先例）。
   py_compile：OK（全零区间逐区 + 终态复验）。测试投递权在协调者（~/proxy）。
 [v6-r1b] 硬件判决（r1 因 B200 服务中停重投）：correctness 4/4 全过（肥原子机器数学正确、一次过硅）；release 35.591ms vs v5 35.653 = −0.17% ≈ 零改善。**null 结果的强判决**：v5(224条)/v5+red.add/v6(160条) 三个结构迥异候选全落 35.6±0.5ms ⇒ ①"每条 0.2µs 入队税钉死释放版"模型证伪（score 入队砍半不动 e2e——限速真实存在但不在释放版关键路径）；②真 pacer 在三者共享机器中：math/pds 链（v5/v6 逐点相同）、dKV L2 原子流（baseline 同款杀手）、K 驻留翻转、驱逐 drain——四者均未被任何一刀触碰。下一步（零硬件）：v5r10↔v6r1b 双 trace 同税率对账定位不动 pacer。trace 已回传（5.96MB，sha 校验一致）。
+[v6.1-diag] S_ISSUE 半程拆发微插桩（协调者，方法论"原子拆分"驱动）：S_ISSUE 同名复用、payload 2→4 粒度（4b+2t+half），D-half 边界的 strip 等待移出 span 变可见 gap ⇒ 单 pass 三段全量化（D-lo 发射 | 边界等待 | D-hi 发射）。r1b 拆分背景：gen3 交叉证人证明 strip 供应 0.6µs 即位（饥饿假说死刑）；payload 算术勘误后 commit 链自洽（S(0) 尾后 +0.61µs、S(1) 尾后 +0.40µs）——S(1) 的 3.97µs 系真实发射/退队限速（~127ns/条 vs 孤立 13.4ns/instr），三轮微基准（dual-acc/SMEM/T2R）全数无罪 ⇒ in-kernel 特有，半程拆发定位堵点在入队口还是退队流。py_compile OK。

@@ -15365,9 +15365,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         pass_payload = issue_seq * Int32(self.SUB_TILES) + Int32(
             sub_tile
         )
+        # [v6.1 diag] S_ISSUE split per D-half (same canonical name,
+        # payload = pass_payload*2 + half = 4b + 2t + half) so the
+        # trace decomposes the pass into D-lo enqueues / boundary
+        # strip-wait (now an inter-span gap) / D-hi enqueues.
         score_issue_token = _iket.range_start(
             "S_ISSUE(i)",
-            pass_payload,
+            pass_payload * Int32(2),
         )
         s_mma = score_tiled_mma.with_()
         dp_mma = dp_tiled_mma.with_()
@@ -15381,12 +15385,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ):
                 # D-half boundary: EARLY stage-0 release (UMMA-
                 # tracked over the D-lo gemms above), then admit the
-                # D-hi strip (gen 2t+1).
+                # D-hi strip (gen 2t+1).  [v6.1 diag] the boundary
+                # sits BETWEEN the two S_ISSUE halves so the strip
+                # wait reads as an inter-span gap.
+                _iket.range_end(
+                    score_issue_token,
+                    pass_payload * Int32(2),
+                )
                 strip_pipeline.consumer_release(
                     strip_consumer_state
                 )
                 strip_consumer_state.advance()
                 strip_pipeline.consumer_wait(strip_consumer_state)
+                score_issue_token = _iket.range_start(
+                    "S_ISSUE(i)",
+                    pass_payload * Int32(2) + Int32(1),
+                )
             for k_block in cutlass.range_constexpr(k_blocks):
                 # G1(t): S^T h64 sub-tile accumulator (A = resident K
                 # piece window; B = [n32 x k64] strip window; one
@@ -15404,7 +15418,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 ):
                     _iket.range_end(
                         score_issue_token,
-                        pass_payload,
+                        pass_payload * Int32(2) + Int32(1),
                     )
                     score_issue_token = _iket.range_start(
                         "dP_ISSUE(i)",
