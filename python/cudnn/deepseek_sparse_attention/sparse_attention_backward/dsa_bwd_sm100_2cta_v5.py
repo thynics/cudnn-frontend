@@ -15266,11 +15266,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 (pair * self.DKV_D_ROUNDS + d_round) * 2
             )
             # Runtime slot tensor (slot == the stage this acquire
-            # claims; .index read pre-advance).
+            # claims; .index read pre-advance).  [fix-r6] dynamic
+            # pointer arithmetic drops the compiler's alignment
+            # attribute to the 4 B default; declare the TRUE slot
+            # alignment (columns 96 + 64k -> bytes 384 + 256k, gcd
+            # 128 B) via Pointer.align -- the barrier_storage
+            # .align(min_align=8) precedent.
             t_slot_dv = cute.make_tensor(
-                tmem_dkv_base
-                + dkv_producer_state.index
-                * Int32(self.TMEM_DKV_SLOT_COLS),
+                (
+                    tmem_dkv_base
+                    + dkv_producer_state.index
+                    * Int32(self.TMEM_DKV_SLOT_COLS)
+                ).align(min_align=128),
                 dkv_c_layout,
             )
             dkv_done_pipeline.producer_acquire(
@@ -15297,9 +15304,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dkv_done_pipeline.producer_commit(dkv_producer_state)
             dkv_producer_state.advance()
             t_slot_dk = cute.make_tensor(
-                tmem_dkv_base
-                + dkv_producer_state.index
-                * Int32(self.TMEM_DKV_SLOT_COLS),
+                (
+                    tmem_dkv_base
+                    + dkv_producer_state.index
+                    * Int32(self.TMEM_DKV_SLOT_COLS)
+                ).align(min_align=128),
                 dkv_c_layout,
             )
             dkv_done_pipeline.producer_acquire(
@@ -15431,18 +15440,25 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             "WAIT_dK(i,r)",
             issue_seq,
         )
-        # dV generation (slot index read pre-advance).
+        # dV generation (slot index read pre-advance).  [fix-r6]
+        # declare the true 128 B slot alignment on the dynamic
+        # pointer (tmem_load x4 requires >= 8 B; dynamic arithmetic
+        # defaults the attribute to 4 B -- the r6 MLIR echo).
         t_slot_dv = cute.make_tensor(
-            tmem_dkv_base
-            + wait_state.index * Int32(self.TMEM_DKV_SLOT_COLS),
+            (
+                tmem_dkv_base
+                + wait_state.index * Int32(self.TMEM_DKV_SLOT_COLS)
+            ).align(min_align=128),
             dkv_c_layout,
         )
         done_pipeline.consumer_wait(wait_state)
         wait_state.advance()
         # dK generation (the pair's second consecutive stage).
         t_slot_dk = cute.make_tensor(
-            tmem_dkv_base
-            + wait_state.index * Int32(self.TMEM_DKV_SLOT_COLS),
+            (
+                tmem_dkv_base
+                + wait_state.index * Int32(self.TMEM_DKV_SLOT_COLS)
+            ).align(min_align=128),
             dkv_c_layout,
         )
         done_pipeline.consumer_wait(wait_state)
@@ -16437,6 +16453,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # forward chain (drains depend only on already-issued grads commits),
 # no cycle; bundle-0 init credits: dkv 6, evict 2, ring/kres/strip as
 # before.
+#
+# [fix-r6] Runtime TMEM slot pointers (tmem_dkv_base + state.index *
+# 64 cols) carry an explicit .align(min_align=128) declaration: the
+# dynamic arithmetic drops MLIR's alignment attribute to the 4 B
+# default while tmem_load x4 requires >= 8 B (2 cols); the TRUE slot
+# alignment is 128 B (columns 96 + 64k -> bytes 384 + 256k, gcd 128).
+# Applied at all four runtime sites (grads-helper gemm accumulators
+# proactively included); the dQ rotating slots and G5 accumulators
+# are STATIC offsets (0/64 B folded by MLIR) and need no declaration.
 #
 # [fix-r5] The offload T2R atom is Ld16x256b Repetition(1) (16 DP x
 # 8 cols): split_wg splits the partitioned tensor's LAST (column-
