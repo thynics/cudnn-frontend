@@ -11688,15 +11688,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     DKV_A_MAJOR = OperandMajorMode.K
     DKV_B_MAJOR = OperandMajorMode.MN
     DKV_A_STAGES = 2
-    DKV_B_STAGES = 2
+    # v5.1 (pair batching): the streamed grad gen returns to FULL h64
+    # width -- pair P = {t=2P, t=2P+1} unions to EXACTLY chunk P's
+    # natural h64 head interval (the two sub-tiles' h16 boxes tile it),
+    # so one gen = [h64 x own-D64] (8,192 B, ONE TMA box, the v32
+    # single-stage box form) serves BOTH accumulate chains of one
+    # (pair, r, tensor) block.  One stage per gen; gen k16-block kb
+    # pairs with slab chunk-P column block kb (identical head sets).
+    DKV_B_STAGES = 1
     DKV_A_MAX_ELEMENTS = 8192
     DKV_B_MAX_ELEMENTS = 8192
-    # v5 (Z6): the streamed grad gen narrows to per-(sub-tile, D-round)
-    # half-wide form -- one gen = the sub-tile's TWO h16 boxes x own-D64
-    # N-half (2 x 2,048 B), TMA'd fresh per pass (L2-hot for t >= 1).
-    # Stage = h16 box, so the gen SMEM layout tiler narrows K to 16;
-    # the dkv MMA tiler itself is unchanged (K only enters via layouts).
-    DKV_B_TILER = (128, 128, 16)
+    DKV_B_TILER = (128, 128, 64)
     DQ_B_STAGES = 2
     DQ_B_MAX_ELEMENTS = 8192
     GRAD_STREAM_IS_B = True
@@ -11775,20 +11777,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # waits for math's T2R of S(c)).
     SCORE_DONE_STAGES = 2
 
-    # v5 round-region generations per bundle (fixed order, one producer
-    # /one consumer, 2-stage ring; 36 mod 2 == 0 keeps the phase law).
-    # The G5 waves move to the END of the leader's bundle (spec Z3), so
-    # FIFO consistency of the single ring REQUIRES the kdq generations
-    # to move behind the 32 grad gens on the producer side too:
-    # g0..g31: dO(t,r)(A) / Q(t,r)(B) pairs, t-major then r then tensor
-    #          [grads(t) D-round r; dO on even gens = buf A, Q odd = B]
-    # g32 kdq_r0w0(A)  g33 kdq_r0w1(B)   [G5 D-round 0, kv waves 0/1]
-    # g34 kdq_r1w0(A)  g35 kdq_r1w1(B)   [G5 D-round 1, kv waves 0/1]
+    # v5.1 round-region generations per bundle (fixed order, one
+    # producer/one consumer, 2-stage ring; 20 mod 2 == 0 keeps the
+    # phase law).  The G5 waves stay at the END of the leader's bundle
+    # (v5 spec Z3), so FIFO consistency of the single ring keeps the
+    # kdq generations behind the grad gens on the producer side:
+    # g0..g15: dO(P,r)(A) / Q(P,r)(B) pairs, pair-major then r then
+    #          tensor [grads(pair P) D-round r; one FULL-WIDE
+    #          [h64 x own-D64] gen per (P, r, tensor) block; dO on
+    #          even gens = buf A, Q odd = B]
+    # g16 kdq_r0w0(A)  g17 kdq_r0w1(B)   [G5 D-round 0, kv waves 0/1]
+    # g18 kdq_r1w0(A)  g19 kdq_r1w1(B)   [G5 D-round 1, kv waves 0/1]
     # The gather<->W17 kdq named-barrier RENDEZVOUS sequence is
     # unchanged (r0(b), r1(b), r0(b+1), ... globally), so the frozen
-    # kdq fill machine is untouched; only W17's position in its own
-    # loop moves.
-    ROUND_GENS_PER_TILE = 36
+    # kdq fill machine is untouched.
+    ROUND_GENS_PER_TILE = 20
     ROUND_STAGES = 2
 
     # v8: back to one dkv_done generation PER SLOT (head- and tail-
@@ -12553,12 +12556,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 swizzle=dq_a_layout_staged.inner,
             ),
         )
-        # v5 round-gen B views (spec Z6): one gen = the sub-tile's two
-        # [h16 x own-D64] boxes (2 x 2,048 B), bound with the 2-stage
-        # half-wide dkv-B layout so stage index == box.  The gen sits
-        # at the head of its (unchanged) 16,384 B round buffer; buffer
-        # assignment by gen parity (dO even -> A, Q odd -> B) is
-        # preserved by the 36-gen order.
+        # v5.1 round-gen B views: one gen = one FULL-WIDE
+        # [h64 x own-D64] box (8,192 B, single stage) covering the
+        # pair's whole chunk interval.  The gen sits at the head of
+        # its (unchanged) 16,384 B round buffer; buffer assignment by
+        # gen parity (dO even -> A, Q odd -> B) is preserved by the
+        # 20-gen order.
         round_grad = (
             storage.round_buf_a.get_tensor(
                 dkv_b_layout_staged.outer,
@@ -12895,12 +12898,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.make_identity_tensor(self.DQ_MMA_TILER[:2])
         )
 
-        # v5 per-CTA round-gen B TMA partitions (spec Z6): mQT/mdOT
-        # ([D,H] views) tiled (N=D128-round, K=h16-box); the D-tile
-        # coordinate walks the four D-rounds, the K-tile coordinate the
-        # EIGHT h16 tiles -- gen (t, r) copies boxes {4c+j, 4c+j+2}
-        # (c = t//2, j = t%2) -- and the CTA takes its own N-half
-        # columns.
+        # v5.1 per-CTA round-gen B TMA partitions: mQT/mdOT ([D,H]
+        # views) tiled (N=D128-round, K=h64-box); the D-tile
+        # coordinate walks the four D-rounds, the K-tile coordinate
+        # the TWO h64 tiles (tile P == chunk P == pair P's full head
+        # interval) -- gen (P, r) is ONE box copy -- and the CTA takes
+        # its own N-half columns.
         g_qt = cute.local_tile(
             tma_tensor_qt,
             cute.select(self.DKV_B_TILER, mode=[1, 2]),
@@ -13267,8 +13270,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # load warp (128 threads vs 32).  Per iteration the order
             # is: chase(b) [with the r1(b-1) rendezvous at the piece-2
             # boundary] -> kdq-r0 handshake of THIS bundle (whose W17
-            # side now sits BEHIND the 32 grad gens, matching the
-            # bundle-tail G5).
+            # side sits BEHIND the 16 full-wide grad gens, matching
+            # the bundle-tail G5).
             _iket.mark("ROLE_KV_LOAD", rank)
             gather_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
@@ -13293,7 +13296,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # releases while the leader runs grads(3)+G5(b).
                 # The bundle-b kdq r0 rendezvous runs AFTER the 32
                 # pieces; its W17 side arrives once the leader's
-                # grads(3)(b) reads free the g30/g31 ring credits.
+                # grads(pair1)(b) reads free the g14/g15 ring credits.
                 for loop_iter in cutlass.range(tile_count):
                     bundle_idx = tile_count - Int32(1) - loop_iter
                     load_k_token = _iket.range_start(
@@ -13369,7 +13372,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
                     # (r1(prev) kdq now runs inside the chase loop, at
                     # the piece-2 boundary -- see the audit note there.)
-                    # Round-0 kdq of THIS bundle (g32/g33, feeds the
+                    # Round-0 kdq of THIS bundle (g16/g17, feeds the
                     # G5 r0 waves at the bundle tail).
                     self._gather_kdq_v8(
                         mKV,
@@ -14042,26 +14045,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Consumer,
                 self.MMA_DONE_STAGES,
             )
-            # v5 (spec Z7): THIRTY-TWO [own-kv64 x D128] blocks per
-            # bundle, in the leader's commit order -- per sub-tile t,
-            # per D-round r, dV then dK.  The block SHAPE and the
-            # fragment decode are unchanged (each block is a K=h32
-            # PARTIAL sum; the f32 GMEM atomics merge sub-tiles the
-            # same way they merge tokens -- approved partial-sum drain,
-            # cost explicitly out of scope).  Both tensors of a round
-            # still merge into the same GMEM quadrant (V == K).
-            # WAIT_dK/REDUCE_T2R/REDUCE_ATOMIC payloads widen with t:
-            # issue_seq = ((bundle*4 + t)*4 + r)*2 + p (spec Z8).
+            # v5.1 (item 4): SIXTEEN [own-kv64 x D128] blocks per
+            # bundle, in the leader's commit order -- per pair P, per
+            # D-round r, dV then dK.  The block SHAPE and the fragment
+            # decode are unchanged (each block is now a K=h64 -- full
+            # chunk -- partial sum; the f32 GMEM atomics merge pairs
+            # the same way they merge tokens).  Both tensors of a
+            # round still merge into the same GMEM quadrant (V == K).
+            # WAIT_dK/REDUCE_T2R/REDUCE_ATOMIC payloads follow the
+            # pair packing: issue_seq = b*16 + pair*8 + r*2 + p.
             for loop_iter in cutlass.range(tile_count):
                 tile_index = tile_count - Int32(1) - loop_iter
-                for sub_tile in cutlass.range_constexpr(
-                    self.SUB_TILES
-                ):
+                for g_pair in cutlass.range_constexpr(2):
                     for d_round in cutlass.range_constexpr(
                         self.DKV_D_ROUNDS
                     ):
-                        # edge: leader dkv commit for (t, r, dV) /
-                        # (t, r, dK) -- FIFO with the 2-stage ring.
+                        # edge: leader dkv commit for (P, r, dV) /
+                        # (P, r, dK) -- FIFO with the 2-stage ring.
                         dkv_wait, dkv_rel = self._drain_dkv_block_v32(
                             t_dkv[0],
                             mdKV_acc,
@@ -14074,13 +14074,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             rtx,
                             rank,
                             loop_iter * Int32(
-                                self.SUB_TILES
-                                * self.DKV_D_ROUNDS
-                                * 2
+                                2 * self.DKV_D_ROUNDS * 2
                             )
                             + Int32(
                                 (
-                                    sub_tile * self.DKV_D_ROUNDS
+                                    g_pair * self.DKV_D_ROUNDS
                                     + d_round
                                 )
                                 * 2
@@ -14101,13 +14099,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             rtx,
                             rank,
                             loop_iter * Int32(
-                                self.SUB_TILES
-                                * self.DKV_D_ROUNDS
-                                * 2
+                                2 * self.DKV_D_ROUNDS * 2
                             )
                             + Int32(
                                 (
-                                    sub_tile * self.DKV_D_ROUNDS
+                                    g_pair * self.DKV_D_ROUNDS
                                     + d_round
                                 )
                                 * 2
@@ -14187,19 +14183,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     grad_fragment_a,
                     grad_fragment_b,
                 )
-                # v5 head-outer bundle schedule (spec Z3 total order):
-                #   score(0); for t in 1..3 { score(t); grads(t-1) };
-                #   grads(3); G5 r0; G5 r1; dq_b free group-commit.
-                # The sub-tile rotation hides math(t-1) under score(t)'s
-                # issue window and runs grads(t-1) right behind it --
-                # the S(t)->M(t)->G(t) three-stage sub-tile pipeline
-                # this demo exists to measure.  G5 moves to the bundle
-                # tail (spec Z3), which -- with the single-FIFO round
-                # ring -- forces the kdq generations behind the 32 grad
-                # gens on the producer side (see ROUND_GENS_PER_TILE).
-                # The 32 chase pieces stream bundle-globally: pass t
-                # re-gathers the same kv rows (L2-hot), paced by the
-                # 2-slot ring credits released inside score(t).
+                # v5.1 pair-batched bundle schedule (change order
+                # v5.1 item 1, total order):
+                #   score(0); score(1); score(2); grads(pair0={t0,t1});
+                #   score(3); grads(pair1={t2,t3}); G5 r0; G5 r1;
+                #   dq_b free group-commit.
+                # The score/math sub-tile pipeline is UNTOUCHED (math
+                # commits pds per sub-tile, 4/bundle); only the grads
+                # consumption batches to pair granularity -- protocol
+                # tax redemption: 8 blocks/pair with ONE dkv+round
+                # handshake set per block, drains 32 -> 16/bundle.
+                # grads(pair0) waits BOTH pds stages (math(0)+math(1))
+                # up front; math(2)/math(3) publish over grads(pair0)
+                # execution and gate grads(pair1).  G5 stays at the
+                # bundle tail; the single-FIFO round ring keeps the
+                # kdq generations behind the 16 grad gens (see
+                # ROUND_GENS_PER_TILE).  The 32 chase pieces stream
+                # bundle-globally exactly as in v5.
                 for loop_iter in cutlass.range(tile_count):
                     dqb_parity = loop_iter & Int32(1)
 
@@ -14236,12 +14236,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 loop_iter,
                             )
                         )
-                        if cutlass.const_expr(sub_tile > 0):
-                            # grads(t-1) issues under score(t)'s window
-                            # (rotation core, spec Z3).
+                        if cutlass.const_expr(sub_tile == 2):
+                            # v5.1 rotation point: grads(pair0) issues
+                            # here; score(3) follows immediately and
+                            # its execution overlaps pair0's MMA
+                            # window (math(2)/math(3) publish over it).
                             pds_cons, dkv_prod, round_cons = (
-                                self._issue_grads_subtile_v5(
-                                    sub_tile - 1,
+                                self._issue_grads_pair_v51(
+                                    0,
                                     dkv_tiled_mma,
                                     t_dkv[0],
                                     t_dkv[1],
@@ -14258,13 +14260,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     loop_iter,
                                 )
                             )
-                    # grads(3): the bundle's last sub-tile has no
-                    # score(t+1) to hide under (score(0) of bundle b+1
+                    # grads(pair1): the bundle's last pair has no
+                    # score to hide under (score(0) of bundle b+1
                     # cannot start before G5(b) frees the TMEM/ring
-                    # order -- bundle boundary shape unchanged vs v32).
+                    # order -- bundle boundary shape unchanged).
                     pds_cons, dkv_prod, round_cons = (
-                        self._issue_grads_subtile_v5(
-                            self.SUB_TILES - 1,
+                        self._issue_grads_pair_v51(
+                            1,
                             dkv_tiled_mma,
                             t_dkv[0],
                             t_dkv[1],
@@ -14287,7 +14289,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # position moved): gated per wave on the mb_dqb[w]
                     # cluster gates armed by the relays during THIS
                     # bundle's publish (one phase flip per bundle).
-                    # Ring FIFO: the kdq r0 gens are g32/g33 here.
+                    # Ring FIFO: the kdq r0 gens are g16/g17 here.
                     for wave in cutlass.range_constexpr(
                         self.DQ_KV_WAVES
                     ):
@@ -14315,7 +14317,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         round_cons.advance()
 
                     # G5 D-round 1 (the LAST dq_b consumers; kdq gens
-                    # g34/g35), then the free group-commit -- it tracks
+                    # g18/g19), then the free group-commit -- it tracks
                     # every issued MMA, so it covers both D-rounds and
                     # both waves (errata #1).
                     for wave in cutlass.range_constexpr(
@@ -14365,11 +14367,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
 
         elif warp_idx == Int32(self.LOAD_WARP):
-            # --- load, v5: stationary TMA once (2 half-chunk boxes per
-            # panel), then 36 round gens per bundle: g0..g31 the 32
-            # half-wide (sub-tile, D-round) x (dO, Q) gradient gens
+            # --- load, v5.1: stationary TMA once (2 half-chunk boxes
+            # per panel), then 20 round gens per bundle: g0..g15 the
+            # 16 full-wide (pair, D-round) x (dO, Q) gradient gens
             # (TMA, software-pipelined over two rotating barriers),
-            # g32/g33 kdq D-round 0 (gather-warp handshake), g34/g35
+            # g16/g17 kdq D-round 0 (gather-warp handshake), g18/g19
             # kdq D-round 1 (second handshake, whose credits free at
             # the leader's G5 r0 of THIS bundle).
             _iket.mark("ROLE_KV_LOAD", rank)
@@ -14456,50 +14458,51 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_index = (
                         tile_count - Int32(1) - loop_iter
                     )
-                    # g0..g31: half-wide round-gen B TMA fills, one
-                    # gen per (sub-tile, D-round, tensor), t-major
-                    # (spec Z6): dO -> buf A (barrier 0), Q -> buf B
-                    # (barrier 1).  Each gen carries the sub-tile's TWO
-                    # h16 boxes on one barrier (expect_tx = 4,096 B,
-                    # GMEM-natural [H,D] rows through the transposed
-                    # [D,H] view at h16-tiles {4c+j, 4c+j+2}).
-                    # Software-pipelined exactly like v17a/v32: issue
-                    # gen q, then wait/commit gen q-1 on the other
-                    # barrier, so no barrier is re-armed while pending.
-                    # MAT_QDO widens to per-sub-tile spans (payload =
-                    # bundle*4 + t, spec Z8); by the pipelining, span
-                    # t's window carries the tail wait of span t-1's
-                    # last gen (documented straddle, V5_BUILD_LOG).
+                    # g0..g15: FULL-WIDE round-gen B TMA fills, one
+                    # gen per (pair, D-round, tensor), pair-major
+                    # (v5.1 item 3): dO -> buf A (barrier 0), Q -> buf
+                    # B (barrier 1).  Each gen is ONE [h64 x own-D64]
+                    # box (expect_tx = 8,192 B, GMEM-natural [H,D]
+                    # rows through the transposed [D,H] view at
+                    # h64-tile P == chunk P -- the pair's two h32
+                    # sub-tile head sets tile it exactly).  Software-
+                    # pipelined exactly like v17a/v32: issue gen q,
+                    # then wait/commit gen q-1 on the other barrier,
+                    # so no barrier is re-armed while pending.
+                    # MAT_QDO narrows to per-pair spans (payload =
+                    # bundle*2 + pair); by the pipelining, span
+                    # pair-1's tail wait rides inside span pair's
+                    # window (documented straddle, V5_BUILD_LOG).
                     mat_qdo_token = _iket.range_start(
                         "MAT_QDO(m,r)",
-                        loop_iter * Int32(self.SUB_TILES),
+                        loop_iter * Int32(2),
                     )
-                    for flat_gen in cutlass.range_constexpr(32):
-                        sub_t = flat_gen // 8
+                    for flat_gen in cutlass.range_constexpr(16):
+                        gen_pair = flat_gen // 8
                         grad_round = (flat_gen % 8) // 2
                         tensor_kind = flat_gen % 2
-                        box_lo = 4 * (sub_t // 2) + sub_t % 2
                         if cutlass.const_expr(
                             flat_gen % 8 == 0 and flat_gen > 0
                         ):
                             _iket.range_end(
                                 mat_qdo_token,
-                                loop_iter * Int32(self.SUB_TILES)
-                                + Int32(sub_t - 1),
+                                loop_iter * Int32(2)
+                                + Int32(gen_pair - 1),
                             )
                             mat_qdo_token = _iket.range_start(
                                 "MAT_QDO(m,r)",
-                                loop_iter * Int32(self.SUB_TILES)
-                                + Int32(sub_t),
+                                loop_iter * Int32(2)
+                                + Int32(gen_pair),
                             )
                         # edge: leader released gen (flat_gen - 2)
-                        # inside grads((flat_gen-2)//8) -- 2-stage ring.
+                        # inside grads(pair (flat_gen-2)//8) -- 2-stage
+                        # ring.
                         pipe_round.producer_acquire(round_acq)
                         round_acq.advance()
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(
                                 round_tma_mbars + tensor_kind,
-                                2 * grad_a_stage_bytes,
+                                grad_a_stage_bytes,
                             )
                         if cutlass.const_expr(tensor_kind == 0):
                             cute.copy(
@@ -14507,19 +14510,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 t_dot_gmem[
                                     None,
                                     grad_round,
-                                    box_lo,
+                                    gen_pair,
                                 ],
                                 t_dot_smem_a[None, 0],
-                                tma_bar_ptr=round_tma_mbars,
-                            )
-                            cute.copy(
-                                tma_atom_dot,
-                                t_dot_gmem[
-                                    None,
-                                    grad_round,
-                                    box_lo + 2,
-                                ],
-                                t_dot_smem_a[None, 1],
                                 tma_bar_ptr=round_tma_mbars,
                             )
                         else:
@@ -14528,19 +14521,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 t_qt_gmem[
                                     None,
                                     grad_round,
-                                    box_lo,
+                                    gen_pair,
                                 ],
                                 t_qt_smem_b[None, 0],
-                                tma_bar_ptr=round_tma_mbars + 1,
-                            )
-                            cute.copy(
-                                tma_atom_qt,
-                                t_qt_gmem[
-                                    None,
-                                    grad_round,
-                                    box_lo + 2,
-                                ],
-                                t_qt_smem_b[None, 1],
                                 tma_bar_ptr=round_tma_mbars + 1,
                             )
                         if cutlass.const_expr(flat_gen > 0):
@@ -14562,7 +14545,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 pipe_round.producer_commit(round_com)
                             round_com.advance()
 
-                    # Drain the last in-flight fill (gen 31, barrier 1).
+                    # Drain the last in-flight fill (gen 15, barrier 1).
                     cute.arch.mbarrier_wait(
                         round_tma_mbars + 1,
                         tma_phase_1,
@@ -14573,18 +14556,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     round_com.advance()
                     _iket.range_end(
                         mat_qdo_token,
-                        loop_iter * Int32(self.SUB_TILES)
-                        + Int32(self.SUB_TILES - 1),
+                        loop_iter * Int32(2) + Int32(1),
                     )
 
-                    # g32/g33: kdq D-round 0, both kv-wave images in
-                    # one gather pass (both stage credits held).  MOVED
-                    # behind the grad gens (spec Z3's bundle-tail G5 +
-                    # single-ring FIFO); the named-barrier rendezvous
-                    # ORDER with the gather warps (r0(b), r1(b), ...)
-                    # is unchanged, so the frozen kdq machine is
-                    # untouched.  edge: ring credits g30/g31 freed by
-                    # the leader's grads(3) reads.
+                    # g16/g17: kdq D-round 0, both kv-wave images in
+                    # one gather pass (both stage credits held).  Kept
+                    # behind the grad gens (bundle-tail G5 + single-
+                    # ring FIFO); the named-barrier rendezvous ORDER
+                    # with the gather warps (r0(b), r1(b), ...) is
+                    # unchanged, so the frozen kdq machine is
+                    # untouched.  edge: ring credits g14/g15 freed by
+                    # the leader's grads(pair1) reads.
                     route_k_token = _iket.range_start(
                         "ROUTE_K(i)",
                         Int32(2) * loop_iter,
@@ -14612,9 +14594,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         Int32(2) * loop_iter,
                     )
 
-                    # g34/g35: kdq D-round 1 handshake (both kv-wave
+                    # g18/g19: kdq D-round 1 handshake (both kv-wave
                     # images).  edge: its stage credits free when the
-                    # leader consumes g32/g33 in G5 r0, which is why
+                    # leader consumes g16/g17 in G5 r0, which is why
                     # the gather side runs this rendezvous AFTER the
                     # next bundle's chase begins (piece-2 boundary).
                     route_k1_token = _iket.range_start(
@@ -14880,55 +14862,54 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
 
     @cute.jit
-    def _issue_dkv_block_v5(
+    def _issue_dkv_block_pair_v51(
         self,
-        sub_tile: cutlass.Constexpr[int],
+        pair: cutlass.Constexpr[int],
         dkv_tiled_mma: cute.TiledMma,
         t_acc: cute.Tensor,
         slab_fragment: cute.Tensor,
         gen_fragment: cute.Tensor,
     ):
-        """v5 G3/G4: one (sub-tile, tensor, D-round) block, K = h32.
+        """v5.1 G3/G4: one (pair, tensor, D-round) block, K = h64.
 
-        A = the P or dS slab chunk image c = t//2; the sub-tile's two
-        h16 column boxes are the K16 blocks {j, j+2} of that stage
-        (j = t%2) -- descriptor windows inside the natural image, the
-        same mid-swizzle-atom K stepping the score plane's k_blocks
-        already exercise.  B = the half-wide round gen: stage == box
-        (2 x [own-D64 x h16], K16 => a single K block per stage), box
-        order matching the A column order by the W17 TMA h16-tile
-        indices {4c+j, 4c+j+2}.  The block accumulator starts fresh
-        (accumulate=False on the first atom): every (t, tensor, round)
-        block is drained before its TMEM slot is reused.
+        Pair P = {t=2P, t=2P+1}: the two sub-tiles' h16 boxes tile
+        chunk P's FULL h64 interval, so A = the P or dS slab chunk
+        image P with ALL FOUR K16 column blocks consumed, and B = one
+        full-wide [h64 x own-D64] gen (single stage; gen k16-block kb
+        carries exactly the heads of slab column block kb).  The two
+        accumulate chains issue back-to-back into the SAME TMEM slot
+        (spec v5.1 item 2):
+          chain t-even (j=0): kb {0, 2}, ACCUMULATE=False on the
+                              first atom (fresh block);
+          chain t-odd  (j=1): kb {1, 3}, ACCUMULATE=True (chained).
+        f32 accumulation-order change is covered by the standing
+        "reordering is legal" ruling of the v5 demo spec.  Every
+        (pair, tensor, round) block is drained before its TMEM slot
+        is reused.
         """
 
-        assert cute.size(gen_fragment, mode=[2]) == 1, str(
+        assert cute.size(gen_fragment, mode=[2]) == 4, str(
             gen_fragment.shape
         )
-        assert cute.size(gen_fragment, mode=[3]) == 2, str(
+        assert cute.size(gen_fragment, mode=[3]) == 1, str(
             gen_fragment.shape
         )
         mma = dkv_tiled_mma.with_()
         mma.set(tcgen05.Field.ACCUMULATE, False)
-        for box in cutlass.range_constexpr(2):
+        for kb in (0, 2, 1, 3):
             cute.gemm(
                 mma,
                 t_acc,
-                slab_fragment[
-                    None,
-                    None,
-                    sub_tile % 2 + 2 * box,
-                    sub_tile // 2,
-                ],
-                gen_fragment[None, None, 0, box],
+                slab_fragment[None, None, kb, pair],
+                gen_fragment[None, None, kb, 0],
                 t_acc,
             )
             mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
-    def _issue_grads_subtile_v5(
+    def _issue_grads_pair_v51(
         self,
-        sub_tile: cutlass.Constexpr[int],
+        pair: cutlass.Constexpr[int],
         dkv_tiled_mma: cute.TiledMma,
         t_dkv_0: cute.Tensor,
         t_dkv_1: cute.Tensor,
@@ -14944,36 +14925,43 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         round_consumer_state: pipeline.PipelineState,
         loop_iter: Int32,
     ):
-        """v5 grads(t): 4 D-rounds x (dV, dK), sub-tile K = h32.
+        """v5.1 grads(pair): 4 D-rounds x (dV, dK), pair K = h64.
 
-        pds handoff (spec Z4, 2-stage, math-produced):
-          consumer_wait   <- edge: math's sub-tile-t pds commit (the
-                             P/dS h16 boxes and dq_b own slice of t are
-                             published and fenced);
-          consumer_release-> edge: math's pds acquire for sub-tile t+2
-                             (UMMA-tracked: fires when grads(t)'s
-                             G3/G4 descriptor reads complete).
+        pds handoff (v5.1 item 1, minimal change on the 2-stage math-
+        produced pipeline): BOTH sub-tile stages of the pair are
+        waited UP FRONT (every block reads both sub-tiles' slab
+        columns) and released together after the pair's 8 blocks --
+        the v32 score-helper clone+advance double-stage precedent:
+          consumer_wait(stage 0 gen) <- edge: math(2P) pds commit;
+          consumer_wait(stage 1 gen) <- edge: math(2P+1) pds commit;
+          2x consumer_release        -> edge: math(2P+2)/math(2P+3)
+                                       pds acquires (UMMA-tracked:
+                                       fire when the pair's G3/G4
+                                       descriptor reads complete).
         Per D-round r, dV then dK; each block:
-          dkv acquire     <- edge: reducer drained the SAME tensor's
-                             previous block (2-stage dkv_done ring
-                             alternating dV/dK);
-          round wait      <- edge: W17 gen (t, r, tensor) TMA landed
-                             (FIFO gen index (t*4 + r)*2 + tensor);
-          round release   -> edge: W17's producer_acquire two gens
-                             ahead (UMMA-tracked);
-          dkv commit      -> edge: reducer WAIT_dK for this block.
-        dVdK_ISSUE payload = ((bundle*4 + t)*4 + r)*2 + p (spec Z8).
+          dkv acquire  <- edge: reducer drained the SAME tensor's
+                          previous block (2-stage dkv_done ring
+                          alternating dV/dK; 16 gens/bundle now);
+          round wait   <- edge: W17 full-wide gen (pair*4 + r)*2 + p
+                          landed (FIFO index);
+          round release-> edge: W17's producer_acquire two gens ahead
+                          (UMMA-tracked);
+          dkv commit   -> edge: reducer WAIT_dK for this block.
+        dVdK_ISSUE payload = b*16 + pair*8 + r*2 + p (v5.1 item 4).
         RETURNS the advanced (pds, dkv, round) states (lesson #14).
         """
 
         pds_pipeline.consumer_wait(pds_consumer_state)
+        pds_state_odd = pds_consumer_state.clone()
+        pds_state_odd.advance()
+        pds_pipeline.consumer_wait(pds_state_odd)
         for d_round in cutlass.range_constexpr(
             self.DKV_D_ROUNDS
         ):
             block_payload = loop_iter * Int32(
-                self.SUB_TILES * self.DKV_D_ROUNDS * 2
+                2 * self.DKV_D_ROUNDS * 2
             ) + Int32(
-                (sub_tile * self.DKV_D_ROUNDS + d_round) * 2
+                (pair * self.DKV_D_ROUNDS + d_round) * 2
             )
             dkv_done_pipeline.producer_acquire(
                 dkv_producer_state
@@ -14983,8 +14971,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 "dVdK_ISSUE(i,r,p)",
                 block_payload,
             )
-            self._issue_dkv_block_v5(
-                sub_tile,
+            self._issue_dkv_block_pair_v51(
+                pair,
                 dkv_tiled_mma,
                 t_dkv_0,
                 p_fragment,
@@ -15006,8 +14994,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 "dVdK_ISSUE(i,r,p)",
                 block_payload + Int32(1),
             )
-            self._issue_dkv_block_v5(
-                sub_tile,
+            self._issue_dkv_block_pair_v51(
+                pair,
                 dkv_tiled_mma,
                 t_dkv_1,
                 ds_fragment,
@@ -15021,8 +15009,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             round_consumer_state.advance()
             dkv_done_pipeline.producer_commit(dkv_producer_state)
             dkv_producer_state.advance()
-        # Sub-tile slab-stage release: math's publish of sub-tile t+2
-        # may proceed once this sub-tile's last G4 completes.
+        # Pair slab-stage releases: math's publishes of sub-tiles
+        # 2P+2 / 2P+3 may proceed once the pair's last G4 completes
+        # (both releases are tcgen05 group commits tracking all
+        # previously issued MMAs, so each covers the whole pair).
+        pds_pipeline.consumer_release(pds_consumer_state)
+        pds_consumer_state.advance()
         pds_pipeline.consumer_release(pds_consumer_state)
         pds_consumer_state.advance()
         return (
@@ -15672,4 +15664,51 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 #   * MAT_QDO straddle: span t includes the wait for span t-1's last
 #     in-flight TMA (software pipelining); do not read MAT_QDO edges
 #     as pure per-sub-tile supply latency.
+# ======================================================================
+# ======================================================================
+# V5.1 PAIR-BATCHING ADDENDUM (change order 2026-08-04; supersedes the
+# V5 addendum's generation law, grads cadences and dVdK/MAT_QDO payload
+# paragraphs; score/math/gather/chase are UNTOUCHED from v5).
+# ======================================================================
+#
+# Pair algebra: pair P = {t=2P, t=2P+1}; the two sub-tiles' h16 boxes
+# tile chunk P's full h64 interval, so the pair's grads window reads
+# ALL FOUR K16 column blocks of slab chunk image P against one
+# FULL-WIDE [h64 x own-D64] gen (single TMA box; gen k16-block kb ==
+# slab column block kb head-for-head).  "Two accumulate chains" =
+# k-block issue order {0,2} (t-even, ACCUMULATE=False first) then
+# {1,3} (t-odd, chained True) into the same TMEM slot; f32 reorder is
+# covered by the standing v5 ruling.
+#
+# Generation law: ROUND_GENS_PER_TILE = 20 (mod 2 == 0): g0..g15
+# full-wide (P, r) x (dO, Q) grad gens (8 KB each), g16/g17 kdq r0,
+# g18/g19 kdq r1.  DKV_B_TILER K = 64, DKV_B_STAGES = 1.
+#
+# Leader total order: score(0); score(1); score(2); grads(pair0);
+# score(3); grads(pair1); G5 r0; G5 r1; dqb-free commit.  grads(pair)
+# waits BOTH pds stages up front (clone+advance double-wait, v32
+# score-helper precedent) and releases both after its 8 blocks; math's
+# per-sub-tile pds cadence (4 commits/bundle, 2-stage) is unchanged --
+# math(2P+2)/math(2P+3) publish over grads(pairP) execution.
+# dkv_done 16 generations/bundle; drains 16.
+#
+# Wait-graph deltas vs the V5 addendum (all other edges unchanged):
+#   grads(pairP) <- pds full x2 (math(2P), math(2P+1))
+#                <- round full (W17 gen (P*4+r)*2+p)
+#                <- dkv empty (reducer, same-tensor previous block)
+#   math(2P+2)   <- pds empty (grads(pairP) first release)
+#   W17 gen q    <- round empty (leader consumed gen q-2; kdq r0
+#                   credits now free at grads(pair1) r3)
+# Liveness closes exactly as v5 (kdq rendezvous order unchanged;
+# cross-bundle chain via G5 -> score(0)(b+1) intact).
+#
+# Trace-readout deltas: dVdK_ISSUE and the reducer spans =
+# b*16 + pair*8 + r*2 + p; MAT_QDO = b*2 + pair (2 spans/bundle,
+# straddle note applies).  All other payloads (S_ISSUE b*4+t, math
+# spans 8b+2t, ...) unchanged.  Static names: net +0 (28/28 held).
+#
+# Experiment verdict hooks: grads windows 4 -> 2 per bundle (expect
+# ~2 x 16 us vs 4 x 13 us), drains 32 -> 16, protocol tax per pass
+# 0.5 us -> ~0.15 us target, slot-pressure cadence halved; the first
+# two score passes' inter-pass gaps should hold at the 0.4 us class.
 # ======================================================================
