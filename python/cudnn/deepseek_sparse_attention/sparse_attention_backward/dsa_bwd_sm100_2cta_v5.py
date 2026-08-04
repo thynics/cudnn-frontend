@@ -190,6 +190,9 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     # Identical to DKV_MMA_TILER for every pre-v5 schedule; the v5
     # class narrows the K mode to one h16 box.
     DKV_B_TILER = DKV_MMA_TILER
+    # v5.2 hook: the dQ-eviction MMA tiler (None = no eviction; the
+    # v5.2 class sets (128, 32, 64) and evicts per-(t, r) blocks).
+    DQ_EVICT_TILER = None
     STATIONARY_TILE_H = H_TILE_CTA
     STATIONARY_STAGES = 1
     DKV_A_MAJOR = OperandMajorMode.MN
@@ -294,6 +297,20 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             score_epi_tile,
             True,
         )
+
+    def _carve_dq_acc(
+        self,
+        workspace_LSE_OdO,
+        problem_shape,
+        total_seqlen_Q,
+    ):
+        """v5.2 hook: the f32 dQ eviction partial-sum tensor.
+
+        None for every schedule without dQ eviction; the v5.2 class
+        carves it from the (extended) LSE/OdO workspace tail.
+        """
+
+        return None
 
     @cute.jit
     def __call__(
@@ -511,6 +528,37 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             cg2,
             self.DQ_MMA_TILER[:2],
         )
+        # v5.2: the dQ-eviction MMA ((128, 32) CG2) and its A layout.
+        # The 2-stage (128,32,64) A layout is byte-identical to the
+        # FROZEN kdq gen bytes ([own-D128 x kv64] under the legacy
+        # (256,128,64) single-stage layout): make_smem_layout_a's
+        # MN-major order is (2,1,3) -- rest_k fastest -- so the legacy
+        # m-half stride (4096 elements) IS the new layout's stage
+        # stride; stage == d_half.  Asserted below (cosize + swizzle).
+        if cutlass.const_expr(self.DQ_EVICT_TILER is not None):
+            dq_evict_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+                self.element_dtype,
+                self.element_dtype,
+                OperandMajorMode.MN,
+                OperandMajorMode.MN,
+                self.acc_dtype,
+                cg2,
+                self.DQ_EVICT_TILER[:2],
+            )
+            dq_a_evict_layout_staged = sm100_utils.make_smem_layout_a(
+                dq_evict_tiled_mma,
+                self.DQ_EVICT_TILER,
+                self.element_dtype,
+                2,
+            )
+        else:
+            dq_evict_tiled_mma = dq_tiled_mma
+            dq_a_evict_layout_staged = sm100_utils.make_smem_layout_a(
+                dq_tiled_mma,
+                self.DQ_MMA_TILER,
+                self.element_dtype,
+                1,
+            )
         score_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
             self.element_dtype,
@@ -671,6 +719,25 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         assert cute.cosize(dkv_b_layout_staged) <= self.DKV_B_MAX_ELEMENTS
         assert cute.cosize(dq_a_layout_staged) <= 8192
         assert cute.cosize(dq_b_layout_staged) <= self.DQ_B_MAX_ELEMENTS
+        if cutlass.const_expr(self.DQ_EVICT_TILER is not None):
+            # v5.2 byte-identity gates for the eviction A view.
+            assert cute.cosize(dq_a_evict_layout_staged) == cute.cosize(
+                dq_a_layout_staged
+            ), (
+                cute.cosize(dq_a_evict_layout_staged),
+                cute.cosize(dq_a_layout_staged),
+            )
+            assert (
+                dq_a_evict_layout_staged.inner
+                == dq_a_layout_staged.inner
+            ), (
+                str(dq_a_evict_layout_staged.inner),
+                str(dq_a_layout_staged.inner),
+            )
+            # v5.2 TMEM budget (change order Z1), echo on failure.
+            assert self.TMEM_BUDGET <= self.TMEM_COLUMNS, (
+                self.TMEM_BUDGET
+            )
         assert cute.cosize(score_a_layout_staged) >= (
             self.H_TILE_CTA * self.N_TILE
         )
@@ -925,6 +992,13 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             self.acc_dtype,
         )
         mdKV_acc = cute.make_tensor(mdKV_acc.iterator, mdKV.layout)
+        # v5.2: the f32 dQ eviction partial-sum tensor (None for every
+        # schedule without eviction).
+        mdQ_acc = self._carve_dq_acc(
+            workspace_LSE_OdO,
+            problem_shape,
+            mQ.shape[2][0],
+        )
 
         sum_OdO_scale = Float32(-1.0)
         LSE_scale = Float32(-math.log2(math.e))
@@ -997,6 +1071,9 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             trace_batch_idx,
             stationary_tiled_mma,
             stationary_a_layout_staged,
+            dq_evict_tiled_mma,
+            dq_a_evict_layout_staged,
+            mdQ_acc,
         ).launch(
             grid=(
                 2 * problem_shape[0],
@@ -10010,6 +10087,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         trace_batch_idx: Int32,
         stationary_tiled_mma: cute.TiledMma,
         stationary_a_layout_staged: cute.ComposedLayout,
+        dq_evict_tiled_mma: cute.TiledMma,
+        dq_a_evict_layout_staged: cute.ComposedLayout,
+        mdQ_acc: Optional[cute.Tensor],
     ):
         """Serialized two-tile v1 macro used only for correctness bring-up.
 
@@ -10026,6 +10106,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         _ = tma_tensor_qt
         _ = tma_atom_dot
         _ = tma_tensor_dot
+        _ = dq_evict_tiled_mma
+        _ = dq_a_evict_layout_staged
+        _ = mdQ_acc
         _ = mQ
         _ = mdO
         _ = grad_a_stage_bytes
@@ -11743,15 +11826,36 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # _issue_dkv_round_v32; kept for trailer/audit cross-reference).
     H_PASSES = 2
 
-    # G5 dQ plane (dQ^T += K^T.dS^T), CG2:
-    #   (M,N,K) = (D256-round, H128, kv64-wave); two D-rounds x two kv64
-    #   waves, accumulate=1 chained into the persistent dQ^T accumulator.
-    #   A = kdq stream gen [own-D128 M-half x kv64] (MN-major, GMEM-
-    #   natural gather rows); B = dq_b base + wave*8,192 window (single
-    #   base descriptor, SW128B-atom-preserving 8,192B jumps).
+    # v5.2 G5 dQ plane (dQ^T += K^T.dS^T), CG2 -- dQ EVICTION form:
+    #   (M,N,K) = (D128-round, h32-block, kv64-wave); SIXTEEN blocks
+    #   per bundle (4 D-rounds x 4 h32 windows), each a FRESH rotating
+    #   accumulator (2 x 16-column TMEM slots) chained over the two
+    #   kv64 waves and immediately offloaded to the f32 dQ workspace
+    #   by the reduce warps (plain LDG+FADD+STG; the cluster owns its
+    #   token's dQ rows exclusively -- deterministic same-cluster f32
+    #   order, NO atomics).  Head map of block (t, r), column n:
+    #     head(t, n) = (n//16)*64 + t*16 + (n%16)
+    #   (each CTA supplies its dq_b's columns [t*16, +16) -- the only
+    #   N-half form compatible with the FROZEN dq_b byte image).
+    #   A = kdq stream gen d-half window (stage == d_half; the frozen
+    #   [own-D128 x kv64] gen's m-half stride 4096 == the (128,32,64)
+    #   2-stage auto layout's stage stride -- order-(2,1,3) algebra);
+    #   B = hand-derived dq_b window view, stage tiled (t, wave) with
+    #   strides (16, 4096) elements (32 B mid-atom window starts, the
+    #   k_block precedent).  Issue order (r_old, t, d_half): the round
+    #   ring holds ONE kdq gen pair at a time, so r_old groups are
+    #   forced; DQ_EPI payload keeps the ordered b*16 + t*4 + r
+    #   encoding (non-monotonic within a bundle, see V5_BUILD_LOG).
+    # DQ_MMA_TILER keeps the LEGACY (256,128,64) value: it feeds only
+    # the _zero_dq_v2 coordinate decode (tile_count == 0 path) and the
+    # dormant dq-epi machinery.
     DQ_MMA_TILER = (256, 128, 64)
+    DQ_EVICT_TILER = (128, 32, 64)
     DQ_D_ROUNDS = 2
     DQ_KV_WAVES = 2
+    DQ_EVICT_ROUNDS = 4
+    DQ_EVICT_WINDOWS = 4
+    DQ_EVICT_SLOTS = 2
 
     # P/dS publish geometry: per h-chunk one [own-kv64 x h64] bf16
     # sub-image (H-contiguous 128B rows, SW128B), stacked chunk-major so
@@ -11760,29 +11864,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     PDS_BLOCK_ELEMENTS = 4_096
     PDS_BLOCK_BYTES = 8_192
 
-    # v5 tiling4 TMEM 512-column map (all f32, per CTA), allocated
-    # UNGUARDED (spec Z1: 448/512 used, [448,512) free):
-    #   dQ^T [0,256): persistent across the query tile, 128 cols per
-    #                 D-round (M256 CG2: 128 lanes x full N=128);
-    #   S pp [256,288) / dP pp [288,320): 2 stages x 16 cols each (M128
-    #                 CG2 fold: UMMA_2SM M64 Interleaved atom
-    #                 (64,(N/2,2)):(1,(128,64)) => 128 DP x N/2 = 16
-    #                 columns for the h32 sub-tile);
-    #   dV [320,384) / dK [384,448): one [kv128 x D128] block each
-    #                 (128 DP x 64 cols), reused across the 16 (t, r)
-    #                 blocks per tensor per bundle.
-    TMEM_DQ0_OFFSET = 0
-    TMEM_DQ1_OFFSET = 128
-    TMEM_S_OFFSET = 256
-    TMEM_S1_OFFSET = 272
-    TMEM_DP_OFFSET = 288
-    TMEM_DP1_OFFSET = 304
-    TMEM_DV_OFFSET = 320
-    TMEM_DK_OFFSET = 384
-    # Back-compat aliases for the shared dkv drain machinery (slot 0 = dV,
-    # slot 1 = dK; slots are per-tensor, not ping-pong).
-    TMEM_DKV0_OFFSET = 320
-    TMEM_DKV1_OFFSET = 384
+    # v5.2 TMEM 512-column map (all f32, per CTA), allocated UNGUARDED
+    # (change order Z1: 32 + 64 + 384 = 480 <= 512, [480,512) free):
+    #   dQ rot [0,32):   2 x 16-column ROTATING eviction slots (block
+    #                    g -> slot g%2; 16 blocks/bundle, even => the
+    #                    slot pattern restarts per bundle, static);
+    #   S pp [32,64) / dP pp [64,96): 2 stages x 16 cols each (M128
+    #                    CG2 fold => 128 DP x 16 columns per h32);
+    #   dV/dK army [96,480): SIX 64-column slots, block g -> slot
+    #                    g%6 (16/bundle mod 6 != 0 => the slot index
+    #                    rides the 6-deep dkv_done pipeline state,
+    #                    RUNTIME tmem offset -- the standard
+    #                    accumulator-ring form).
+    TMEM_DQ_SLOT0 = 0
+    TMEM_DQ_SLOT1 = 16
+    TMEM_S_OFFSET = 32
+    TMEM_S1_OFFSET = 48
+    TMEM_DP_OFFSET = 64
+    TMEM_DP1_OFFSET = 80
+    TMEM_DKV_BASE = 96
+    TMEM_DKV_SLOT_COLS = 64
+    TMEM_DKV_SLOTS = 6
+    # TMEM budget echo-assert (host side, __call__).
+    TMEM_BUDGET = 32 + 64 + 6 * 64
 
     # v7: S/dP TMEM double-buffer depth (cross-chunk: S(c+1) no longer
     # waits for math's T2R of S(c)).
@@ -11805,13 +11909,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     ROUND_GENS_PER_TILE = 20
     ROUND_STAGES = 2
 
-    # v8: back to one dkv_done generation PER SLOT (head- and tail-
-    # committed), two stages.  v7's fused single generation forced depth 1
-    # and pushed the slot-0 T2R start to the tail commit, tightening the
-    # leader's acquire slack; the per-slot cadence restores the v6 head
-    # start while the reducer keeps every v7 fused saving that mattered
-    # (shared index preload, fused atomic section, no reduce_sync_barrier).
-    MMA_DONE_STAGES = 2
+    # v5.2 slot army: the dkv_done ring deepens to SIX (one generation
+    # per [own-kv64 x D128] block, slot == pipeline stage == runtime
+    # tmem offset).  Six slots decouple the leader's block issue from
+    # the drain by ~3 fused pairs of runway; the reducer consumes
+    # generations in (dV, dK) pairs (fused drain).
+    MMA_DONE_STAGES = 6
 
     # v9.3 hoisting is DISABLED for v3.2: the transposed plane's
     # constants live on the COLUMN axis, and the Ld16x256b(Rep4)
@@ -11885,6 +11988,64 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.acc_dtype,
         )
 
+    @staticmethod
+    def _get_workspace_size_LSE_OdO(
+        q: int,
+        d: int,
+        h: int,
+        b: int,
+        acc_dtype,
+    ):
+        """v5.2: extend each (h, q) workspace entry by one f32 D-row.
+
+        Layout: [sum_OdO vectors][scaled_LSE vectors][dQ f32 partial
+        sums, D per (h, q)].  The harness allocates via
+        impl_cls._get_workspace_size_LSE_OdO (torch.zeros), so this
+        override is authoritative for the v5.2 runs; the public
+        wrapper path instantiates the baseline class and is
+        unaffected.  Cross-run safety does NOT rely on the zero fill:
+        the first bundle's eviction stores directly (no LDG).
+        """
+
+        d_r = (d + 7) // 8 * 8
+        q_r = (q + 7) // 8 * 8
+        acc_bytes = acc_dtype.width // 8
+        workspace_bytes = 2 * acc_bytes + d_r * acc_bytes
+        return (b, h, q_r, workspace_bytes)
+
+    def _carve_dq_acc(
+        self,
+        workspace_LSE_OdO,
+        problem_shape,
+        total_seqlen_Q,
+    ):
+        """v5.2: carve the f32 dQ partial-sum view from the extended
+        LSE/OdO workspace tail (indexed [head, d, (token, batch)])."""
+
+        H = cute.size(problem_shape[3][0])
+        D = cute.round_up(problem_shape[2], 8)
+        q_r = cute.round_up(total_seqlen_Q, 8)
+        acc_bytes = self.acc_dtype.width // 8
+        base_bytes = cute.assume(
+            2 * H * q_r * acc_bytes,
+            divby=64,
+        )
+        dq_iter = cute.recast_ptr(
+            workspace_LSE_OdO.iterator + base_bytes,
+            dtype=self.acc_dtype,
+        )
+        return cute.make_tensor(
+            dq_iter,
+            cute.make_layout(
+                (H, D, (q_r, 1)),
+                stride=(
+                    D,
+                    1,
+                    (cute.assume(H * D, divby=64), 0),
+                ),
+            ),
+        )
+
     def _specialize_shared_storage(
         self,
         default_storage,
@@ -11937,7 +12098,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # v5 (spec Z4): pds is a 2-stage pipeline now (full+empty
             # per stage).
             pds_mbars: cute.struct.MemRange[cutlass.Int64, 4]
-            dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+            # v5.2 slot army: 6-stage dkv_done ring (full+empty per
+            # stage).
+            dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 12]
+            # v5.2: the dQ eviction handoff (2 stages, full+empty per
+            # stage; leader UMMA producer -> reduce consumers).
+            dq_evict_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+            # v5.2: DORMANT (the dQ TMA epilogue and its dq_done gate
+            # retired with the eviction; kept for byte-account
+            # stability).
             dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             # Raw single-phase-per-tile barriers.
             stationary_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
@@ -12436,6 +12605,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         trace_batch_idx: Int32,
         stationary_tiled_mma: cute.TiledMma,
         stationary_a_layout_staged: cute.ComposedLayout,
+        dq_evict_tiled_mma: cute.TiledMma,
+        dq_a_evict_layout_staged: cute.ComposedLayout,
+        mdQ_acc: Optional[cute.Tensor],
     ):
         """v2 rotated-schedule two-CTA backward (design: 优化设计文档_v2.md)."""
 
@@ -12536,10 +12708,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             score_a_layout_staged.outer,
             swizzle=score_a_layout_staged.inner,
         )
-        # v3.2: the dQ epilogue stages each [D128, H128] round across the
-        # CONTIGUOUS round_buf_a+round_buf_b pair (32,768 B), which is
-        # dead once dq_done commits: the last round-region readers are
-        # the G5 r1 waves, tracked by the same commit.
+        # v5.2: DORMANT (the dQ TMA epilogue retired with the
+        # eviction); the staging view is kept so the dormant epi
+        # helpers stay compilable.
         s_dq_epi = cute.make_tensor(
             cute.recast_ptr(
                 storage.round_buf_a.data_ptr(),
@@ -12556,6 +12727,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             storage.round_buf_b.get_tensor(
                 dq_a_layout_staged.outer,
                 swizzle=dq_a_layout_staged.inner,
+            ),
+        )
+        # v5.2 eviction-A views of the SAME kdq gen bytes: the 2-stage
+        # (128,32,64) layout's stage stride (4,096 elements) equals the
+        # legacy layout's m-half stride (order-(2,1,3) algebra, byte
+        # identity asserted host-side), so stage == d_half.  The
+        # legacy round_kd views above stay for the FROZEN gather-side
+        # kdq fill machine.
+        round_kd_evict = (
+            storage.round_buf_a.get_tensor(
+                dq_a_evict_layout_staged.outer,
+                swizzle=dq_a_evict_layout_staged.inner,
+            ),
+            storage.round_buf_b.get_tensor(
+                dq_a_evict_layout_staged.outer,
+                swizzle=dq_a_evict_layout_staged.inner,
             ),
         )
         # v5.1 round-gen B views: one gen = one FULL-WIDE
@@ -12967,13 +13154,60 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         score_k_fragment = score_tiled_mma.make_fragment_A(k_chase)
         dp_k_fragment = dp_tiled_mma.make_fragment_A(k_chase)
-        dq_kd_fragment_a = dq_tiled_mma.make_fragment_A(
-            round_kd[0]
+        # v5.2 eviction G5 fragments.  A: the kdq gen d-half windows
+        # (stage == d_half, byte identity asserted host-side).
+        dq_kd_fragment_a = dq_evict_tiled_mma.make_fragment_A(
+            round_kd_evict[0]
         )
-        dq_kd_fragment_b = dq_tiled_mma.make_fragment_A(
-            round_kd[1]
+        dq_kd_fragment_b = dq_evict_tiled_mma.make_fragment_A(
+            round_kd_evict[1]
         )
-        dq_ds_fragment = dq_tiled_mma.make_fragment_B(dq_b_t)
+        # B: a HAND-DERIVED window view of the FROZEN dq_b bytes (the
+        # auto (128,32,64) MN-major staged-B would select an SW32 atom
+        # and cannot bind the SW128 image).  Legacy stage form (from
+        # the (256,128,64) staged-B, order (2,1,3), hardware-
+        # validated):
+        #   offset(h, kv) = (kv//8)*512 + sw((kv%8)*64 + h),
+        #   wave stage stride 4096.
+        # The eviction view narrows N to a 16-head window and tiles
+        # the stage mode as (t-window 4, wave 2) -> flat stage index
+        # t + 4*w at offset t*16 + w*4096 elements (32 B mid-swizzle-
+        # atom window starts -- the k_block descriptor precedent).
+        # Profile ((atom_n, atom_k), rest_n, rest_k, stage) with
+        # atom_k split (8,2):(64,512) and rest_k 4 x 1024 (kv 0..63).
+        dq_b_evict_layout = cute.make_layout(
+            (
+                (16, (8, 2)),
+                1,
+                4,
+                (4, 2),
+            ),
+            stride=(
+                (1, (64, 512)),
+                0,
+                1024,
+                (16, 4096),
+            ),
+        )
+        # Tight cosize pin: the view must cover the 8,192-element
+        # dq_b image bijectively-in-range (echo on failure).
+        assert cute.cosize(dq_b_evict_layout) == 8192, str(
+            dq_b_evict_layout
+        )
+        assert cute.cosize(dq_b_layout_staged) == 8192, str(
+            dq_b_layout_staged
+        )
+        dq_b_evict_t = cute.make_tensor(
+            cute.recast_ptr(
+                dq_b_raw,
+                dq_b_layout_staged.inner,
+                dtype=self.element_dtype,
+            ),
+            dq_b_evict_layout,
+        )
+        dq_ds_fragment = dq_evict_tiled_mma.make_fragment_B(
+            dq_b_evict_t
+        )
         grad_fragment_a = dkv_tiled_mma.make_fragment_B(
             round_grad[0]
         )
@@ -13107,11 +13341,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipe_dq_done = pipeline.PipelineUmmaAsync.create(
-            num_stages=1,
+        # v5.2: the dQ eviction handoff replaces dq_done (the TMA
+        # epilogue retired).  Leader UMMA producer commits one
+        # generation per (t, r) block; the reduce warps of both CTAs
+        # consume (T2R + plain RMW offload) -- consumer count carries
+        # the atom_thr_size factor via reduce_group (lesson #10).
+        pipe_dq_evict = pipeline.PipelineUmmaAsync.create(
+            num_stages=2,
             producer_group=leader_group,
-            consumer_group=math_group,
-            barrier_storage=storage.dq_done_mbars.data_ptr(),
+            consumer_group=reduce_group,
+            barrier_storage=storage.dq_evict_mbars.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
@@ -13198,6 +13437,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self.DQ_MMA_TILER[:2]
             )
         ).layout
+        # v5.2: the eviction C fragment ((128,32) CG2 fold -> 128 DP x
+        # 16 columns per CTA) and its coordinate identity (offloader
+        # decode).
+        dq_evict_c_layout = dq_evict_tiled_mma.make_fragment_C(
+            dq_evict_tiled_mma.partition_shape_C(
+                self.DQ_EVICT_TILER[:2]
+            )
+        ).layout
         t_score = cute.make_tensor(
             tmem_ptr + self.TMEM_S_OFFSET,
             score_c_layout,
@@ -13214,26 +13461,25 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             tmem_ptr + self.TMEM_DP1_OFFSET,
             score_c_layout,
         )
-        t_dq = (
+        # v5.2 rotating dQ eviction slots (block g -> slot g%2,
+        # static: 16 blocks/bundle is even).
+        t_dq_rot = (
             cute.make_tensor(
-                tmem_ptr + self.TMEM_DQ0_OFFSET,
-                dq_c_layout,
+                tmem_ptr + self.TMEM_DQ_SLOT0,
+                dq_evict_c_layout,
             ),
             cute.make_tensor(
-                tmem_ptr + self.TMEM_DQ1_OFFSET,
-                dq_c_layout,
-            ),
-        )
-        t_dkv = (
-            cute.make_tensor(
-                tmem_ptr + self.TMEM_DKV0_OFFSET,
-                dkv_c_layout,
-            ),
-            cute.make_tensor(
-                tmem_ptr + self.TMEM_DKV1_OFFSET,
-                dkv_c_layout,
+                tmem_ptr + self.TMEM_DQ_SLOT1,
+                dq_evict_c_layout,
             ),
         )
+        # v5.2 dkv slot army: SIX 64-column slots addressed at RUNTIME
+        # from the 6-deep dkv_done pipeline state (slot == stage ==
+        # generation % 6; 16 blocks/bundle mod 6 != 0, so the slot
+        # index cannot be static).  Roles rebuild the slot tensor per
+        # block from this base pointer + dkv_c_layout (the standard
+        # accumulator-ring form).
+        tmem_dkv_base = tmem_ptr + self.TMEM_DKV_BASE
 
         if cutlass.const_expr(mTopkLength is not None):
             topk = mTopkLength[token_idx]
@@ -13469,10 +13715,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             pds_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 2,
-            )
-            dq_done_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer,
-                1,
             )
             dqb_free_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
@@ -13948,70 +14190,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     math_bar1_token,
                     loop_iter,
                 )
-            # v12 (S1): the pds producer_tail moves BELOW the epilogue.  It
-            # used to gate the dQ epilogue behind the leader's last pds
-            # consumer_release even though the epilogue only needs the dQ
-            # TMEM columns [128,384), which are disjoint from the leader's
-            # tail writes into dKV [384,512).  Keeping the tail after the
-            # epilogue preserves the pipeline-teardown contract (it is only
-            # a drain of outstanding producer credit) while removing a
-            # serialization point from the per-token critical tail.
-
-            # dQ epilogue: wait for the last dQ generation, then store both
-            # rank-owned [D128, H128] slices (disjoint across CTAs/rounds).
+            # v5.2: the dQ TMA epilogue is RETIRED (change order item
+            # 2) -- the reducer's last-bundle RMW already wrote the
+            # terminal mdQ values, so the per-token seam disappears.
+            # Only the F3 dqb-free credit drain survives (pre-arm 1 +
+            # 1/bundle = tile_count+1 commits vs tile_count in-loop
+            # consumes; without this the leader's producer_tail waits
+            # a release that never comes).
             if tile_count > Int32(0):
-                # Drain the leader's LAST dq_b free commit (pre-arm 1 +
-                # 1/bundle = tile_count+1 commits vs tile_count in-loop
-                # consumes; without this the leader's producer_tail
-                # waits a release that never comes -- audit F3).
                 pipe_dqb_free.consumer_wait(dqb_free_state)
                 pipe_dqb_free.consumer_release(dqb_free_state)
                 dqb_free_state.advance()
-                pipe_dq_done.consumer_wait(dq_done_state)
-                dq_epi_0_token = _iket.range_start(
-                    "DQ_EPI(r)",
-                    Int32(0),
-                )
-                self._store_dq_epi_tma_v12(
-                    t_dq[0],
-                    dq_tmem_load,
-                    rank_dq_coordinates,
-                    s_dq_epi,
-                    tma_atom_dq_epi,
-                    tma_tensor_dq_epi,
-                    0,
-                    token_idx,
-                    batch_idx,
-                    rank,
-                    mtx,
-                )
-                _iket.range_end(
-                    dq_epi_0_token,
-                    Int32(0),
-                )
-                dq_epi_1_token = _iket.range_start(
-                    "DQ_EPI(r)",
-                    Int32(1),
-                )
-                self._store_dq_epi_tma_v12(
-                    t_dq[1],
-                    dq_tmem_load,
-                    rank_dq_coordinates,
-                    s_dq_epi,
-                    tma_atom_dq_epi,
-                    tma_tensor_dq_epi,
-                    1,
-                    token_idx,
-                    batch_idx,
-                    rank,
-                    mtx,
-                )
-                _iket.range_end(
-                    dq_epi_1_token,
-                    Int32(1),
-                )
-                pipe_dq_done.consumer_release(dq_done_state)
-                dq_done_state.advance()
             else:
                 self._zero_dq_v2(
                     rank_dq_coordinates,
@@ -14029,18 +14218,25 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     batch_idx,
                     mtx,
                 )
-            # v5: math owns the pds producer role (spec Z4), so the
-            # producer_tail moves here from the relay -- below the
-            # epilogue per the v12 (S1) rationale above (it is only a
-            # drain of outstanding producer credit).
+            # v5: math owns the pds producer role (spec Z4); the
+            # producer_tail is only a drain of outstanding producer
+            # credit (the v12 S1 epilogue-ordering rationale is moot
+            # now that the epilogue is retired).
             if tile_count > Int32(0):
                 pipe_pds.producer_tail(pds_state)
 
         elif warp_idx < Int32(self.MMA_WARP):
-            # --- reduce: one fused drain call per tile; slot 0 is T2R'd
-            # and released off the head commit, slot 1 off the tail commit,
-            # then both atomic bursts run back-to-back.  Split wait/release
-            # states let each release trail its own fence.
+            # --- reduce, v5.2: FUSED dV+dK drains (8/bundle; V == K
+            # makes d(KV) = dV + dK share one destination, so the pair
+            # is summed in registers and issued as a SINGLE red.global
+            # stream -- the T3-HO4 P0 gate measurement) + the dQ
+            # eviction offload (16 blocks/bundle; plain LDG/FADD/STG,
+            # the cluster owns its token's dQ rows exclusively).
+            # This warpgroup pair is the only idle-enough role that
+            # can offload dQ: tcgen05.ld gives each warp only its own
+            # 32-DP slice, so the [128 DP x 16 col] slot needs a full
+            # warpgroup (W18/W19 = 2 warps = 64 DP, physically short),
+            # and the drain fusion frees ~half the reduce throughput.
             _iket.mark("ROLE_REDUCE", rank)
             rtx = tidx - Int32(self.REDUCE_THREAD_BEGIN)
             dkv_wait = pipeline.make_pipeline_state(
@@ -14051,25 +14247,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Consumer,
                 self.MMA_DONE_STAGES,
             )
-            # v5.1 (item 4): SIXTEEN [own-kv64 x D128] blocks per
-            # bundle, in the leader's commit order -- per pair P, per
-            # D-round r, dV then dK.  The block SHAPE and the fragment
-            # decode are unchanged (each block is now a K=h64 -- full
-            # chunk -- partial sum; the f32 GMEM atomics merge pairs
-            # the same way they merge tokens).  Both tensors of a
-            # round still merge into the same GMEM quadrant (V == K).
-            # WAIT_dK/REDUCE_T2R/REDUCE_ATOMIC payloads follow the
-            # pair packing: issue_seq = b*16 + pair*8 + r*2 + p.
+            evict_wait = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer,
+                2,
+            )
+            evict_rel = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer,
+                2,
+            )
             for loop_iter in cutlass.range(tile_count):
                 tile_index = tile_count - Int32(1) - loop_iter
+                # 8 fused (dV, dK) drains, leader commit order (pair-
+                # major then D-round).  Fused-block payload =
+                # b*8 + pair*4 + r (change order item 3).
                 for g_pair in cutlass.range_constexpr(2):
                     for d_round in cutlass.range_constexpr(
                         self.DKV_D_ROUNDS
                     ):
-                        # edge: leader dkv commit for (P, r, dV) /
-                        # (P, r, dK) -- FIFO with the 2-stage ring.
-                        dkv_wait, dkv_rel = self._drain_dkv_block_v32(
-                            t_dkv[0],
+                        # edge: leader dkv commits for (P, r, dV) and
+                        # (P, r, dK) -- consumed as a pair from the
+                        # 6-deep ring.
+                        dkv_wait, dkv_rel = self._drain_dkv_fused_v52(
+                            tmem_dkv_base,
+                            dkv_c_layout,
                             mdKV_acc,
                             mTopkIdxs,
                             tile_index,
@@ -14079,46 +14279,46 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             batch_idx,
                             rtx,
                             rank,
-                            loop_iter * Int32(
-                                2 * self.DKV_D_ROUNDS * 2
-                            )
-                            + Int32(
-                                (
-                                    g_pair * self.DKV_D_ROUNDS
-                                    + d_round
-                                )
-                                * 2
-                            ),
+                            loop_iter * Int32(8)
+                            + Int32(g_pair * 4 + d_round),
                             pipe_dkv_done,
                             dkv_wait,
                             dkv_rel,
                         )
-                        dkv_wait, dkv_rel = self._drain_dkv_block_v32(
-                            t_dkv[1],
-                            mdKV_acc,
-                            mTopkIdxs,
-                            tile_index,
-                            Int32(d_round),
-                            topk,
-                            token_idx,
-                            batch_idx,
-                            rtx,
-                            rank,
-                            loop_iter * Int32(
-                                2 * self.DKV_D_ROUNDS * 2
-                            )
-                            + Int32(
-                                (
-                                    g_pair * self.DKV_D_ROUNDS
-                                    + d_round
+                # 16 dQ eviction offloads, leader issue order
+                # (r_old, t, d_half); DQ_EPI payload keeps the ordered
+                # b*16 + t*4 + r encoding (r = 2*r_old + d_half).
+                is_first = loop_iter == Int32(0)
+                is_last = loop_iter == tile_count - Int32(1)
+                for r_old in cutlass.range_constexpr(2):
+                    for t_window in cutlass.range_constexpr(4):
+                        for d_half in cutlass.range_constexpr(2):
+                            # edge: leader dq_evict commit for block
+                            # (t, 2*r_old + d_half).
+                            evict_wait, evict_rel = (
+                                self._offload_dq_block_v52(
+                                    t_window,
+                                    2 * r_old + d_half,
+                                    t_dq_rot[d_half],
+                                    mdQ_acc,
+                                    mdQ,
+                                    token_idx,
+                                    batch_idx,
+                                    rtx,
+                                    rank,
+                                    is_first,
+                                    is_last,
+                                    loop_iter * Int32(16)
+                                    + Int32(
+                                        t_window * 4
+                                        + 2 * r_old
+                                        + d_half
+                                    ),
+                                    pipe_dq_evict,
+                                    evict_wait,
+                                    evict_rel,
                                 )
-                                * 2
-                                + 1
-                            ),
-                            pipe_dkv_done,
-                            dkv_wait,
-                            dkv_rel,
-                        )
+                            )
 
         elif warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
@@ -14160,9 +14360,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Producer,
                     self.MMA_DONE_STAGES,
                 )
-                dq_done_prod = pipeline.make_pipeline_state(
+                # v5.2: the dQ eviction producer (2 rotating slots).
+                dq_evict_prod = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
-                    1,
+                    2,
                 )
                 dqb_free_prod = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
@@ -14177,7 +14378,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_dqb_free.producer_acquire(dqb_free_prod)
                     pipe_dqb_free.producer_commit(dqb_free_prod)
                     dqb_free_prod.advance()
-                pipe_dq_done.producer_acquire(dq_done_prod)
 
                 dq_kd_frags = (
                     dq_kd_fragment_a,
@@ -14199,10 +14399,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # handshake set per block, drains 32 -> 16/bundle.
                 # grads(pair0) waits BOTH pds stages (math(0)+math(1))
                 # up front; math(2)/math(3) publish over grads(pair0)
-                # execution and gate grads(pair1).  G5 stays at the
-                # bundle tail; the single-FIFO round ring keeps the
-                # kdq generations behind the 16 grad gens (see
-                # ROUND_GENS_PER_TILE).  v5.1b: K is RESIDENT -- the
+                # execution and gate grads(pair1).  v5.2: the bundle
+                # tail is the 16-block dQ EVICTION plane (rotating
+                # 2x16-column slots, offloaded by the reducers); the
+                # single-FIFO round ring keeps the kdq generations
+                # behind the 16 grad gens (see ROUND_GENS_PER_TILE).
+                # v5.1b: K is RESIDENT -- the
                 # bundle-head kres wait admits the gather's single
                 # 8-piece fill, and the release after score(3) is the
                 # tcgen05-tracked completion edge that gates the
@@ -14256,8 +14458,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 self._issue_grads_pair_v51(
                                     0,
                                     dkv_tiled_mma,
-                                    t_dkv[0],
-                                    t_dkv[1],
+                                    tmem_dkv_base,
+                                    dkv_c_layout,
                                     p_fragment,
                                     ds_fragment,
                                     grad_frags[0],
@@ -14289,8 +14491,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         self._issue_grads_pair_v51(
                             1,
                             dkv_tiled_mma,
-                            t_dkv[0],
-                            t_dkv[1],
+                            tmem_dkv_base,
+                            dkv_c_layout,
                             p_fragment,
                             ds_fragment,
                             grad_frags[0],
@@ -14305,82 +14507,87 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         )
                     )
 
-                    # G5 D-round 0 at the bundle tail (spec Z3; the G5
-                    # issue path is byte-identical v32, only its
-                    # position moved): gated per wave on the mb_dqb[w]
-                    # cluster gates armed by the relays during THIS
-                    # bundle's publish (one phase flip per bundle).
-                    # Ring FIFO: the kdq r0 gens are g16/g17 here.
-                    for wave in cutlass.range_constexpr(
-                        self.DQ_KV_WAVES
-                    ):
-                        # edge: W17 kdq r0 handshake commit (gen 32+w).
+                    # v5.2 G5 EVICTION plane (change order item 2):
+                    # SIXTEEN (t, r) blocks -- 4 D128-rounds x 4 h32
+                    # windows -- each a fresh rotating accumulator,
+                    # offloaded by the reduce warps through
+                    # pipe_dq_evict.  Issue order (r_old, t, d_half):
+                    # the round ring holds ONE kdq gen pair at a time,
+                    # which forces the r_old grouping (DQ_EPI payload
+                    # keeps the ordered b*16 + t*4 + r encoding; the
+                    # in-bundle sequence is non-monotonic across the
+                    # two r_old groups, see V5_BUILD_LOG).  Rotating
+                    # slot index == d_half (block ordinal parity --
+                    # r_old*8 + t*2 + d_half mod 2 == d_half, static).
+                    # Both dq_b wave gates are HOISTED: every block's
+                    # K chain reads both kv waves.
+                    # edge: relay arms -- own image stored (math) AND
+                    # peer push landed (errata #2 pair).
+                    _mbarrier_wait_acquire_cluster(
+                        dqb_mbars,
+                        dqb_parity,
+                    )
+                    _mbarrier_wait_acquire_cluster(
+                        dqb_mbars + 1,
+                        dqb_parity,
+                    )
+                    for r_old in cutlass.range_constexpr(2):
+                        # kdq gen pair (r_old) held for the whole
+                        # 8-block group (clone+advance double wait),
+                        # released together after it.
+                        # edge: W17 kdq handshake commits (gens
+                        # 16+2*r_old / 17+2*r_old).
                         pipe_round.consumer_wait(round_cons)
-                        # edge: relay arms -- own image stored (math)
-                        # AND peer push landed (errata #2 pair).
-                        _mbarrier_wait_acquire_cluster(
-                            dqb_mbars + wave,
-                            dqb_parity,
-                        )
-                        if cutlass.const_expr(wave == 0):
-                            dq_acc_w = loop_iter != Int32(0)
-                        else:
-                            dq_acc_w = cutlass.Boolean(True)
-                        self._issue_dq_wave_v32(
-                            dq_tiled_mma,
-                            t_dq[0],
-                            dq_kd_frags[wave],
-                            dq_ds_fragment,
-                            wave,
-                            dq_acc_w,
-                        )
+                        round_cons_w1 = round_cons.clone()
+                        round_cons_w1.advance()
+                        pipe_round.consumer_wait(round_cons_w1)
+                        for t_window in cutlass.range_constexpr(4):
+                            for d_half in cutlass.range_constexpr(2):
+                                # edge: the reducer offloaded the
+                                # block two generations back (2
+                                # rotating dQ slots).
+                                pipe_dq_evict.producer_acquire(
+                                    dq_evict_prod
+                                )
+                                self._issue_dq_block_v52(
+                                    t_window,
+                                    d_half,
+                                    dq_evict_tiled_mma,
+                                    t_dq_rot[d_half],
+                                    dq_kd_frags[0],
+                                    dq_kd_frags[1],
+                                    dq_ds_fragment,
+                                )
+                                # edge -> the reducer's DQ_EPI wait
+                                # for this block (tcgen05-tracked).
+                                pipe_dq_evict.producer_commit(
+                                    dq_evict_prod
+                                )
+                                dq_evict_prod.advance()
                         pipe_round.consumer_release(round_cons)
                         round_cons.advance()
-
-                    # G5 D-round 1 (the LAST dq_b consumers; kdq gens
-                    # g18/g19), then the free group-commit -- it tracks
-                    # every issued MMA, so it covers both D-rounds and
-                    # both waves (errata #1).
-                    for wave in cutlass.range_constexpr(
-                        self.DQ_KV_WAVES
-                    ):
-                        # edge: W17 kdq r1 handshake commit (gen 34+w).
-                        pipe_round.consumer_wait(round_cons)
-                        if cutlass.const_expr(wave == 0):
-                            dq_acc_w1 = loop_iter != Int32(0)
-                        else:
-                            dq_acc_w1 = cutlass.Boolean(True)
-                        self._issue_dq_wave_v32(
-                            dq_tiled_mma,
-                            t_dq[1],
-                            dq_kd_frags[wave],
-                            dq_ds_fragment,
-                            wave,
-                            dq_acc_w1,
-                        )
                         pipe_round.consumer_release(round_cons)
                         round_cons.advance()
-                    # edge -> math(b+1)'s bundle-head dqb-free wait.
+                    # edge -> math(b+1)'s bundle-head dqb-free wait
+                    # (the group commit tracks every issued MMA, so it
+                    # covers all sixteen blocks -- errata #1 shape).
                     pipe_dqb_free.producer_acquire(dqb_free_prod)
                     pipe_dqb_free.producer_commit(dqb_free_prod)
                     dqb_free_prod.advance()
 
-                # v3.2 tail: the per-bundle schedule is fully caught up
-                # (no rotated grads block to drain); commit dq_done --
-                # the group commit tracks every issued G5 wave, so the
-                # math epilogue starts exactly on the last dQ MMA's
-                # completion edge -- then drain the producer credits.
+                # v5.2 tail: the dQ TMA epilogue retired with the
+                # eviction (the last bundle's RMW wrote the terminal
+                # mdQ values), so dq_done is gone -- the tail is now a
+                # pure producer-credit drain.
                 if tile_count > Int32(0):
                     tail_token = _iket.range_start(
                         "TAIL",
                         tile_count - Int32(1),
                     )
-                    pipe_dq_done.producer_commit(dq_done_prod)
-                    dq_done_prod.advance()
                     pipe_s_done.producer_tail(s_prod)
                     pipe_dp_done.producer_tail(dp_prod)
                     pipe_dkv_done.producer_tail(dkv_prod)
-                    pipe_dq_done.producer_tail(dq_done_prod)
+                    pipe_dq_evict.producer_tail(dq_evict_prod)
                     pipe_dqb_free.producer_tail(dqb_free_prod)
                     _iket.range_end(
                         tail_token,
@@ -14452,8 +14659,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         # edge: leader's strip release -- tcgen05-
                         # tracked score(t-2) B-read completion (init
                         # credits cover t = 0, 1 of bundle 0).
+                        # v5.2 MAT_ACQ probe (gen ordinals: strips
+                        # 0-3, wide 4-19, kdq 20-23).
+                        mat_acq_token = _iket.range_start(
+                            "MAT_ACQ(m,g)",
+                            loop_iter * Int32(32)
+                            + Int32(strip_t),
+                        )
                         pipe_strip.producer_acquire(strip_acq)
                         strip_acq.advance()
+                        _iket.range_end(
+                            mat_acq_token,
+                            loop_iter * Int32(32)
+                            + Int32(strip_t),
+                        )
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(
                                 stationary_tma_mbars,
@@ -14539,8 +14758,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         # edge: leader released gen (flat_gen - 2)
                         # inside grads(pair (flat_gen-2)//8) -- 2-stage
                         # ring.
+                        mat_acq_token = _iket.range_start(
+                            "MAT_ACQ(m,g)",
+                            loop_iter * Int32(32)
+                            + Int32(4 + flat_gen),
+                        )
                         pipe_round.producer_acquire(round_acq)
                         round_acq.advance()
+                        _iket.range_end(
+                            mat_acq_token,
+                            loop_iter * Int32(32)
+                            + Int32(4 + flat_gen),
+                        )
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(
                                 round_tma_mbars + tensor_kind,
@@ -14613,10 +14842,26 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "ROUTE_K(i)",
                         Int32(2) * loop_iter,
                     )
+                    mat_acq_token = _iket.range_start(
+                        "MAT_ACQ(m,g)",
+                        loop_iter * Int32(32) + Int32(20),
+                    )
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
+                    _iket.range_end(
+                        mat_acq_token,
+                        loop_iter * Int32(32) + Int32(20),
+                    )
+                    mat_acq_token = _iket.range_start(
+                        "MAT_ACQ(m,g)",
+                        loop_iter * Int32(32) + Int32(21),
+                    )
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
+                    _iket.range_end(
+                        mat_acq_token,
+                        loop_iter * Int32(32) + Int32(21),
+                    )
                     # v8: the gather warps write the K_dQ images (128
                     # threads vs 32).  Handshake A publishes "both stage
                     # credits held"; handshake B returns "both images
@@ -14645,10 +14890,26 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "ROUTE_K(i)",
                         Int32(2) * loop_iter + Int32(1),
                     )
+                    mat_acq_token = _iket.range_start(
+                        "MAT_ACQ(m,g)",
+                        loop_iter * Int32(32) + Int32(22),
+                    )
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
+                    _iket.range_end(
+                        mat_acq_token,
+                        loop_iter * Int32(32) + Int32(22),
+                    )
+                    mat_acq_token = _iket.range_start(
+                        "MAT_ACQ(m,g)",
+                        loop_iter * Int32(32) + Int32(23),
+                    )
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
+                    _iket.range_end(
+                        mat_acq_token,
+                        loop_iter * Int32(32) + Int32(23),
+                    )
                     self.kdq_barrier.arrive_and_wait()
                     self.kdq_barrier.arrive_and_wait()
                     cute.arch.fence_view_async_shared()
@@ -14947,8 +15208,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         self,
         pair: cutlass.Constexpr[int],
         dkv_tiled_mma: cute.TiledMma,
-        t_dkv_0: cute.Tensor,
-        t_dkv_1: cute.Tensor,
+        tmem_dkv_base,
+        dkv_c_layout,
         p_fragment: cute.Tensor,
         ds_fragment: cute.Tensor,
         gen_fragment_a: cute.Tensor,
@@ -14975,14 +15236,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                        fire when the pair's G3/G4
                                        descriptor reads complete).
         Per D-round r, dV then dK; each block:
-          dkv acquire  <- edge: reducer drained the SAME tensor's
-                          previous block (2-stage dkv_done ring
-                          alternating dV/dK; 16 gens/bundle now);
+          dkv acquire  <- edge: reducer FUSED drain of the block six
+                          generations back (v5.2 slot army: 6-deep
+                          dkv_done ring, slot == stage == generation
+                          % 6 -- the accumulator TMEM address is
+                          rebuilt per block from the pipeline state's
+                          RUNTIME index, tmem_dkv_base + index*64);
           round wait   <- edge: W17 full-wide gen (pair*4 + r)*2 + p
                           landed (FIFO index);
           round release-> edge: W17's producer_acquire two gens ahead
                           (UMMA-tracked);
-          dkv commit   -> edge: reducer WAIT_dK for this block.
+          dkv commit   -> edge: reducer WAIT_dK for this block (the
+                          reducer consumes generations in (dV, dK)
+                          pairs -- fused drain).
         dVdK_ISSUE payload = b*16 + pair*8 + r*2 + p (v5.1 item 4).
         RETURNS the advanced (pds, dkv, round) states (lesson #14).
         """
@@ -14999,6 +15265,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ) + Int32(
                 (pair * self.DKV_D_ROUNDS + d_round) * 2
             )
+            # Runtime slot tensor (slot == the stage this acquire
+            # claims; .index read pre-advance).
+            t_slot_dv = cute.make_tensor(
+                tmem_dkv_base
+                + dkv_producer_state.index
+                * Int32(self.TMEM_DKV_SLOT_COLS),
+                dkv_c_layout,
+            )
             dkv_done_pipeline.producer_acquire(
                 dkv_producer_state
             )
@@ -15010,7 +15284,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self._issue_dkv_block_pair_v51(
                 pair,
                 dkv_tiled_mma,
-                t_dkv_0,
+                t_slot_dv,
                 p_fragment,
                 gen_fragment_a,
             )
@@ -15022,6 +15296,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             round_consumer_state.advance()
             dkv_done_pipeline.producer_commit(dkv_producer_state)
             dkv_producer_state.advance()
+            t_slot_dk = cute.make_tensor(
+                tmem_dkv_base
+                + dkv_producer_state.index
+                * Int32(self.TMEM_DKV_SLOT_COLS),
+                dkv_c_layout,
+            )
             dkv_done_pipeline.producer_acquire(
                 dkv_producer_state
             )
@@ -15033,7 +15313,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self._issue_dkv_block_pair_v51(
                 pair,
                 dkv_tiled_mma,
-                t_dkv_1,
+                t_slot_dk,
                 ds_fragment,
                 gen_fragment_b,
             )
@@ -15060,35 +15340,48 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
 
     @cute.jit
-    def _issue_dq_wave_v32(
+    def _issue_dq_block_v52(
         self,
+        t_window: cutlass.Constexpr[int],
+        d_half: cutlass.Constexpr[int],
         dq_tiled_mma: cute.TiledMma,
-        t_dq_round: cute.Tensor,
-        kd_fragment: cute.Tensor,
+        t_dq_slot: cute.Tensor,
+        kd_fragment_w0: cute.Tensor,
+        kd_fragment_w1: cute.Tensor,
         ds_b_fragment: cute.Tensor,
-        wave: cutlass.Constexpr[int],
-        dq_accumulate: cutlass.Boolean,
     ):
-        """v3.2 G5: one (D-round, kv-wave) dQ^T pass.
+        """v5.2 G5: one (t, r) dQ eviction block, K chained over kv128.
 
-        A = the kdq stream gen [own-D128 M-half x kv64] (MN-major),
-        B = dq_b sub_img[wave] (fragment stage == kv-wave, the 8,192 B
-        descriptor window hop).  accumulate chains the persistent dQ^T
-        accumulator across waves and bundles; the caller passes False
-        exactly once per D-round accumulator (wave 0 of the FIRST
-        bundle) to initialize it.
+        (M,N,K) = (D128, h32, kv64) x two kv waves.  A = the kdq gen
+        d-half window (stage == d_half; wave w's gen lives in round
+        buf w).  B = the hand-derived dq_b window view (flat stage
+        index t + 4*w).  The rotating TMEM slot starts FRESH
+        (ACCUMULATE=False on the first atom): partial sums accumulate
+        in the f32 dQ workspace via the reducer's RMW offload, never
+        across bundles in TMEM.  Output column n of this block is
+        physical head (n//16)*64 + t*16 + (n%16), D row
+        r*128 + rank*64 + m (the offloader's decode contract).
         """
 
         mma = dq_tiled_mma.with_()
-        mma.set(tcgen05.Field.ACCUMULATE, dq_accumulate)
-        k_blocks = cute.size(kd_fragment, mode=[2])
+        mma.set(tcgen05.Field.ACCUMULATE, False)
+        k_blocks = cute.size(kd_fragment_w0, mode=[2])
         for k_block in cutlass.range_constexpr(k_blocks):
             cute.gemm(
                 mma,
-                t_dq_round,
-                kd_fragment[None, None, k_block, 0],
-                ds_b_fragment[None, None, k_block, wave],
-                t_dq_round,
+                t_dq_slot,
+                kd_fragment_w0[None, None, k_block, d_half],
+                ds_b_fragment[None, None, k_block, t_window],
+                t_dq_slot,
+            )
+            mma.set(tcgen05.Field.ACCUMULATE, True)
+        for k_block in cutlass.range_constexpr(k_blocks):
+            cute.gemm(
+                mma,
+                t_dq_slot,
+                kd_fragment_w1[None, None, k_block, d_half],
+                ds_b_fragment[None, None, k_block, t_window + 4],
+                t_dq_slot,
             )
             mma.set(tcgen05.Field.ACCUMULATE, True)
 
@@ -15100,9 +15393,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # 32-column group of the output).
 
     @cute.jit
-    def _drain_dkv_block_v32(
+    def _drain_dkv_fused_v52(
         self,
-        t_dkv_slot: cute.Tensor,
+        tmem_dkv_base,
+        dkv_c_layout,
         mdKV_acc: cute.Tensor,
         mTopkIdxs: cute.Tensor,
         tile_index: Int32,
@@ -15117,29 +15411,39 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         wait_state: pipeline.PipelineState,
         release_state: pipeline.PipelineState,
     ):
-        """v3.2: drain ONE [own-kv64 x D128] dV or dK block.
+        """v5.2: FUSED drain of one (dV, dK) pair -- ONE red.global
+        stream (the T3-HO4 P0 gate measurement).
 
-        Reducer mechanics inherit the v8 drain (Ld16x256b Rep-4 T2R
-        split across two warp groups, red.global f32 atomics).  V == K,
-        so dV and dK blocks of the same D-round land in the SAME GMEM
-        quadrant and the atomics merge them into the shared dKV
-        accumulator.  The transposed fragment puts kv on the datapath
-        axis and D on the column axis, where a thread owns column
-        PAIRS, so the atomic vector narrows to f32x2 (this is inside
-        the design doc's +8-trip drain tax).  The kv row and its topk
-        index are decoded PER PAIR from the identity coordinates (the
-        Rep-4 fragment spans multiple fold rows per thread -- v8
-        precedent: four dp rows; a one-entry cache elides redundant
-        index reloads).
-        V32-TODO(audit): the {n, n+1} pair adjacency (v1 = v0 column
-        neighbor, v0 column even) is still assumed from the v8 value
-        order; if the trace harness shows otherwise, degrade the f32x2
-        atomic to two scalars.
+        Physical basis: V == K, so dV and dK of the same (pair, r)
+        target the SAME dKV accumulator rows; summing the pair in
+        registers before the atomics halves the red.global traffic
+        (expected ~1.2-1.4 us/pair vs the old 2 x ~2 us).  Both
+        generations of the pair are waited up front (dV then dK,
+        consecutive stages of the 6-deep ring; slot tensors are
+        rebuilt from the RUNTIME state index, pre-advance), T2R'd
+        back-to-back under one fence, released together, then the
+        summed fragment runs the v32 decode verbatim (per-pair kv row
+        + f32x2 atomics).  WAIT_dK/REDUCE_T2R/REDUCE_ATOMIC payloads
+        = the fused-pair issue_seq (b*8 + pair*4 + r).
         """
 
         wait_dk_token = _iket.range_start(
             "WAIT_dK(i,r)",
             issue_seq,
+        )
+        # dV generation (slot index read pre-advance).
+        t_slot_dv = cute.make_tensor(
+            tmem_dkv_base
+            + wait_state.index * Int32(self.TMEM_DKV_SLOT_COLS),
+            dkv_c_layout,
+        )
+        done_pipeline.consumer_wait(wait_state)
+        wait_state.advance()
+        # dK generation (the pair's second consecutive stage).
+        t_slot_dk = cute.make_tensor(
+            tmem_dkv_base
+            + wait_state.index * Int32(self.TMEM_DKV_SLOT_COLS),
+            dkv_c_layout,
         )
         done_pipeline.consumer_wait(wait_state)
         wait_state.advance()
@@ -15154,27 +15458,33 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
         wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
-        t_dkv_core = t_dkv_slot[(None, None), 0, 0]
+        t_core_dv = t_slot_dv[(None, None), 0, 0]
+        t_core_dk = t_slot_dk[(None, None), 0, 0]
         # The M64-interleaved UMMA_2SM fragment core is
-        # (m64,(n64,h2)) with TMEM-ENCODED strides (hardware echo:
-        # (65536,(1,4194304)) -- lane stride 2^16): lane = m + 64*h,
-        # column = n.  make_tmem_copy needs the physical (DP, col)
-        # congruence, so regroup to ((m64,h2),n64) -- a pure mode
-        # permutation; the encoded strides ride along verbatim.
-        assert t_dkv_core.shape == (
+        # (m64,(n64,h2)) with TMEM-ENCODED strides (lane stride 2^16):
+        # lane = m + 64*h, column = n.  make_tmem_copy needs the
+        # physical (DP, col) congruence, so regroup to ((m64,h2),n64)
+        # -- a pure mode permutation; the encoded strides ride along
+        # verbatim (v32 drain precedent).
+        assert t_core_dv.shape == (
             self.N_TILE,
             (self.N_TILE, 2),
-        ), str(t_dkv_core.layout)
-        core_stride = t_dkv_core.layout.stride
-        t_dkv_phys = cute.make_tensor(
-            t_dkv_core.iterator,
-            cute.make_layout(
-                ((self.N_TILE, 2), self.N_TILE),
-                stride=(
-                    (core_stride[0], core_stride[1][1]),
-                    core_stride[1][0],
-                ),
+        ), str(t_core_dv.layout)
+        core_stride = t_core_dv.layout.stride
+        phys_layout = cute.make_layout(
+            ((self.N_TILE, 2), self.N_TILE),
+            stride=(
+                (core_stride[0], core_stride[1][1]),
+                core_stride[1][0],
             ),
+        )
+        t_phys_dv = cute.make_tensor(
+            t_core_dv.iterator,
+            phys_layout,
+        )
+        t_phys_dk = cute.make_tensor(
+            t_core_dk.iterator,
+            phys_layout,
         )
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
@@ -15182,7 +15492,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         tiled_t2r = tcgen05.make_tmem_copy(
             tmem_load_atom,
-            t_dkv_phys,
+            t_phys_dv,
         )
         thread_t2r = tiled_t2r.get_slice(dp_idx)
         c_dkv = cute.make_identity_tensor(
@@ -15193,18 +15503,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             2,
             wg_idx,
         )
-        thread_source = self.split_wg(
-            thread_t2r.partition_S(t_dkv_phys),
+        thread_source_dv = self.split_wg(
+            thread_t2r.partition_S(t_phys_dv),
             2,
             wg_idx,
         )
-        thread_values = cute.make_rmem_tensor(
+        thread_source_dk = self.split_wg(
+            thread_t2r.partition_S(t_phys_dk),
+            2,
+            wg_idx,
+        )
+        thread_values_dv = cute.make_rmem_tensor(
+            thread_coordinates.shape,
+            self.acc_dtype,
+        )
+        thread_values_dk = cute.make_rmem_tensor(
             thread_coordinates.shape,
             self.acc_dtype,
         )
 
-        cute.copy(tiled_t2r, thread_source, thread_values)
+        cute.copy(tiled_t2r, thread_source_dv, thread_values_dv)
+        cute.copy(tiled_t2r, thread_source_dk, thread_values_dk)
         cute.arch.fence_view_async_tmem_load()
+        # Both slots free together (two consecutive releases).
+        done_pipeline.consumer_release(release_state)
+        release_state.advance()
         done_pipeline.consumer_release(release_state)
         release_state.advance()
         _iket.range_end(
@@ -15212,7 +15535,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             issue_seq,
         )
 
-        assert cute.size(thread_values) == self.N_TILE // 2
+        assert cute.size(thread_values_dv) == self.N_TILE // 2
+        # Register fusion: d(KV) = dV + dK (same destination rows).
+        for i in cutlass.range_constexpr(self.N_TILE // 2):
+            thread_values_dv[i] = (
+                thread_values_dv[i] + thread_values_dk[i]
+            )
+
         reduce_atomic_token = _iket.range_start(
             "REDUCE_ATOMIC(i,r)",
             issue_seq,
@@ -15232,8 +15561,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 (2,),
                 self.acc_dtype,
             )
-            rdkv_frg[0] = thread_values[v0]
-            rdkv_frg[1] = thread_values[v1]
+            rdkv_frg[0] = thread_values_dv[v0]
+            rdkv_frg[1] = thread_values_dv[v1]
             pair_kv = Int32(
                 cute.get(
                     thread_coordinates[v0],
@@ -15282,6 +15611,243 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
         _iket.range_end(
             reduce_atomic_token,
+            issue_seq,
+        )
+        return wait_state, release_state
+
+    @cute.jit
+    def _offload_dq_block_v52(
+        self,
+        t_window: cutlass.Constexpr[int],
+        r_index: cutlass.Constexpr[int],
+        t_dq_slot: cute.Tensor,
+        mdQ_acc: cute.Tensor,
+        mdQ: cute.Tensor,
+        token_idx: Int32,
+        batch_idx: Int32,
+        rtx: Int32,
+        rank: Int32,
+        is_first: cutlass.Boolean,
+        is_last: cutlass.Boolean,
+        issue_seq: Int32,
+        evict_pipeline,
+        wait_state: pipeline.PipelineState,
+        release_state: pipeline.PipelineState,
+    ):
+        """v5.2: offload ONE (t, r) dQ eviction block, plain RMW.
+
+        The cluster owns its token's dQ rows exclusively, so the
+        offload is ordinary LDG + FADD + STG on the f32 workspace
+        (deterministic same-cluster f32 order -- NO atomics):
+          first bundle: STG only (initializes the buffer; also makes
+            the kernel stateless across runs);
+          last bundle:  LDG + FADD + single bf16 cast into mdQ (the
+            terminal value -- f32 accumulation + ONE final rounding,
+            the same numeric class as the retired TMEM epilogue);
+          middle:       LDG + FADD + STG f32.
+        Decode contract (see _issue_dq_block_v52): value at fold
+        coordinate ((m, n_hi), n_low) is
+          d = r*128 + rank*64 + m,  head = n_hi*64 + t*16 + n_low.
+        DQ_EPI(r) is the offload span now (payload b*16 + t*4 + r --
+        semantic change logged in V5_BUILD_LOG).
+        """
+
+        dq_epi_token = _iket.range_start(
+            "DQ_EPI(r)",
+            issue_seq,
+        )
+        # edge: the leader's dq_evict commit (tcgen05-tracked block
+        # completion).
+        evict_pipeline.consumer_wait(wait_state)
+        wait_state.advance()
+        dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
+        wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
+        t_core = t_dq_slot[(None, None), 0, 0]
+        # (128,32) CG2 fold core: (m64,(n16,2)) TMEM-encoded; regroup
+        # to ((m64,2),n16) exactly like the dkv drain.
+        assert t_core.shape == (
+            self.N_TILE,
+            (self.SUB_TILE_BOX, 2),
+        ), str(t_core.layout)
+        core_stride = t_core.layout.stride
+        t_phys = cute.make_tensor(
+            t_core.iterator,
+            cute.make_layout(
+                ((self.N_TILE, 2), self.SUB_TILE_BOX),
+                stride=(
+                    (core_stride[0], core_stride[1][1]),
+                    core_stride[1][0],
+                ),
+            ),
+        )
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(2)),
+            self.acc_dtype,
+        )
+        tiled_t2r = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            t_phys,
+        )
+        thread_t2r = tiled_t2r.get_slice(dp_idx)
+        c_dq = cute.make_identity_tensor(
+            ((self.N_TILE, 2), self.SUB_TILE_BOX)
+        )
+        thread_coordinates = self.split_wg(
+            thread_t2r.partition_D(c_dq),
+            2,
+            wg_idx,
+        )
+        thread_source = self.split_wg(
+            thread_t2r.partition_S(t_phys),
+            2,
+            wg_idx,
+        )
+        thread_values = cute.make_rmem_tensor(
+            thread_coordinates.shape,
+            self.acc_dtype,
+        )
+        cute.copy(tiled_t2r, thread_source, thread_values)
+        cute.arch.fence_view_async_tmem_load()
+        # edge -> the leader's dq_evict acquire two blocks ahead.
+        evict_pipeline.consumer_release(release_state)
+        release_state.advance()
+
+        # 2,048 values / 256 threads = 8 per thread (echo on drift).
+        assert cute.size(thread_values) == 8, str(
+            thread_coordinates.shape
+        )
+        # Four RMW variants hoisted around the unrolled value loop
+        # (dynamic branches around static loops -- gather precedent).
+        if is_first:
+            if is_last:
+                for i in cutlass.range_constexpr(8):
+                    d_g = Int32(
+                        r_index * 128
+                    ) + rank * Int32(64) + Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[0, 0],
+                        )
+                    )
+                    head = Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[0, 1],
+                        )
+                    ) * Int32(64) + Int32(
+                        t_window * 16
+                    ) + Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[1],
+                        )
+                    )
+                    mdQ[
+                        d_g,
+                        head,
+                        (token_idx, batch_idx),
+                    ] = self.element_dtype(thread_values[i])
+            else:
+                for i in cutlass.range_constexpr(8):
+                    d_g = Int32(
+                        r_index * 128
+                    ) + rank * Int32(64) + Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[0, 0],
+                        )
+                    )
+                    head = Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[0, 1],
+                        )
+                    ) * Int32(64) + Int32(
+                        t_window * 16
+                    ) + Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[1],
+                        )
+                    )
+                    mdQ_acc[
+                        head,
+                        d_g,
+                        (token_idx, batch_idx),
+                    ] = thread_values[i]
+        else:
+            if is_last:
+                for i in cutlass.range_constexpr(8):
+                    d_g = Int32(
+                        r_index * 128
+                    ) + rank * Int32(64) + Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[0, 0],
+                        )
+                    )
+                    head = Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[0, 1],
+                        )
+                    ) * Int32(64) + Int32(
+                        t_window * 16
+                    ) + Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[1],
+                        )
+                    )
+                    mdQ[
+                        d_g,
+                        head,
+                        (token_idx, batch_idx),
+                    ] = self.element_dtype(
+                        mdQ_acc[
+                            head,
+                            d_g,
+                            (token_idx, batch_idx),
+                        ]
+                        + thread_values[i]
+                    )
+            else:
+                for i in cutlass.range_constexpr(8):
+                    d_g = Int32(
+                        r_index * 128
+                    ) + rank * Int32(64) + Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[0, 0],
+                        )
+                    )
+                    head = Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[0, 1],
+                        )
+                    ) * Int32(64) + Int32(
+                        t_window * 16
+                    ) + Int32(
+                        cute.get(
+                            thread_coordinates[i],
+                            mode=[1],
+                        )
+                    )
+                    mdQ_acc[
+                        head,
+                        d_g,
+                        (token_idx, batch_idx),
+                    ] = (
+                        mdQ_acc[
+                            head,
+                            d_g,
+                            (token_idx, batch_idx),
+                        ]
+                        + thread_values[i]
+                    )
+        _iket.range_end(
+            dq_epi_token,
             issue_seq,
         )
         return wait_state, release_state
@@ -15804,4 +16370,79 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # reads as pure 8-piece fill time (the kres gate wait sits OUTSIDE
 # the span).  All other payloads unchanged.  Static names net +0
 # (28/28 held; kscore had no span of its own).
+# ======================================================================
+# ======================================================================
+# V5.2 EVICTION + SLOT ARMY + FUSED DRAIN ADDENDUM (change order
+# 2026-08-04-b; supersedes the earlier addenda's TMEM map, G5/dQ, drain
+# and dq_done/TAIL paragraphs; score/math-loop/gather/W17-supply-form/
+# relay/kdq are UNTOUCHED from v5.1b except the MAT_ACQ probes).
+# ======================================================================
+#
+# TMEM map: dQ rot 2x16 [0,32) | S pp [32,64) | dP pp [64,96) |
+# dV/dK army 6x64 [96,480) | [480,512) free (32+64+384 = 480).
+#
+# G5 eviction plane: (M,N,K) = (D128, h32, kv64) CG2, 16 blocks/bundle
+# = 4 D-rounds x 4 h32 windows, K chained over both kv waves; issue
+# order (r_old, t, d_half) -- the round ring holds one kdq gen pair at
+# a time (double-hold, double-release); rotating slot == d_half
+# (static block-ordinal parity).  Block (t, r) column n is head
+# (n//16)*64 + t*16 + (n%16), row r*128 + rank*64 + m.  A = kdq gen
+# d-half windows (2-stage auto layout, stage stride 4096 == legacy
+# m-half stride, order-(2,1,3) algebra); B = hand dq_b window view
+# ((16,(8,2)),1,4,(4,2)) : ((1,(64,512)),0,1024,(16,4096)), flat stage
+# t + 4*w (32 B mid-atom starts, k_block precedent).
+#
+# dQ eviction: pipe_dq_evict (UmmaAsync, 2 stages, leader -> reduce).
+# The reduce warpgroups offload each block with plain LDG/FADD/STG on
+# the f32 workspace (carved from the EXTENDED LSE/OdO workspace --
+# V2 overrides _get_workspace_size_LSE_OdO: entry bytes 8 -> 8 + D*4;
+# the harness allocates via impl_cls, the public wrapper path is
+# unaffected).  First bundle stores directly (stateless across runs);
+# last bundle casts the terminal sum straight into mdQ (bf16, ONE
+# final rounding -- the retired TMA epilogue's numeric class).  The
+# dQ TMA epilogue, dq_done pipeline and the TAIL dq_done commit are
+# retired; _zero_dq_v2 keeps the tile_count == 0 contract.
+# Offloader role choice: tcgen05.ld exposes only the executing warp's
+# 32-DP slice, so [128 DP x 16 col] needs a full warpgroup -- W18/W19
+# (2 warps) are physically short; the reduce pair has post-fusion
+# slack and the T2R machinery in place.
+#
+# Fused drain: the reducer consumes dkv_done generations in (dV, dK)
+# pairs from the SIX-slot ring (slot == stage == runtime state index;
+# tmem_dkv_base + index*64), sums the pair in registers (V == K =>
+# same destination), and issues ONE red.global f32x2 stream -- 8
+# fused drains/bundle (the T3-HO4 P0 gate: expect ~1.2-1.4 us/pair vs
+# the old 2 x ~2 us).
+#
+# Wait-graph deltas (all other edges unchanged from v5.1b):
+#   grads block  <- dkv empty [fused drain of gen n-6]
+#   G5 block     <- dq_evict empty [offload of block n-2]
+#                <- round full [kdq gen pair r_old, double-hold]
+#                <- mb_dqb[0] AND mb_dqb[1] (hoisted: every block
+#                   reads both waves)
+#   fused drain  <- dkv full x2 [leader (P,r,dV) + (P,r,dK) commits]
+#   offload      <- dq_evict full [leader block commit]
+#   math dqb_free edge, kres/strip edges: unchanged.
+# Liveness: leader G5 stalls at block 2 on evict credits until the
+# reducer finishes its 8 fused drains and starts offloading -- a
+# forward chain (drains depend only on already-issued grads commits),
+# no cycle; bundle-0 init credits: dkv 6, evict 2, ring/kres/strip as
+# before.
+#
+# Trace-readout deltas: DQ_EPI(r) is now the OFFLOAD span (payload
+# b*16 + t*4 + r; includes the evict wait -- rhythm visibility);
+# WAIT_dK/REDUCE_T2R/REDUCE_ATOMIC = one set per FUSED pair (payload
+# b*8 + pair*4 + r); MAT_ACQ(m,g) reinstated on every W17 supply
+# acquire (payload b*32 + ordinal: strips 0-3, wide 4-19, kdq 20-23)
+# -- the S_ISSUE-slope cross-examination witness.  dVdK_ISSUE payload
+# UNCHANGED (b*16 + pair*8 + r*2 + p); DQ_EPI in-bundle sequence is
+# non-monotonic across the two r_old groups.  Names: 28 spans +
+# provenance = 29/29 (MAT_ACQ reinstated into the ledger).
+#
+# Verdict hooks (pre-registered): period ~35 -> ~20-22 us (e2e
+# ~14-15 ms); MERGE lanes halve and decouple from MMA issue; grads
+# windows collapse toward back-to-back bursts; a new DQ_EPI offload
+# cadence appears at the bundle tails.  R7/R8 (residency window /
+# strip descriptor layouts) remain the prime suspects for the r4
+# S_ISSUE slope -- MAT_ACQ is the cross-examination probe.
 # ======================================================================
