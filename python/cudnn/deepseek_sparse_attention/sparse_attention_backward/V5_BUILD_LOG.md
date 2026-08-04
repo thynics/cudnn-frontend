@@ -121,3 +121,4 @@
     L2 K 驻留部分双缓冲（8 片 D64 中前 2 片预填，+16KB SMEM 入预算，削 36µs 翻转空转的填充段）；
     L3 score 前置连发（S(0..3) bundle 头背靠背，解 S 稀释斜坡 ~10µs/bundle 税后）。
   (5·基础设施注记)：haifa 短暂死亡期间建成 computelab 直连三通道（computelab-runner 前端 drop-box / b200-runner 持卡容器 drop-box / ~/proxy Codex 委托协议）；harness 聚合器对 v5.2 拒收（缺退役的 dQ_ISSUE(i,r) 契约 span）——原始解码 JSON 不受影响，本地账本管线为权威；若需 harness 表格，后续在 trace-prepare 里给 offload span 起 dQ_ISSUE 别名即可。
+[v5.2-r10-S案终审] S_ISSUE 斜坡全案告破（三轮悬案结案）：S_ISSUE 窗=31 条 gemm 入队（16 G1+15 G2 交错，SCORE_D_PIECES=8×k_blocks=2；dP_ISSUE=最后 1 条 G2）。逐条价：t0=0.038µs/条（空队裸价）→ t3=0.208µs/条 ≡ dVdK 单条恒定价 0.2µs。机制：bundle 末 36µs 停摆排空 UMMA 队列+TC 闲置 → t0 免费；bundle 内 MMA 积压令队列饱和 → 入队速率被钳到 TC 退队速率。斜坡=队列充满过程的影子，停摆重置 ⇒ "逐 t 恶化+每 bundle 归零+跨重构不变"三特征全解。鉴别器：dP_ISSUE 全程平坦（稀释假说要求同比拉长→死刑）；并发-斜坡零相关（t2 并发最低 5.4 warp 却次长）。含义：t3 非浪费（TC 满载真活）；真浪费=36µs 停摆期 TC 空转（bundle 级 TC 利用率 ~50%）；L3 score 前置从解药降级为无效药（重排不减 TC 总量）；L1/L2 聚焦度提升——砍停摆即摊平 TC 工作。旧"队列论证伪"之误：假设了 TC 跟得上入队。
