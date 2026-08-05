@@ -13592,13 +13592,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # per-pass re-gather retires with the chase ring: -75%
             # gather traffic) -- PLUS the kdq image fills offloaded
             # from the load warp (128 threads vs 32).  Per iteration
-            # the order is: [kres acquire; fill 8 pieces; commit] ->
-            # r1(b-1) rendezvous -> r0(b) rendezvous.  The global kdq
-            # named-barrier sequence r0(b), r1(b), r0(b+1), ... is
-            # UNCHANGED (frozen kdq machine; r1(b-1) merely moves from
-            # the old piece-2 boundary to after the fill, which only
-            # tightens the K prefetch -- the fill no longer waits the
-            # late r1 credits).
+            # the order is ([l2l] fill reorder): r1(b-1) rendezvous
+            # -> [kres acquire; fill the NEXT iteration's pieces;
+            # commit] -> r0(b) rendezvous, with iteration 0's fill
+            # peeled up front and the last iteration peeled
+            # fill-less.  The global kdq named-barrier sequence
+            # r0(b), r1(b), r0(b+1), ... is UNCHANGED (frozen kdq
+            # machine; only the fill block -- which has no
+            # rendezvous -- moved off the boundary).
             _iket.mark("ROLE_KV_LOAD", rank)
             gather_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
@@ -13615,54 +13616,82 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self._chase_slot_rows_v32(k_chase, 3),
             )
             if tile_count > Int32(0):
-                for loop_iter in cutlass.range(tile_count):
+                # [l2l] L2-lite fill reorder: iteration i carries the
+                # NEXT iteration's resident-K fill BETWEEN the
+                # r1(b-1) and r0(b) rendezvous.  The v7r1 boundary
+                # forensics (log [l2-recon-final] (2)) showed the old
+                # head-of-iteration fill was queued in the warp
+                # stream behind kdq r0(b), whose tail is ring-2
+                # pinned to the pair-7 MMA retirement AT the bundle
+                # boundary -- putting the whole 6.0-6.6us fill on the
+                # boundary critical chain even though its kres WAR
+                # gate (the leader's tcgen05-tracked release,
+                # score(1)(b) reads) opens MID-bundle, ~25us before
+                # the boundary.  Gate ordering after the reorder:
+                # r1(b-1) credits (G5 r0(b-1) retirement, boundary
+                # +~2us) < kres edge (mid-bundle) < r0(b) credits
+                # (pair-7 retirement, next boundary) -- the
+                # mid-iteration acquire/fill never stalls either
+                # neighbouring rendezvous.  The kres pipeline, its
+                # mbars and the leader wait/release sites are
+                # untouched (the producer acquire simply returns
+                # earlier); the kdq named-barrier global order is
+                # verbatim unchanged (the fill has no rendezvous).
+                # LOAD_K(i)'s payload still names the SERVED
+                # iteration (same 0..N-1 set); the span merely lands
+                # one bundle earlier in wall-clock.
+                #
+                # Prologue peel: iteration 0's K has no earlier host
+                # iteration -- fill it up front (the init credit
+                # admits the acquire immediately).  Verbatim copy of
+                # the steady-state fill block with bundle
+                # tile_count-1 / payload 0.
+                pipe_kres.producer_acquire(gather_state)
+                load_k_token = _iket.range_start(
+                    "LOAD_K(i)",
+                    Int32(0),
+                )
+                for piece in cutlass.range_constexpr(
+                    self.SCORE_D_PIECES
+                ):
+                    self._load_chase_piece_v32(
+                        mKV,
+                        mTopkIdxs,
+                        kres_rows[piece],
+                        token_idx,
+                        batch_idx,
+                        tile_count - Int32(1),
+                        Int32(piece),
+                        topk,
+                        rank,
+                        tidx,
+                        kv_copy_atom,
+                        kv_thread_copy,
+                    )
+                    cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.fence_view_async_shared()
+                pipe_kres.producer_commit(gather_state)
+                gather_state.advance()
+                _iket.range_end(
+                    load_k_token,
+                    Int32(0),
+                )
+                # Steady state: iterations [0, tile_count-1); the
+                # LAST iteration is peeled below (no next fill), so
+                # every producer acquire/commit/advance stays in a
+                # straight-line body (static discipline: no runtime
+                # `if` wraps a pipeline-state advance).
+                for loop_iter in cutlass.range(
+                    tile_count - Int32(1)
+                ):
                     bundle_idx = tile_count - Int32(1) - loop_iter
-                    # edge: the leader's kres release -- tcgen05-
-                    # tracked LAST-score-pass(b-1) READ completion
-                    # (the "K(i+1) gather gate = last score pass
-                    # completion edge" contract; score(1) in v6);
-                    # bundle 0 eats the init credit.
-                    # The wait sits OUTSIDE the LOAD_K span so the
-                    # span reads as pure fill time.
-                    pipe_kres.producer_acquire(gather_state)
-                    load_k_token = _iket.range_start(
-                        "LOAD_K(i)",
-                        loop_iter,
-                    )
-                    for piece in cutlass.range_constexpr(
-                        self.SCORE_D_PIECES
-                    ):
-                        self._load_chase_piece_v32(
-                            mKV,
-                            mTopkIdxs,
-                            kres_rows[piece],
-                            token_idx,
-                            batch_idx,
-                            bundle_idx,
-                            Int32(piece),
-                            topk,
-                            rank,
-                            tidx,
-                            kv_copy_atom,
-                            kv_thread_copy,
-                        )
-                        cute.arch.cp_async_commit_group()
-                    # One drain + fence covers all eight piece groups,
-                    # then the single residency commit (all 256 gather
-                    # threads arrive) -> the leader's bundle-head wait.
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.fence_view_async_shared()
-                    pipe_kres.producer_commit(gather_state)
-                    gather_state.advance()
-                    _iket.range_end(
-                        load_k_token,
-                        loop_iter,
-                    )
-                    # r1(b-1) rendezvous AFTER the fill/commit (K
-                    # prefetch never waits the late r1 credits) and
-                    # BEFORE r0(b) (global kdq order preserved).
-                    # edge (W17 side): G5 r0(b-1) consumption freed
-                    # the g18/g19 ring credits.
+                    # r1(b-1) rendezvous FIRST (its ring credits --
+                    # G5 r0(b-1) retirement -- arrive at the bundle
+                    # head, BEFORE the kres edge, so it never waits
+                    # the fill) and BEFORE r0(b) (global kdq order
+                    # preserved).  edge (W17 side): G5 r0(b-1)
+                    # consumption freed the g18/g19 ring credits.
                     if loop_iter > Int32(0):
                         self._gather_kdq_v8(
                             mKV,
@@ -13679,8 +13708,52 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             kv_copy_atom,
                             kv_thread_copy,
                         )
+                    # The NEXT iteration's resident-K fill (bundle
+                    # bundle_idx-1, payload loop_iter+1), mid-bundle.
+                    # edge: the leader's kres release -- tcgen05-
+                    # tracked LAST-score-pass(b) READ completion
+                    # (the "K(i+1) gather gate = last score pass
+                    # completion edge" contract; score(1) in v6).
+                    # The wait sits OUTSIDE the LOAD_K span so the
+                    # span reads as pure fill time.
+                    pipe_kres.producer_acquire(gather_state)
+                    load_k_token = _iket.range_start(
+                        "LOAD_K(i)",
+                        loop_iter + Int32(1),
+                    )
+                    for piece in cutlass.range_constexpr(
+                        self.SCORE_D_PIECES
+                    ):
+                        self._load_chase_piece_v32(
+                            mKV,
+                            mTopkIdxs,
+                            kres_rows[piece],
+                            token_idx,
+                            batch_idx,
+                            bundle_idx - Int32(1),
+                            Int32(piece),
+                            topk,
+                            rank,
+                            tidx,
+                            kv_copy_atom,
+                            kv_thread_copy,
+                        )
+                        cute.arch.cp_async_commit_group()
+                    # One drain + fence covers all piece groups, then
+                    # the single residency commit (all gather threads
+                    # arrive) -> the leader's NEXT bundle-head wait.
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.fence_view_async_shared()
+                    pipe_kres.producer_commit(gather_state)
+                    gather_state.advance()
+                    _iket.range_end(
+                        load_k_token,
+                        loop_iter + Int32(1),
+                    )
                     # Round-0 kdq of THIS bundle (g16/g17, feeds the
-                    # G5 r0 waves at the bundle tail).
+                    # G5 r0 waves at the bundle tail).  Its ring
+                    # credits (pair-7 retirement) strictly follow the
+                    # kres edge consumed above.
                     self._gather_kdq_v8(
                         mKV,
                         mTopkIdxs,
@@ -13696,6 +13769,42 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         kv_copy_atom,
                         kv_thread_copy,
                     )
+                # Peeled LAST iteration (bundle 0): the kdq
+                # rendezvous pair keeps its exact global position;
+                # no next fill.  The r1 guard tile_count > 1 is the
+                # peeled value of the loop's loop_iter > 0 guard at
+                # loop_iter == tile_count-1.
+                if tile_count > Int32(1):
+                    self._gather_kdq_v8(
+                        mKV,
+                        mTopkIdxs,
+                        gather_kd_rows_0,
+                        gather_kd_rows_1,
+                        token_idx,
+                        batch_idx,
+                        Int32(1),
+                        Int32(1),
+                        topk,
+                        rank,
+                        tidx,
+                        kv_copy_atom,
+                        kv_thread_copy,
+                    )
+                self._gather_kdq_v8(
+                    mKV,
+                    mTopkIdxs,
+                    gather_kd_rows_0,
+                    gather_kd_rows_1,
+                    token_idx,
+                    batch_idx,
+                    Int32(0),
+                    Int32(0),
+                    topk,
+                    rank,
+                    tidx,
+                    kv_copy_atom,
+                    kv_thread_copy,
+                )
                 # Epilogue: the last bundle's round-1 kdq (no next fill).
                 self._gather_kdq_v8(
                     mKV,
@@ -16609,4 +16718,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 #      overlap); S(1) length is the case-1 natural experiment -- if
 #      the co-residency decay dies with reduce silence, the 100 ns/
 #      enqueue in-kernel tax was reduce-lane-induced.
+# ======================================================================
+# L2-LITE FILL-REORDER ADDENDUM (log [l2-recon-final]/(3), 2026-08-05):
+# the gather iteration is re-sequenced to [r1(b-1); kres acquire +
+# LOAD_K(i+1) + commit; r0(b)] with iteration 0's fill peeled up front
+# and the last iteration peeled fill-less -- zero bytes, zero protocol
+# change (kres pipeline/mbars and the leader wait/release sites are
+# byte-identical; the kdq named-barrier global order r0(b), r1(b), ...
+# is verbatim unchanged).  LOAD_K(i) payload SEMANTICS are unchanged
+# (payload = the SERVED leader iteration, set 0..N-1, count N), but
+# the span's wall-clock placement moves ~one bundle earlier: fill i+1
+# now runs mid-bundle i (admitted by the leader's mid-bundle tcgen05
+# kres release) instead of sitting on the boundary chain behind kdq
+# r0(b)'s ring-2-pinned tail.  Trace hook: the boundary segment
+# pair7(b) -> S_ISSUE(4b+4) should shed the 6.0-6.6 us LOAD_K link
+# (v7r1 forensics: 12.7 -> ~7 us residual = G5 r0 retirement -> kdq
+# r1 fill -> W17 strip -> S_ISSUE).
 # ======================================================================
