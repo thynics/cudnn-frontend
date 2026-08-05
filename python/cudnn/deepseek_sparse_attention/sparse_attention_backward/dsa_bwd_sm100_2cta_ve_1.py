@@ -14122,20 +14122,26 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     lane1_round0_payload = (
                         lane1_iter * Int32(self.D_ROUNDS)
                     )
-                    mat_qdo_lane0_token_0 = _iket.range_start(
+                    mat_qdo_token = _iket.range_start(
                         "MAT_QDO(m,r)",
                         lane0_round0_payload,
                     )
-                    mat_qdo_lane1_token_0 = mat_qdo_lane0_token_0
-                    if has_second:
-                        # One physical materialization feeds both tiles.
-                        # Attribute the same interval to both tile payloads
-                        # so the native per-tile trace schema remains exact.
-                        mat_qdo_lane1_token_0 = _iket.range_start(
-                            "MAT_QDO(m,r)",
-                            lane1_round0_payload,
-                        )
                     for flat_gen in cutlass.range_constexpr(8):
+                        # IKET does not permit nested ranges with the same
+                        # event name.  Attribute the first/second half of
+                        # each shared four-generation round to lane0/lane1;
+                        # together they describe one physical pair fill
+                        # while preserving the native tile*round payloads.
+                        if cutlass.const_expr(flat_gen == 2):
+                            if has_second:
+                                _iket.range_end(
+                                    mat_qdo_token,
+                                    lane0_round0_payload,
+                                )
+                                mat_qdo_token = _iket.range_start(
+                                    "MAT_QDO(m,r)",
+                                    lane1_round0_payload,
+                                )
                         grad_round = flat_gen // 4
                         if cutlass.const_expr(flat_gen % 4 < 2):
                             tensor_kind = 0
@@ -14145,26 +14151,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         if cutlass.const_expr(flat_gen == 4):
                             if has_second:
                                 _iket.range_end(
-                                    mat_qdo_lane1_token_0,
+                                    mat_qdo_token,
                                     lane1_round0_payload,
                                 )
-                            _iket.range_end(
-                                mat_qdo_lane0_token_0,
-                                lane0_round0_payload,
-                            )
+                            else:
+                                _iket.range_end(
+                                    mat_qdo_token,
+                                    lane0_round0_payload,
+                                )
                             lane0_round1_payload = (
                                 lane0_round0_payload + Int32(1)
                             )
                             lane1_round1_payload = (
                                 lane1_round0_payload + Int32(1)
                             )
-                            mat_qdo_lane0_token_1 = _iket.range_start(
+                            mat_qdo_token = _iket.range_start(
                                 "MAT_QDO(m,r)",
                                 lane0_round1_payload,
                             )
-                            mat_qdo_lane1_token_1 = mat_qdo_lane0_token_1
+                        if cutlass.const_expr(flat_gen == 6):
                             if has_second:
-                                mat_qdo_lane1_token_1 = _iket.range_start(
+                                _iket.range_end(
+                                    mat_qdo_token,
+                                    lane0_round1_payload,
+                                )
+                                mat_qdo_token = _iket.range_start(
                                     "MAT_QDO(m,r)",
                                     lane1_round1_payload,
                                 )
@@ -14348,13 +14359,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     round_com.advance()
                     if has_second:
                         _iket.range_end(
-                            mat_qdo_lane1_token_1,
+                            mat_qdo_token,
                             lane1_round1_payload,
                         )
-                    _iket.range_end(
-                        mat_qdo_lane0_token_1,
-                        lane0_round1_payload,
-                    )
+                    else:
+                        _iket.range_end(
+                            mat_qdo_token,
+                            lane0_round1_payload,
+                        )
                 pipe_round.producer_tail(round_acq)
 
         elif warp_idx == Int32(self.RELAY_WARP):
