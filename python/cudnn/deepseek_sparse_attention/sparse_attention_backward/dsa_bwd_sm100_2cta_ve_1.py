@@ -13693,21 +13693,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     rtx,
                     rank,
                     lane0_iter,
+                    score_alias_free_mbar,
+                    lane1_iter < tile_count,
                     pipe_dkv_done,
                     dkv_wait,
                     dkv_rel,
                 )
                 if lane1_iter < tile_count:
-                    # Every pair UMMA precedes one common TMEM-store fence
-                    # and the lane-0 completion generations consumed above.
-                    # PDS1 is therefore dead as an MMA B source here; return
-                    # its alias before lane-1 T2R/atomics, which touch only
-                    # the disjoint dKV TMEM arena and GMEM workspace.
-                    if rtx == Int32(0):
-                        cute.arch.mbarrier_arrive(
-                            score_alias_free_mbar,
-                            rank,
-                        )
                     tile_index = (
                         tile_count - Int32(1) - lane1_iter
                     )
@@ -13723,6 +13715,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         rtx,
                         rank,
                         lane1_iter,
+                        score_alias_free_mbar,
+                        cutlass.Boolean(False),
                         pipe_dkv_done,
                         dkv_wait,
                         dkv_rel,
@@ -15010,6 +15004,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         rtx: Int32,
         rank: Int32,
         issue_seq: Int32,
+        score_alias_free_mbar: cute.Pointer,
+        signal_score_alias: cutlass.Boolean,
         done_pipeline,
         wait_state: pipeline.PipelineState,
         release_state: pipeline.PipelineState,
@@ -15040,6 +15036,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         done_pipeline.consumer_wait(wait_state)
         wait_state.advance()
+        # The producer issues every pair dKV MMA before one common TMEM
+        # store fence and the four completion commits.  This first
+        # completion-linked wait therefore proves every PDS1 B-source read
+        # has retired.  Return the alias immediately; T2R and atomics below
+        # touch only TMEM/registers/GMEM and need not hold score_kv hostage.
+        if signal_score_alias:
+            if rtx == Int32(0):
+                cute.arch.mbarrier_arrive(
+                    score_alias_free_mbar,
+                    rank,
+                )
         _iket.range_end(
             wait_dk_token,
             packed_issue,
