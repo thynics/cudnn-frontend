@@ -15847,37 +15847,55 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # (audit F5: a single hoisted row misroutes 3/4 of the mass).
         # A one-entry cache elides the redundant index reloads within
         # a row run.
-        cached_kv_row = Int32(-1)
-        kv_index = Int32(-1)
-        for i in cutlass.range_constexpr(self.N_TILE // 4):
-            v0 = 2 * i
-            v1 = v0 + 1
-            rdkv_frg = cute.make_rmem_tensor(
-                (2,),
-                self.acc_dtype,
-            )
-            rdkv_frg[0] = thread_values_dv[v0]
-            rdkv_frg[1] = thread_values_dv[v1]
-            pair_kv = Int32(
+        # [v11-E] Row-grouped drain, from the SASS forensics of the
+        # v7 drain unit (265 static instructions per unit: 44% address
+        # arithmetic, 29% control flow, 6% index loads, 6% atomics --
+        # the TMEM load is 1.5%, which is why hiding its latency was
+        # never the lever).
+        #
+        # A thread's 16 pairs touch only FOUR fold rows, but they
+        # alternate ABABABAB / CDCDCDCD, so the one-entry cache this
+        # replaces missed on EVERY pair: the machine code carried 16
+        # index loads and 16 full address chains per unit instead of 4.
+        # Preloading the four rows and iterating row-major collapses
+        # the index loads 16 -> 4, their address chains with them, and
+        # the per-pair bounds predicate into one per row.  Atomics stay
+        # one per pair, and a row's four pairs address four distinct
+        # destinations, so no same-location ordering changes.
+        pre_kv_index = cute.make_rmem_tensor((4,), Int32)
+        for slot in cutlass.range_constexpr(4):
+            rep_pair = (slot // 2) * 8 + (slot % 2)
+            rep_kv = Int32(
                 cute.get(
-                    thread_coordinates[v0],
+                    thread_coordinates[2 * rep_pair],
                     mode=[0, 0],
                 )
             )
-            if pair_kv != cached_kv_row:
-                cached_kv_row = pair_kv
-                pair_global_row = (
-                    tile_index * Int32(2 * self.N_TILE)
-                    + rank * Int32(2 * self.N_TILE_CTA)
-                    + pair_kv
-                )
-                kv_index = Int32(-1)
-                if pair_global_row < topk:
-                    kv_index = mTopkIdxs[
-                        pair_global_row,
-                        (token_idx, batch_idx),
-                    ]
+            rep_global_row = (
+                tile_index * Int32(2 * self.N_TILE)
+                + rank * Int32(2 * self.N_TILE_CTA)
+                + rep_kv
+            )
+            pre_kv_index[slot] = Int32(-1)
+            if rep_global_row < topk:
+                pre_kv_index[slot] = mTopkIdxs[
+                    rep_global_row,
+                    (token_idx, batch_idx),
+                ]
+
+        for slot in cutlass.range_constexpr(4):
+            kv_index = pre_kv_index[slot]
             if kv_index >= Int32(0):
+              for k in cutlass.range_constexpr(4):
+                i = (slot // 2) * 8 + 2 * k + (slot % 2)
+                v0 = 2 * i
+                v1 = v0 + 1
+                rdkv_frg = cute.make_rmem_tensor(
+                    (2,),
+                    self.acc_dtype,
+                )
+                rdkv_frg[0] = thread_values_dv[v0]
+                rdkv_frg[1] = thread_values_dv[v1]
                 # D within the block = 64 * h(fold half, mode [0,1])
                 # + n (mode [1]); the block's GMEM quadrant is d_round.
                 d_local = Int32(
