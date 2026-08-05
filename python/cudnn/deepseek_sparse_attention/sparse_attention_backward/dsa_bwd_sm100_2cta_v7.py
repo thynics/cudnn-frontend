@@ -15817,37 +15817,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.acc_dtype,
         )
 
-        # [v11-D] Row-index preload, issued BEFORE the TMEM fence.
-        # The Rep-4 fragment spans four fold rows per thread (v8
-        # precedent), so a unit touches exactly four kv rows; their
-        # topk indices depend only on coordinates and the tile, NOT on
-        # any TMEM value, yet the original code fetched them from the
-        # middle of the atomic stream behind a one-entry cache -- four
-        # serialized far-memory round trips sitting on the drain's
-        # critical path.  Hoisted here they overlap the TMEM data
-        # latency that the thread is about to wait on anyway.  Cost:
-        # four Int32 registers (the retired cache held two), which is
-        # why this fits where the C1 fragment pipelining did not.
-        pre_kv_index = cute.make_rmem_tensor((4,), Int32)
-        for row in cutlass.range_constexpr(4):
-            pre_pair_kv = Int32(
-                cute.get(
-                    thread_coordinates[row * 8],
-                    mode=[0, 0],
-                )
-            )
-            pre_global_row = (
-                tile_index * Int32(2 * self.N_TILE)
-                + rank * Int32(2 * self.N_TILE_CTA)
-                + pre_pair_kv
-            )
-            pre_kv_index[row] = Int32(-1)
-            if pre_global_row < topk:
-                pre_kv_index[row] = mTopkIdxs[
-                    pre_global_row,
-                    (token_idx, batch_idx),
-                ]
-
         cute.copy(tiled_t2r, thread_source_dv, thread_values_dv)
         cute.copy(tiled_t2r, thread_source_dk, thread_values_dk)
         cute.arch.fence_view_async_tmem_load()
@@ -15878,6 +15847,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # (audit F5: a single hoisted row misroutes 3/4 of the mass).
         # A one-entry cache elides the redundant index reloads within
         # a row run.
+        cached_kv_row = Int32(-1)
+        kv_index = Int32(-1)
         for i in cutlass.range_constexpr(self.N_TILE // 4):
             v0 = 2 * i
             v1 = v0 + 1
@@ -15887,8 +15858,25 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             rdkv_frg[0] = thread_values_dv[v0]
             rdkv_frg[1] = thread_values_dv[v1]
-            # [v11-D] preloaded above: pairs 4k..4k+3 share fold row k.
-            kv_index = pre_kv_index[i // 4]
+            pair_kv = Int32(
+                cute.get(
+                    thread_coordinates[v0],
+                    mode=[0, 0],
+                )
+            )
+            if pair_kv != cached_kv_row:
+                cached_kv_row = pair_kv
+                pair_global_row = (
+                    tile_index * Int32(2 * self.N_TILE)
+                    + rank * Int32(2 * self.N_TILE_CTA)
+                    + pair_kv
+                )
+                kv_index = Int32(-1)
+                if pair_global_row < topk:
+                    kv_index = mTopkIdxs[
+                        pair_global_row,
+                        (token_idx, batch_idx),
+                    ]
             if kv_index >= Int32(0):
                 # D within the block = 64 * h(fold half, mode [0,1])
                 # + n (mode [1]); the block's GMEM quadrant is d_round.
