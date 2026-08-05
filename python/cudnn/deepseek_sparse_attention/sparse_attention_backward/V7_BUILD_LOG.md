@@ -172,3 +172,6 @@
   改动：SCORE_MMA_TILER (128,64,128)→(128,64,256)、SCORE_D_PIECES 4→2、K_CHUNK 128→256、K_CHUNKS/SCORE_A/B_STAGES 4→2、kres_rows 元组 4→2。字节恒等式：D256 下 **score-B 一级 == strip 一级**（STATIONARY_TILE_D 恰为 256），s = d 平凡成立，比 v9-LB 的 s=4d+kb 更强；SMEM/TMEM/协议/其余角色零字节。早释放边界 SCORE_D_PIECES//2 = 1（piece0 用 stage0、piece1 用 stage1，1:1 对齐）。py_compile OK。
   判读：e2e 预期 −2~4%（19.09 → ~18.3-18.7ms）；若零收益则窗级税在 D128 已饱和（同样是有价值的边界数据，回滚零成本）。
 [v9.2-LB2-r1 判决·保留] correctness 4/4（D256 字节恒等硅裁决通过）；release **18.923ms** vs 19.09 = −0.88%（新最优；候选侧测量噪声实测 ~0.15%，信号为真）。**窗级税井已见底**：跃迁 8→4 给 −4.1%、4→2 仅给 −0.88%（下一档 2→1 预期 <0.3% 且毁 strip 双缓冲 ⇒ 封井）。e2e 台账：35.65 → 21.94(v7) → 21.04(v9-LB) → 19.09(L2-lite) → **18.92(LB2)**，累计 −46.9%；baseline 8.39（2.25×）。
+[v11-D-r1 判决·回滚] correctness dense FAIL（235,818/262,144 = 90% 元素错，max_abs 2.89）⇒ **"pairs 4k..4k+3 → fold row k"映射证伪**（v8 注释的"four dp rows"存在，但分组顺序非连续四联；Rep-4 的 lane/col 分派与我的假设不符）。响亮失败设计生效：一轮钉死、零静默、零性能数据浪费（correctness 门在 benchmark 前）。revert 8213a86，内核回 LB2 终态（18.92ms）。
+  残留价值：**索引取数是否真在关键路径仍未证**——原子段为 constexpr 全展开，ptxas 可能已自行提前这些取数；若已提前则前置无收益、只剩寄存器代价（C1 律）。要继续这条线需先拿 SASS 证据（原子段内 LDG 的实际调度位置），而非再猜映射。
+  正确的映射获取途径（留待需要时）：从 make_tmem_copy 的 layout_tv 直接打印 partition_D 的坐标序（host 侧 trace 期 print），或从 v8 时代日志里找已验证的 fold 分组表。
