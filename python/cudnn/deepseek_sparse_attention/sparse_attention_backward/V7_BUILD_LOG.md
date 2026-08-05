@@ -171,3 +171,4 @@
   发现纠偏（重要）：v9-LB 并未减少 cute.gemm 调用数——k_blocks = size(k_fragment, mode=[2]) 随 K_CHUNK 同步翻倍，调用数恒 64/bundle；**它真正减半的是描述符窗跃迁（8→4），却换来 −4.1% e2e ⇒ 窗跃迁即窗级税的物理载体**（案 1 那 1/4 的实体）。本轮同一口井再打一档：窗跃迁 4→2。
   改动：SCORE_MMA_TILER (128,64,128)→(128,64,256)、SCORE_D_PIECES 4→2、K_CHUNK 128→256、K_CHUNKS/SCORE_A/B_STAGES 4→2、kres_rows 元组 4→2。字节恒等式：D256 下 **score-B 一级 == strip 一级**（STATIONARY_TILE_D 恰为 256），s = d 平凡成立，比 v9-LB 的 s=4d+kb 更强；SMEM/TMEM/协议/其余角色零字节。早释放边界 SCORE_D_PIECES//2 = 1（piece0 用 stage0、piece1 用 stage1，1:1 对齐）。py_compile OK。
   判读：e2e 预期 −2~4%（19.09 → ~18.3-18.7ms）；若零收益则窗级税在 D128 已饱和（同样是有价值的边界数据，回滚零成本）。
+[v9.2-LB2-r1 判决·保留] correctness 4/4（D256 字节恒等硅裁决通过）；release **18.923ms** vs 19.09 = −0.88%（新最优；候选侧测量噪声实测 ~0.15%，信号为真）。**窗级税井已见底**：跃迁 8→4 给 −4.1%、4→2 仅给 −0.88%（下一档 2→1 预期 <0.3% 且毁 strip 双缓冲 ⇒ 封井）。e2e 台账：35.65 → 21.94(v7) → 21.04(v9-LB) → 19.09(L2-lite) → **18.92(LB2)**，累计 −46.9%；baseline 8.39（2.25×）。
