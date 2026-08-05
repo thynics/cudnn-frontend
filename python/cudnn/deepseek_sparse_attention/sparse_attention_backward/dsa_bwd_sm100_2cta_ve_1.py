@@ -11096,8 +11096,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     the stmatrix m8n8.x4.trans branch; a build-time assert makes the
     premise a trace failure instead of a silent regression.  Softmax
     stats indexing becomes group-hoisted and coordinate-derived; the
-    four zero-information S/dP ACQUIRE/PUBLISH spans are retired so the
-    IKET name count is exactly 31.
+    four zero-information S/dP ACQUIRE/PUBLISH spans are retired.  ve_1
+    additionally omits the one-shot LOAD_STATS and redundant MATH_BAR1
+    ranges so the IKET name count is exactly 28.
 
     Inherited v8 notes:
 
@@ -13036,10 +13037,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             _iket.mark("ROLE_MATH", rank)
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
             if warp_idx == Int32(self.MATH_WARP_BEGIN):
-                load_stats_token = _iket.range_start(
-                    "LOAD_STATS",
-                    Int32(0),
-                )
+                # Keep the source-native IKET vocabulary at its 28-event
+                # backend limit.  LOAD_STATS is a one-shot startup copy and
+                # is not needed to diagnose the steady pair schedule.
                 if tile_count > Int32(0):
                     cute.copy(
                         stats_copy_atom,
@@ -13054,10 +13054,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
-                _iket.range_end(
-                    load_stats_token,
-                    Int32(0),
-                )
             self.math_barrier.arrive_and_wait()
 
             s_state = pipeline.make_pipeline_state(
@@ -13585,19 +13581,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # v12 (P2i): the barrier rendezvous, both DSM sends, and
                 # the pds commit move to the relay warp (W18).  Each math
                 # thread hands off with one release-semantics mbarrier
-                # arrive after its own fenced stores; MATH_BAR1 now
-                # brackets that arrive (name kept for the trace contract).
-                math_bar1_token = _iket.range_start(
-                    "MATH_BAR1(i)",
-                    loop_iter,
-                )
+                # arrive after its own fenced stores.  MATH_PD already
+                # brackets this handoff, so a separate MATH_BAR1 range is
+                # redundant and would overflow IKET's 28-event limit.
                 cute.arch.mbarrier_arrive(
                     pds_ready_mbars + pds_stage,
                     rank,
-                )
-                _iket.range_end(
-                    math_bar1_token,
-                    loop_iter,
                 )
                 _iket.range_end(
                     math_pd_token,
@@ -14575,8 +14564,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         """
 
         # v9.3: the S/dP ACQUIRE and PUBLISH spans are retired (near-zero
-        # information since the 2-stage ping-pong) to bring the IKET name
-        # count to 31, the trace-encoding limit.
+        # information since the 2-stage ping-pong).  Together with ve_1's
+        # two startup/redundant omissions the trace stays at 28 names.
         done_pipeline.producer_acquire(producer_state)
         if cutlass.const_expr(is_dp):
             mma_issue_token = _iket.range_start(
