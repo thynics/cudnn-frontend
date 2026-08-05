@@ -12940,9 +12940,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self.gather_barrier.arrive_and_wait()
                 if warp_idx == Int32(0):
                     with cute.arch.elect_one():
+                        # Signal this CTA's local epilogue consumers.  The
+                        # rank operand maps the local pointer back to self;
+                        # rank 0 would strand CTA 1 on its private mbarrier.
                         cute.arch.mbarrier_arrive(
                             loan_epi_safe_mbar,
-                            Int32(0),
+                            rank,
                         )
 
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
