@@ -14035,9 +14035,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # commit for gen q-1 happens after gen q's TMA is in
                     # flight; barrier q%2 was last waited at iteration q-1,
                     # so it is never re-armed while pending.
-                    mat_qdo_token_1 = _iket.range_start(
+                    # Keep the source-native two-span contract expected by
+                    # the trace tables: payload r0 covers the dO-r1 pair and
+                    # payload r1 covers the Q-r1 pair.  This split is IKET
+                    # metadata only; it does not change the round pipeline.
+                    mat_qdo_token_0 = _iket.range_start(
                         "MAT_QDO(m,r)",
-                        loop_iter * Int32(self.D_ROUNDS) + Int32(1),
+                        loop_iter * Int32(self.D_ROUNDS),
                     )
                     for flat_gen in cutlass.range_constexpr(4):
                         if cutlass.const_expr(flat_gen < 2):
@@ -14047,6 +14051,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             grad_round = 1
                             tensor_kind = 1  # Q_r1
                         h_half = flat_gen % 2
+                        if cutlass.const_expr(flat_gen == 2):
+                            _iket.range_end(
+                                mat_qdo_token_0,
+                                loop_iter * Int32(self.D_ROUNDS),
+                            )
+                            mat_qdo_token_1 = _iket.range_start(
+                                "MAT_QDO(m,r)",
+                                loop_iter * Int32(self.D_ROUNDS)
+                                + Int32(1),
+                            )
                         pipe_round.producer_acquire(round_acq)
                         round_acq.advance()
                         with cute.arch.elect_one():
