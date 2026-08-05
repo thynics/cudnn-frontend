@@ -1,5 +1,35 @@
 # vre_3 手术规格（S2 环深 + dOᵀ 流式 + B-lite）— 2026-08-05
 
+## r2 修订（r1 correctness 尸检 + 架构修正）——本节为准
+
+**r1 判负根因（dense 70% 污染）**：r1 把 dOscore 放进主环并让 leader 以
+[S, dP, grads, dq] 序消费——但 FIFO 消费指针是单一序列，leader 迭代 k 的
+dP(k) 在 grads(k−1) 之前执行时，指针停在上一组的 qdo 处 ⇒ **dP 读到象限
+数据**。"消费滞后一拍自洽"论证是错的（r1 头注里的推理作废）；且任何把
+dP 排到迭代尾部的修法都会让 [dP→math→pub→grads] 串进约束环（period ~7，
+更差）。**单环 + dP 流式不可两全，dP 必须离开主环。**
+
+**r2 架构**：
+- **dos 专用管道**：dP 的 score-A 走独立的 2 槽 dos 缓冲（2×16KB，
+  `dos_buf` + `pipe_dos` 2-stage + 专用 TMA mbar），chunk 粒度 TMA
+  （新 host atom：`make_tiled_tma_atom_A(op, mdO, score_a_layout,
+  score_tiler, score_tiled_mma)`，16KB box）。dP fragment 用 2-stage
+  dos 布局，chunk c 静态取 stage c%2（槽复用，描述符=槽地址，天然正确）。
+  leader 程序序回到 v12 形态 [S, dP(dos), grads, dq尾, pads]——dP 保持
+  头部，math 边不入环。
+- **主环 12 gen**：[qdo×8 | kdq×2 融合 | pad×2]，12 mod 4 = 0；槽位映射
+  与 r1 相同（dO→a/b、Q→c/d、kdq→a/b、pad→c/d）。消费严格滞后一组
+  （iter 0 零消费，iter k 消费 group k−1，TAIL 收 group T−1），kdq 零移位。
+- **SMEM 精确闭合**：225.5 = v12 225.5 − dO panel 64 + 环 c/d 32 + dos 32。
+- W17 每迭代：[dos×4 chunk fill（头部，接受首 tile dP ~1µs 一次性延迟）→
+  qdo×8 → kdq 融合 → pad×2]。
+- 信用算术（r2 复核）：f0(组k) 等 kdq(组k−1) 的 dq 读（iter k ~+3.8）⇒
+  grads(k) 于 iter k+1 +1.4 全预填；kdq(组k) 等自组 f4 释放（+2.6）⇒
+  dq 尾部停顿 ~0.5（预算内）。预期 period 4.5-5.0 不变。
+
+以下 r1 原文中与本节冲突处（dOscore 入主环、16 gen、整板 TMA、消费滞后
+论证）一律以 r2 为准。
+
 基线：`dsa_bwd_sm100_2cta_v12.py`（9bc35b3）→ 新文件 `dsa_bwd_sm100_2cta_vre3.py`。
 判据来源：vre_1 分解（period 6.948；LOAD 纯工作 2.80/等待 4.00）+ S1 证伪的
 FIFO 信用算术（饱和 2 深单 FIFO 上消费序置换一阶不变；环长 = pds 边 + N×节拍 + 尾部填充）。

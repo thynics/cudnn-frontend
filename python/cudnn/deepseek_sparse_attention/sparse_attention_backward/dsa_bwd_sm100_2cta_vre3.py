@@ -1,20 +1,26 @@
-# vre_3 (S2 ring-depth + dO^T streaming + B-lite): fork of
-# dsa_bwd_sm100_2cta_v12.py per VRE3_SURGERY_SPEC.md (2026-08-05).
-#   * round FIFO depth 2 -> 4; 16 gens/tile in the ONLY viable order
-#     [dOscore c0..c3 | qdo f0..f7 | kdq r0/r1 (fused, untouched) | pad x2]
-#     (16 mod 4 = 0: every slot mapping is compile-time static).
-#   * stationary_do RETIRED (-64KB): dP's score-A streams through ring
-#     slots 0..3 (the 4-stage stationary layout laid over the contiguous
-#     round_buf_a..d span, stage == slot); dO quadrant fills lose their
-#     OWN_HALF_BULK source and go GMEM TMA on both halves.
+# vre_3 r2 (S2 ring-depth + dO^T streaming + B-lite): fork of
+# dsa_bwd_sm100_2cta_v12.py per VRE3_SURGERY_SPEC.md (2026-08-05, r2
+# section governs; r1's single-ring dOscore design was correctness-
+# falsified on silicon -- FIFO order forced dP to read quadrant data).
+#   * round FIFO depth 2 -> 4; 12 gens/tile
+#     [qdo f0..f7 | kdq r0/r1 (fused, untouched) | pad x2]
+#     (12 mod 4 = 0: every slot mapping is compile-time static; the
+#     leader consumes one full group per iteration with a one-group lag,
+#     so the kdq rendezvous pairing needs no shift).
+#   * stationary_do RETIRED (-64KB -> ring slots c/d 32KB + dos 32KB):
+#     dP's score-A streams through a DEDICATED 2-slot dos pipeline
+#     (chunk-granularity TMA atom, chunk c -> slot c % 2), keeping dP at
+#     the leader's iteration head with zero main-ring coupling; dO
+#     quadrant fills lose their OWN_HALF_BULK source and go GMEM TMA on
+#     both halves.
 #   * B-lite: the relay's pds commit moves BEFORE its DSM sends (commit
 #     semantics = both CTAs' math published; landings are separately
 #     gated by the landing mbars).
-#   * leader order: S -> dP(streamed) -> grads -> dQ -> pads; the pds
-#     release follows dQ (WAR for the dS_H image -- the S1 lesson).
+#   * leader order: S -> dP(dos) -> grads -> dQ -> pads; the pds release
+#     follows dQ (WAR for the dS_H image -- the S1 lesson).
 # Rationale: vre_1 measured the 6.95us period as [pds edge 2.3 + 8 x 0.45
 # ring cadence + tail]; depth 2 was the latency amplifier (57.5% of the
-# supply row was waits).  Expected period 5.3-5.6us (kdq un-fusion is the
+# supply row was waits).  Expected period 4.5-5.0us (kdq un-fusion is the
 # reserved vre_3b follow-up worth ~0.4us more).
 """Pipelined SM100 two-CTA DSA backward, under staged integration.
 
@@ -573,6 +579,23 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             stationary_tiler,
             stationary_tiled_mma,
         )
+        # vre_3 r2: chunk-granularity dO score-A atom (16 KiB box, the
+        # score-plane per-stage layout) feeding the dedicated 2-slot dos
+        # buffer; plus the 2-stage dos smem layout for the dP fragment
+        # and TMA partition (chunk c lives in slot c % 2).
+        dos_a_layout_staged = sm100_utils.make_smem_layout_a(
+            score_tiled_mma,
+            score_tiler,
+            self.element_dtype,
+            2,
+        )
+        tma_atom_dos, tma_tensor_dos = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op,
+            mdO,
+            score_a_layout,
+            score_tiler,
+            score_tiled_mma,
+        )
         score_a_stage_bytes = cute.size_in_bytes(
             self.element_dtype,
             score_a_layout,
@@ -818,6 +841,9 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             trace_batch_idx,
             stationary_tiled_mma,
             stationary_a_layout_staged,
+            tma_atom_dos,
+            tma_tensor_dos,
+            dos_a_layout_staged,
         ).launch(
             grid=(
                 2 * problem_shape[0],
@@ -9692,6 +9718,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV1A0(
         trace_batch_idx: Int32,
         stationary_tiled_mma: cute.TiledMma,
         stationary_a_layout_staged: cute.ComposedLayout,
+        tma_atom_dos: cute.CopyAtom,
+        tma_tensor_dos: cute.Tensor,
+        dos_a_layout_staged: cute.ComposedLayout,
     ):
         """Serialized two-tile v1 macro used only for correctness bring-up.
 
@@ -11302,16 +11331,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # for math's T2R of S(t)).
     SCORE_DONE_STAGES = 2
 
-    # vre_3: round-region generations per tile (fixed order, one
-    # producer/one consumer), 16 gens over a FOUR-deep ring -- slot =
-    # position mod 4, all compile-time static (16 mod 4 == 0 phase law):
-    # g0..g3   dOscore c0..c3 (slots 0..3)  -> dP(t+1), the FIFO head
-    # g4  dO_r0h0(a) g5 dO_r0h1(b) g6 Q_r0h0(c) g7 Q_r0h1(d)
-    # g8  dO_r1h0(a) g9 dO_r1h1(b) g10 Q_r1h0(c) g11 Q_r1h1(d)
-    # g12 kdq_r0(a)  g13 kdq_r1(b)          -> dQ, at the tile tail
-    # g14/g15 pad (c/d): empty gens keeping the phase law; W17 commits
+    # vre_3 r2: round-region generations per tile (one producer/one
+    # consumer), 12 gens over a FOUR-deep ring -- slot = position mod 4,
+    # all compile-time static (12 mod 4 == 0 phase law); dP's score-A
+    # stream lives on its own dedicated 2-stage dos pipeline, NOT here:
+    # g0 dO_r0h0(a) g1 dO_r0h1(b) g2 Q_r0h0(c) g3 Q_r0h1(d)
+    # g4 dO_r1h0(a) g5 dO_r1h1(b) g6 Q_r1h0(c)  g7 Q_r1h1(d)
+    # g8 kdq_r0(a)  g9 kdq_r1(b)              -> dQ, at the tile tail
+    # g10/g11 pad (c/d): empty gens keeping the phase law; W17 commits
     # them immediately, the leader waits+releases them after dQ.
-    ROUND_GENS_PER_TILE = 16
+    # Consumption lags production by exactly one group (leader iter 0
+    # consumes nothing here; iter k consumes group k-1; TAIL takes the
+    # last group), so the kdq rendezvous pairing needs NO shift.
+    ROUND_GENS_PER_TILE = 12
     ROUND_STAGES = 4
 
     # v8: back to one dkv_done generation PER SLOT (head- and tail-
@@ -11426,6 +11458,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             round_mbars: cute.struct.MemRange[cutlass.Int64, 8]
+            # vre_3 r2: dedicated dP score-A stream (2-stage) barriers.
+            dos_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+            dos_tma_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
@@ -11467,6 +11502,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ]
             round_buf_d: cute.struct.Align[
                 cute.struct.MemRange[element_dtype, 8192],
+                1024,
+            ]
+            # vre_3 r2: the dP score-A double buffer (2 x 16 KiB;
+            # chunk c lives in slot c % 2).
+            dos_buf: cute.struct.Align[
+                cute.struct.MemRange[element_dtype, 16384],
                 1024,
             ]
             p_blocks: cute.struct.Align[
@@ -11969,6 +12010,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         trace_batch_idx: Int32,
         stationary_tiled_mma: cute.TiledMma,
         stationary_a_layout_staged: cute.ComposedLayout,
+        tma_atom_dos: cute.CopyAtom,
+        tma_tensor_dos: cute.Tensor,
+        dos_a_layout_staged: cute.ComposedLayout,
     ):
         """v2 rotated-schedule two-CTA backward (design: 优化设计文档_v2.md)."""
 
@@ -12004,6 +12048,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar.ptr
         stationary_tma_mbars = storage.stationary_tma_mbars.data_ptr()
         stationary_ready_mbar = storage.stationary_ready_mbar.data_ptr()
+        dos_tma_mbar = storage.dos_tma_mbar.data_ptr()
         landing_mbars = storage.landing_mbars.data_ptr()
         relay_mbars = storage.relay_mbars.data_ptr()
         pds_ready_mbars = storage.pds_ready_mbars.data_ptr()
@@ -12027,29 +12072,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             score_a_layout_staged.outer,
             swizzle=score_a_layout_staged.inner,
         )
-        # vre_3: dP's score-A views live on the ring span (round_buf_a..d
-        # contiguous, 4-stage layout stage == ring slot).  Same layout
-        # algebra as the retired stationary_do, different base pointer.
+        # vre_3 r2: dP's score-A views live on the DEDICATED dos double
+        # buffer (2-stage score-plane layout; chunk c -> slot c % 2).
+        # One tensor serves both the fragment and the TMA partition.
+        dos_buf_raw = storage.dos_buf.data_ptr()
         stationary_do = cute.make_tensor(
             cute.recast_ptr(
-                round_buf_a_raw,
-                score_a_layout_staged.inner,
+                dos_buf_raw,
+                dos_a_layout_staged.inner,
                 dtype=self.element_dtype,
             ),
-            score_a_layout_staged.outer,
+            dos_a_layout_staged.outer,
         )
         stationary_q_tma = storage.stationary_q.get_tensor(
             stationary_a_layout_staged.outer,
             swizzle=stationary_a_layout_staged.inner,
         )
-        stationary_do_tma = cute.make_tensor(
-            cute.recast_ptr(
-                round_buf_a_raw,
-                stationary_a_layout_staged.inner,
-                dtype=self.element_dtype,
-            ),
-            stationary_a_layout_staged.outer,
-        )
+        stationary_do_tma = stationary_do
         k_n = storage.score_kv.get_tensor(
             score_b_layout_staged.outer,
             swizzle=score_b_layout_staged.inner,
@@ -12262,17 +12301,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ),
             (None, None, (token_idx, batch_idx)),
         )
-        g_do = cute.local_tile(
-            tma_tensor_do,
-            cute.select(
-                (self.H_TILE_CTA, self.N_TILE, self.D_HEAD),
-                mode=[0, 2],
-            ),
-            (None, None, (token_idx, batch_idx)),
-        )
         stationary_thr_mma = stationary_tiled_mma.get_slice(0)
         rank_g_q = stationary_thr_mma.partition_A(g_q)
-        rank_g_do = stationary_thr_mma.partition_A(g_do)
         t_q_smem, t_q_gmem = cpasync.tma_partition(
             tma_atom_q,
             0,
@@ -12280,13 +12310,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.group_modes(stationary_q_tma, 0, 3),
             cute.group_modes(rank_g_q, 0, 3),
         )
-        t_do_smem, t_do_gmem = cpasync.tma_partition(
-            tma_atom_do,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(stationary_do_tma, 0, 3),
-            cute.group_modes(rank_g_do, 0, 3),
-        )
+        # vre_3 r2: the whole-panel dO partition is retired -- dP's
+        # score-A streams through t_dos_smem/t_dos_gmem below.
 
         rank_score_mma = score_tiled_mma.get_slice(rank)
         rank_dkv_mma = dkv_tiled_mma.get_slice(rank)
@@ -12301,6 +12326,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         rank_dq_coordinates = rank_dq_mma.partition_C(
             cute.make_identity_tensor(self.DQ_MMA_TILER[:2])
+        )
+
+        # vre_3 r2: dos (dP score-A) chunk partition -- this CTA's
+        # M-half boxes of the score plane, d-tiled by K_CHUNK.
+        g_dos = cute.local_tile(
+            tma_tensor_dos,
+            cute.select(
+                (
+                    self.H_TILE_CLUSTER,
+                    self.SCORE_MMA_N,
+                    self.K_CHUNK,
+                ),
+                mode=[0, 2],
+            ),
+            (None, None, (token_idx, batch_idx)),
+        )
+        rank_g_dos = rank_score_mma.partition_A(g_dos)
+        t_dos_smem, t_dos_gmem = cpasync.tma_partition(
+            tma_atom_dos,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(stationary_do_tma, 0, 3),
+            cute.group_modes(rank_g_dos, 0, 3),
         )
 
         # Per-CTA quadrant TMA partitions (mQT/mdOT tiled (D256, H64)).
@@ -12477,6 +12525,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
+        # vre_3 r2: dedicated dP score-A stream (2 stages; producer =
+        # the load warp's elected lane, consumer = the leader).
+        pipe_dos = pipeline.PipelineAsyncUmma.create(
+            num_stages=2,
+            producer_group=load_elect_group,
+            consumer_group=leader_group,
+            barrier_storage=storage.dos_mbars.data_ptr(),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
         # v12 (P2i): the pds COMMIT belongs to the relay warp's lane 0
         # (math only acquires, which is a non-arriving phase wait), so the
         # producer group is a single thread.
@@ -12516,6 +12574,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         if tidx == Int32(0):
             cute.arch.mbarrier_init(stationary_tma_mbars, 1)
             cute.arch.mbarrier_init(stationary_tma_mbars + 1, 1)
+            cute.arch.mbarrier_init(dos_tma_mbar, 1)
             cute.arch.mbarrier_init(stationary_ready_mbar, 2)
             cute.arch.mbarrier_init(stationary_ready_mbar + 1, 2)
             cute.arch.mbarrier_init(landing_mbars, 1)
@@ -13358,6 +13417,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Consumer,
                     self.ROUND_STAGES,
                 )
+                dos_cons = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer,
+                    2,
+                )
                 pds_cons = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer,
                     1,
@@ -13404,7 +13467,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # a..d (positions 0..3 of this tile's 16-gen group) --
                     # no stationary gate; the dOscore whole-panel fill is
                     # the producer.  Early K recycle stays right after.
-                    dp_prod, round_cons = self._issue_dp_streamed_vre3(
+                    dp_prod, dos_cons = self._issue_dp_streamed_vre3(
                         dp_tiled_mma,
                         t_dp,
                         t_dp_pp,
@@ -13412,8 +13475,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         dp_k_fragment,
                         pipe_dp_done,
                         dp_prod,
-                        pipe_round,
-                        round_cons,
+                        pipe_dos,
+                        dos_cons,
                         loop_iter,
                     )
                     pipe_kscore.consumer_release(kscore_cons)
@@ -13617,6 +13680,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Producer,
                 self.ROUND_STAGES,
             )
+            dos_acq = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer,
+                2,
+            )
+            dos_com = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer,
+                2,
+            )
+            dos_tma_phase = Int32(0)
             tma_phase_0 = Int32(0)
             tma_phase_1 = Int32(0)
             if tile_count > Int32(0):
@@ -13656,58 +13728,44 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_index = (
                         tile_count - Int32(1) - loop_iter
                     )
-                    # vre_3 g0..g3: dOscore whole-panel fill -- ONE 64 KiB
-                    # TMA spanning ring slots a..d (the 4-stage stationary
-                    # layout at round_buf_a; stage == slot).  Consumer is
-                    # dP(t) at the leader's iteration head, the only ring
-                    # consumer with no pds dependency; its four credits
-                    # freed at the PREVIOUS iteration's dQ/pad releases.
+                    # vre_3 r2: dP(t)'s four score-A chunks through the
+                    # DEDICATED 2-slot dos stream (chunk c -> slot c%2),
+                    # off the main ring entirely -- the leader's dP stays
+                    # at its iteration head with no FIFO-order coupling.
                     load_qdo_token = _iket.range_start(
                         "LOAD_QDO",
                         loop_iter + Int32(1),
                     )
-                    pipe_round.producer_acquire(round_acq)
-                    round_acq.advance()
-                    pipe_round.producer_acquire(round_acq)
-                    round_acq.advance()
-                    pipe_round.producer_acquire(round_acq)
-                    round_acq.advance()
-                    pipe_round.producer_acquire(round_acq)
-                    round_acq.advance()
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            round_tma_mbars,
-                            score_a_stage_bytes * self.K_CHUNKS,
+                    for dos_chunk in cutlass.range_constexpr(
+                        self.K_CHUNKS
+                    ):
+                        pipe_dos.producer_acquire(dos_acq)
+                        dos_acq.advance()
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                dos_tma_mbar,
+                                score_a_stage_bytes,
+                            )
+                        cute.copy(
+                            tma_atom_dos,
+                            t_dos_gmem[None, 0, dos_chunk],
+                            t_dos_smem[None, dos_chunk % 2],
+                            tma_bar_ptr=dos_tma_mbar,
                         )
-                    cute.copy(
-                        tma_atom_do,
-                        t_do_gmem[None, rank, 0],
-                        t_do_smem[None, 0],
-                        tma_bar_ptr=round_tma_mbars,
-                    )
-                    cute.arch.mbarrier_wait(
-                        round_tma_mbars,
-                        tma_phase_0,
-                    )
-                    tma_phase_0 = Int32(1) - tma_phase_0
-                    with cute.arch.elect_one():
-                        pipe_round.producer_commit(round_com)
-                    round_com.advance()
-                    with cute.arch.elect_one():
-                        pipe_round.producer_commit(round_com)
-                    round_com.advance()
-                    with cute.arch.elect_one():
-                        pipe_round.producer_commit(round_com)
-                    round_com.advance()
-                    with cute.arch.elect_one():
-                        pipe_round.producer_commit(round_com)
-                    round_com.advance()
+                        cute.arch.mbarrier_wait(
+                            dos_tma_mbar,
+                            dos_tma_phase,
+                        )
+                        dos_tma_phase = Int32(1) - dos_tma_phase
+                        with cute.arch.elect_one():
+                            pipe_dos.producer_commit(dos_com)
+                        dos_com.advance()
                     _iket.range_end(
                         load_qdo_token,
                         loop_iter + Int32(1),
                     )
 
-                    # g4..g11: panel TMA fills, pipelined depth 2.  The
+                    # g0..g7: panel TMA fills, pipelined depth 2.  The
                     # commit for gen q-1 happens after gen q's TMA is in
                     # flight; barrier q%2 was last waited at iteration q-1,
                     # so it is never re-armed while pending.
@@ -13923,6 +13981,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         pipe_round.producer_commit(round_com)
                     round_com.advance()
                 pipe_round.producer_tail(round_acq)
+                pipe_dos.producer_tail(dos_acq)
 
         elif warp_idx == Int32(self.RELAY_WARP):
             # --- relay, v12 (P2i): now also the publish engine.  Per tile:
@@ -14146,7 +14205,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.gemm(
                         mma,
                         accumulator_0,
-                        a_fragment[None, None, k_block, chunk],
+                        a_fragment[None, None, k_block, chunk % 2],
                         b_fragment[None, None, k_block, chunk],
                         accumulator_0,
                     )
@@ -14160,7 +14219,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.gemm(
                         mma,
                         accumulator_1,
-                        a_fragment[None, None, k_block, chunk],
+                        a_fragment[None, None, k_block, chunk % 2],
                         b_fragment[None, None, k_block, chunk],
                         accumulator_1,
                     )
