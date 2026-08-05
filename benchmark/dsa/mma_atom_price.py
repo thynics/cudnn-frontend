@@ -219,6 +219,7 @@ class MmaAtomPriceBench:
         num_clusters: int = 1,
         load_mode: str = "none",
         t2r_target: str = "far",
+        issuers: int = 1,
     ):
         assert instr_n % 16 == 0 and 16 <= instr_n <= 256, f"bad N={instr_n}"
         assert batch_atoms >= 1 and k_chunks >= 1 and num_clusters >= 1
@@ -229,9 +230,16 @@ class MmaAtomPriceBench:
         # 累加器写全程并发的 TMEM 端口争抢; none = 原始安静基线。
         assert load_mode in ("none", "smem", "t2r", "fma"), f"bad load_mode={load_mode}"
         assert t2r_target in ("far", "near", "acc"), f"bad t2r_target={t2r_target}"
+        # F0 探针: 双发射 warp——warp0/warp1 各自向不相交累加器并发入队,
+        # 判 TC 前端跨 warp 入队是串行还是并行(V10 双发射的归零风险)。
+        assert issuers in (1, 2), f"bad issuers={issuers}"
+        assert load_mode == "none" or issuers == 1, "issuers=2 仅 none 档"
+        if issuers == 2:
+            assert 2 * instr_n <= self.TMEM_COLUMNS, "双发射需双累加器入 512 列"
+        self.issuers = issuers
         self.t2r_target = t2r_target
         self.load_mode = load_mode
-        self.threads_per_cta = {"none": 32, "smem": 128, "t2r": 256, "fma": 256}[load_mode]
+        self.threads_per_cta = {"none": 32 * issuers, "smem": 128, "t2r": 256, "fma": 256}[load_mode]
         if load_mode == "t2r":
             # 目标列区 [2N, 2N+64): 恒避开双累加器区 [0, 2N), 不越 512 列。
             assert (2 * instr_n if t2r_target == "far" else instr_n if t2r_target == "near" else 0) + self.T2R_COLS <= self.TMEM_COLUMNS, (
@@ -374,7 +382,7 @@ class MmaAtomPriceBench:
 
         # ---- done mbarrier: 聚合到达计数 = num_batches（R1） ----
         with cute.arch.elect_one():
-            cute.arch.mbarrier_init(done_mbar, num_batches)
+            cute.arch.mbarrier_init(done_mbar, num_batches * Int32(self.issuers))
         cute.arch.mbarrier_init_fence()
 
         tmem.allocate(self.TMEM_COLUMNS)
@@ -410,18 +418,22 @@ class MmaAtomPriceBench:
         )
 
         # ---- 发射循环: 仅 leader CTA warp0（cute.gemm 内部自带 elect_one） ----
-        if is_leader_cta and warp_idx == 0:
+        if is_leader_cta and warp_idx < self.issuers:
             mma = tiled_mma.with_()
             if cutlass.const_expr(not self.idle):
                 # priming: ACCUMULATE=False 覆写 TMEM 垃圾, 之后恒 True。
                 # 多出的 1~2 个原子计入首批 commit, 量级 1/65536, 忽略。
                 mma.set(tcgen05.Field.ACCUMULATE, False)
+                acc_prime = t_acc[0]
+                if cutlass.const_expr(self.issuers == 2):
+                    if warp_idx == 1:
+                        acc_prime = t_acc[1]
                 cute.gemm(
                     mma,
-                    t_acc[0],
+                    acc_prime,
                     a_fragment[None, None, 0, 0],
                     b_fragment[None, None, 0, 0],
-                    t_acc[0],
+                    acc_prime,
                 )
                 if cutlass.const_expr(self.dual_acc):
                     cute.gemm(
@@ -436,6 +448,10 @@ class MmaAtomPriceBench:
                 if cutlass.const_expr(not self.idle):
                     for i in cutlass.range_constexpr(self.batch_atoms):
                         acc = t_acc[self.acc_ids[i]]
+                        if cutlass.const_expr(self.issuers == 2):
+                            acc = t_acc[0]
+                            if warp_idx == 1:
+                                acc = t_acc[1]
                         cute.gemm(
                             mma,
                             acc,
@@ -623,6 +639,9 @@ def parse_args() -> argparse.Namespace:
                    choices=["none", "smem", "t2r", "fma", "both", "all"],
                    default="none",
                    )
+    p.add_argument("--issuers", type=int, choices=[1, 2], default=1,
+                   help="F0 探针: 并发发射 warp 数(2=warp0/1 各自向不相交"
+                        "累加器入队, 判 TC 前端跨 warp 串行性)")
     p.add_argument("--t2r-target", choices=["far", "near", "acc"],
                    default="far",
                    help="t2r 档目标列区: far=[2N,2N+64) 远列(原状); "
@@ -677,7 +696,7 @@ def main() -> int:
         for n in n_list:
             row = {"mode": mode, "N": n, "batch_atoms": args.batch_atoms,
                    "k_chunks": args.k_chunks, "dual_acc": args.dual_acc,
-                   "load_mode": load_mode, "t2r_target": args.t2r_target}
+                   "load_mode": load_mode, "t2r_target": args.t2r_target, "issuers": args.issuers}
             try:
                 bench = MmaAtomPriceBench(
                     instr_n=n,
@@ -689,6 +708,7 @@ def main() -> int:
                     num_clusters=args.clusters,
                     load_mode=load_mode,
                     t2r_target=args.t2r_target,
+                    issuers=args.issuers,
                 )
                 compiled = cute.compile(
                     bench, Int32(1), stream, options=f"--gpu-arch {arch}"
@@ -696,7 +716,7 @@ def main() -> int:
                 init_nb = max(1, math.ceil(args.atoms / args.batch_atoms))
                 nb = calibrate_batches(compiled, init_nb, stream, args.target_ms)
                 assert 1 <= nb <= MBARRIER_MAX_ARRIVALS
-                atoms = nb * args.batch_atoms
+                atoms = nb * args.batch_atoms * args.issuers
 
                 total_ms = time_median(
                     compiled, nb, stream, args.warmup, args.reps
