@@ -11097,8 +11097,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     premise a trace failure instead of a silent regression.  Softmax
     stats indexing becomes group-hoisted and coordinate-derived; the
     four zero-information S/dP ACQUIRE/PUBLISH spans are retired.  ve_1
-    additionally omits the one-shot LOAD_STATS and redundant MATH_BAR1
-    ranges so the IKET name count is exactly 28.
+    additionally omits three optional WAIT ranges and adds the required
+    TAIL range so the complete native taxonomy stays at exactly 28 names.
 
     Inherited v8 notes:
 
@@ -12007,15 +12007,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 issue_seq * Int32(self.D_ROUNDS)
                 + Int32(round_index)
             )
-            wait_dq_token = _iket.range_start(
-                "WAIT_dQ(i,r)",
-                packed_issue,
-            )
             round_pipeline.consumer_wait(round_consumer_state)
-            _iket.range_end(
-                wait_dq_token,
-                packed_issue,
-            )
             dq_issue_token = _iket.range_start(
                 "dQ_ISSUE(i,r)",
                 packed_issue,
@@ -13037,9 +13029,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             _iket.mark("ROLE_MATH", rank)
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
             if warp_idx == Int32(self.MATH_WARP_BEGIN):
-                # Keep the source-native IKET vocabulary at its 28-event
-                # backend limit.  LOAD_STATS is a one-shot startup copy and
-                # is not needed to diagnose the steady pair schedule.
+                load_stats_token = _iket.range_start(
+                    "LOAD_STATS",
+                    Int32(0),
+                )
                 if tile_count > Int32(0):
                     cute.copy(
                         stats_copy_atom,
@@ -13054,6 +13047,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
+                _iket.range_end(
+                    load_stats_token,
+                    Int32(0),
+                )
             self.math_barrier.arrive_and_wait()
 
             s_state = pipeline.make_pipeline_state(
@@ -13325,15 +13322,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
 
             for loop_iter in cutlass.range(tile_count):
-                wait_s_token = _iket.range_start(
-                    "WAIT_S(i)",
-                    loop_iter,
-                )
                 pipe_s_done.consumer_wait(s_state)
-                _iket.range_end(
-                    wait_s_token,
-                    loop_iter,
-                )
                 t2r_s_token = _iket.range_start(
                     "T2R_S(i)",
                     loop_iter,
@@ -13354,15 +13343,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     loop_iter,
                 )
 
-                wait_dp_token = _iket.range_start(
-                    "WAIT_dP(i)",
-                    loop_iter,
-                )
                 pipe_dp_done.consumer_wait(dp_state)
-                _iket.range_end(
-                    wait_dp_token,
-                    loop_iter,
-                )
                 t2r_dp_token = _iket.range_start(
                     "T2R_dP(i)",
                     loop_iter,
@@ -13581,12 +13562,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # v12 (P2i): the barrier rendezvous, both DSM sends, and
                 # the pds commit move to the relay warp (W18).  Each math
                 # thread hands off with one release-semantics mbarrier
-                # arrive after its own fenced stores.  MATH_PD already
-                # brackets this handoff, so a separate MATH_BAR1 range is
-                # redundant and would overflow IKET's 28-event limit.
+                # arrive after its own fenced stores; MATH_BAR1 brackets
+                # that arrive as required by the native trace taxonomy.
+                math_bar1_token = _iket.range_start(
+                    "MATH_BAR1(i)",
+                    loop_iter,
+                )
                 cute.arch.mbarrier_arrive(
                     pds_ready_mbars + pds_stage,
                     rank,
+                )
+                _iket.range_end(
+                    math_bar1_token,
+                    loop_iter,
                 )
                 _iket.range_end(
                     math_pd_token,
@@ -13985,10 +13973,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         if has_second:
                             pipe_pds.consumer_release(pds_rel)
                             pds_rel.advance()
+                    tail_token = _iket.range_start(
+                        "TAIL",
+                        tile_count - Int32(1),
+                    )
                     pipe_s_done.producer_tail(s_prod)
                     pipe_dp_done.producer_tail(dp_prod)
                     pipe_dkv_done.producer_tail(dkv_com)
                     pipe_dq_done.producer_tail(dq_done_prod)
+                    _iket.range_end(
+                        tail_token,
+                        tile_count - Int32(1),
+                    )
         elif warp_idx == Int32(self.LOAD_WARP):
             # --- load: stationary TMA once, then 8 A/B gens per tile.
             # v3: the eight panel TMA fills are software-pipelined over two
@@ -14564,8 +14560,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         """
 
         # v9.3: the S/dP ACQUIRE and PUBLISH spans are retired (near-zero
-        # information since the 2-stage ping-pong).  Together with ve_1's
-        # two startup/redundant omissions the trace stays at 28 names.
+        # information since the 2-stage ping-pong).  ve_1 retires the three
+        # optional WAIT spans and adds TAIL, keeping 28 trace names.
         done_pipeline.producer_acquire(producer_state)
         if cutlass.const_expr(is_dp):
             mma_issue_token = _iket.range_start(
