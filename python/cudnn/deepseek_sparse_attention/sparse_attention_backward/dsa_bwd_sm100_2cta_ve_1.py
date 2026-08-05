@@ -11426,9 +11426,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             score_epi_safe_mbar: cutlass.Int64
             # Math -> W18 publish handoff (count-128), one per pair lane.
             pds_ready_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            # The gather role publishes completion-driven K source safety;
-            # the leader publishes PDS1 death before the next pair reloads
-            # score_kv as K.
+            # Gather publishes completion-driven K source safety; reducer
+            # completion and W18 source drain jointly return the PDS1 alias.
             kscore_safe_mbar: cutlass.Int64
             score_alias_free_mbar: cutlass.Int64
             khot_seq: cute.struct.MemRange[cutlass.Int64, 1]
@@ -12387,9 +12386,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             score_store_domain,
             swizzle=score_store_layout.inner,
         )
+        aligned_ds_image_alias_ptr = cute.make_ptr(
+            self.element_dtype,
+            ds_image_alias.iterator.toint(),
+            ds_image_alias.memspace,
+            assumed_align=16,
+        )
         ds_image_alias_store = cute.make_tensor(
             cute.recast_ptr(
-                ds_image_alias_raw,
+                aligned_ds_image_alias_ptr,
                 score_store_layout.inner,
                 dtype=self.element_dtype,
             ),
@@ -12764,9 +12769,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(score_alias_free_mbar, 2)
             cute.arch.mbarrier_init(round_tma_mbars, 1)
             cute.arch.mbarrier_init(round_tma_mbars + 1, 1)
-            # Epilogue reuse of score_kv needs both the leader's final
-            # K/PDS consumer release and W18's outgoing DSM source drain.
-            cute.arch.mbarrier_init(score_epi_safe_mbar, 2)
+            # Gather publishes this only after true kscore empty and, for a
+            # full final pair, the joined reducer+W18 alias release.
+            cute.arch.mbarrier_init(score_epi_safe_mbar, 1)
             _store_shared_seq_v4(khot_seq, Int32(0))
         cute.arch.fence_view_async_shared()
         self.cta_barrier.arrive_and_wait()
@@ -12967,6 +12972,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         gather_state.advance()
                         _iket.range_end(load_k_token, lane1_iter)
 
+                    # Unlike a raw arrive after consumer_release, this wait
+                    # observes the actual completion-linked empty phase.
+                    # W18 cannot grant PDS1 write credit before it returns.
+                    pipe_kscore.producer_acquire(gather_state)
+                    if warp_idx == Int32(0):
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(
+                                kscore_safe_mbar,
+                                rank,
+                            )
+
                     # W17 has reserved two physical round stages for each
                     # live tile before entering each rendezvous.
                     self._gather_kdq_v8(
@@ -13007,6 +13023,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             score_alias_free_mbar,
                             pair_iter % Int32(2),
                         )
+                    if pair_iter == pair_count - Int32(1):
+                        if warp_idx == Int32(0):
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive(
+                                    score_epi_safe_mbar,
+                                    rank,
+                                )
                 pipe_kscore.producer_tail(gather_state)
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
             # --- math: stats, per-tile softmax + publication, dQ epilogue.
@@ -13717,6 +13740,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         dkv_wait,
                         dkv_rel,
                     )
+                    # Stage-0's completion-linked wait inside the two drain
+                    # calls proves every pair MMA (including PDS1 B reads)
+                    # has retired.  Join this with W18's DSM source drain.
+                    if rtx == Int32(0):
+                        cute.arch.mbarrier_arrive(
+                            score_alias_free_mbar,
+                            rank,
+                        )
 
         elif warp_idx == Int32(self.MMA_WARP):
             # --- ve_1 leader: score two KV tiles, then consume every
@@ -13848,19 +13879,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             pipe_kscore.consumer_release(kscore_cons)
                             kscore_cons.advance()
 
-                        # This event follows PipelineAsyncUmma's
-                        # completion-driven empty release, so W18 may grant
-                        # score_kv/PDS1 write credit without a timing guess.
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive(
-                                kscore_safe_mbar,
-                                Int32(0),
-                            )
-                            cute.arch.mbarrier_arrive(
-                                kscore_safe_mbar,
-                                Int32(1),
-                            )
-
                         pipe_pds.consumer_wait(pds_wait)
                         pds_wait.advance()
                         round_cons = self._issue_dq_rounds_v2(
@@ -13890,6 +13908,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 round_cons,
                                 lane1_iter,
                             )
+                        if pair_iter == pair_count - Int32(1):
+                            # Keep dQ in its own completion group.  Committing
+                            # after dKV would make dq_done an empty-group hint.
+                            pipe_dq_done.producer_commit(dq_done_prod)
+                            dq_done_prod.advance()
 
                         # Conservative bring-up: both remote P and dS halves
                         # are complete before entering the shared A-panel
@@ -13973,27 +13996,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         if has_second:
                             pipe_pds.consumer_release(pds_rel)
                             pds_rel.advance()
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive(
-                                    score_alias_free_mbar,
-                                    Int32(0),
-                                )
-                                cute.arch.mbarrier_arrive(
-                                    score_alias_free_mbar,
-                                    Int32(1),
-                                )
-
-                    pipe_dq_done.producer_commit(dq_done_prod)
-                    dq_done_prod.advance()
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(
-                            score_epi_safe_mbar,
-                            Int32(0),
-                        )
-                        cute.arch.mbarrier_arrive(
-                            score_epi_safe_mbar,
-                            Int32(1),
-                        )
                     pipe_s_done.producer_tail(s_prod)
                     pipe_dp_done.producer_tail(dp_prod)
                     pipe_dkv_done.producer_tail(dkv_com)
@@ -14541,10 +14543,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         )
                 if tile_count > Int32(0):
                     pipe_pds.producer_tail(pds_com)
-                    cute.arch.mbarrier_arrive(
-                        score_epi_safe_mbar,
-                        rank,
-                    )
 
         # ==================================================================
         # Common tail: full-cluster rendezvous, then TMEM release.
