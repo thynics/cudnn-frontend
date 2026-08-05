@@ -13698,6 +13698,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     dkv_rel,
                 )
                 if lane1_iter < tile_count:
+                    # Every pair UMMA precedes one common TMEM-store fence
+                    # and the lane-0 completion generations consumed above.
+                    # PDS1 is therefore dead as an MMA B source here; return
+                    # its alias before lane-1 T2R/atomics, which touch only
+                    # the disjoint dKV TMEM arena and GMEM workspace.
+                    if rtx == Int32(0):
+                        cute.arch.mbarrier_arrive(
+                            score_alias_free_mbar,
+                            rank,
+                        )
                     tile_index = (
                         tile_count - Int32(1) - lane1_iter
                     )
@@ -13717,14 +13727,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         dkv_wait,
                         dkv_rel,
                     )
-                    # Stage-0's completion-linked wait inside the two drain
-                    # calls proves every pair MMA (including PDS1 B reads)
-                    # has retired.  Join this with W18's DSM source drain.
-                    if rtx == Int32(0):
-                        cute.arch.mbarrier_arrive(
-                            score_alias_free_mbar,
-                            rank,
-                        )
 
         elif warp_idx == Int32(self.MMA_WARP):
             # --- ve_1 leader: score two KV tiles, then consume every
@@ -13786,17 +13788,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         pair_phase = pair_iter % Int32(2)
 
                         # Stages 0/1 are the aliased [S,dP] TMEM ranges.
-                        # Acquiring them before score issue proves the prior
-                        # reducer has completed T2R and returned ownership.
+                        # Only these two stages must be acquired before the
+                        # next score pair.  Stages 2/3 live in the disjoint
+                        # pair-1 dKV arena and are acquired at their actual
+                        # first write below, so the prior pair's lane-1 T2R
+                        # does not serialize the next pair's score work.
                         pipe_dkv_done.producer_acquire(dkv_acq)
                         dkv_acq.advance()
                         pipe_dkv_done.producer_acquire(dkv_acq)
                         dkv_acq.advance()
-                        if has_second:
-                            pipe_dkv_done.producer_acquire(dkv_acq)
-                            dkv_acq.advance()
-                            pipe_dkv_done.producer_acquire(dkv_acq)
-                            dkv_acq.advance()
 
                         pipe_kscore.consumer_wait(kscore_cons)
                         s_prod = self._issue_score_v2(
@@ -13911,6 +13911,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 relay_mbars + 3,
                                 pair_phase,
                             )
+
+                            # The second tile's dKV stages do not alias the
+                            # score accumulators.  Acquire them only at their
+                            # first write, after score/dQ and the P/dS relay
+                            # have had the full reducer window to overlap.
+                            pipe_dkv_done.producer_acquire(dkv_acq)
+                            dkv_acq.advance()
+                            pipe_dkv_done.producer_acquire(dkv_acq)
+                            dkv_acq.advance()
 
                         round_cons = self._issue_pair_grad_round_ve1(
                             dkv_tiled_mma,
