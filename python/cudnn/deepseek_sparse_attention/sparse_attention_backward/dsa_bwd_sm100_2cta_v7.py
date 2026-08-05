@@ -14543,39 +14543,94 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Consumer,
                 self.MMA_DONE_STAGES,
             )
+            # [v11-C1] One-time T2R geometry (slots are bundle-invariant
+            # static selections; lesson #15 family derivation preserved
+            # inside the factored helper).
+            (
+                drn_t2r,
+                drn_coords,
+                drn_src_dv,
+                drn_src_dk,
+            ) = self._drain_t2r_views_v11(
+                t_dkv_army[0],
+                t_dkv_army[1],
+                rtx,
+            )
+            # Ping-pong dV fragments: while unit u's atomics stream out
+            # of fragment u%2, unit u+1's dV lands in fragment (u+1)%2.
+            drn_vals = (
+                cute.make_rmem_tensor(drn_coords.shape, self.acc_dtype),
+                cute.make_rmem_tensor(drn_coords.shape, self.acc_dtype),
+            )
             for loop_iter in cutlass.range(tile_count):
                 tile_index = tile_count - Int32(1) - loop_iter
-                # 8 fused (dV, dK) drains, leader commit order (pair-
-                # major then D-round).  Fused-block payload =
-                # b*8 + pair*4 + r (change order item 3).
-                for g_pair in cutlass.range_constexpr(2):
-                    for d_round in cutlass.range_constexpr(
-                        self.DKV_D_ROUNDS
-                    ):
-                        # edge: leader dkv commits for (P, r, dV) and
-                        # (P, r, dK) -- consumed as a pair from the
-                        # 2-deep ring.
-                        # v7 static slot selection at the call site:
-                        # slot = p % 2 (dV slot 0, dK slot 1; pair
-                        # and round invariant).
-                        dkv_wait, dkv_rel = self._drain_dkv_fused_v52(
-                            t_dkv_army[0],
-                            t_dkv_army[1],
-                            mdKV_acc,
-                            mTopkIdxs,
-                            tile_index,
-                            Int32(d_round),
-                            topk,
-                            token_idx,
-                            batch_idx,
-                            rtx,
-                            rank,
-                            loop_iter * Int32(8)
-                            + Int32(g_pair * 4 + d_round),
-                            pipe_dkv_done,
-                            dkv_wait,
-                            dkv_rel,
-                        )
+                # [v11-C1] software-pipelined drain: 8 fused units per
+                # bundle, constexpr-unrolled.  Unit 0 runs plain (its
+                # wait IS the bundle-boundary production hole -- never
+                # hoisted, l2l peel discipline); units 1..7 have their
+                # dV wait+copy hoisted underneath the PREVIOUS unit's
+                # atomics via the try-wait token path, so the ~1.25 us
+                # TMEM data gap the v11 recon measured rides inside the
+                # ~1.7 us atomic stream instead of extending the unit.
+                # Payloads: unit u = loop_iter*8 + u (unchanged).
+                fused0, dkv_wait, dkv_rel = self._drain_head_v11(
+                    drn_t2r,
+                    drn_coords,
+                    drn_src_dv,
+                    drn_src_dk,
+                    drn_vals[0],
+                    loop_iter * Int32(8) + Int32(0),
+                    pipe_dkv_done,
+                    dkv_wait,
+                    dkv_rel,
+                    False,
+                )
+                for unit in cutlass.range_constexpr(1, 8):
+                    dkv_wait = self._drain_prefetch_dv_v11(
+                        drn_t2r,
+                        drn_src_dv,
+                        drn_vals[unit % 2],
+                        pipe_dkv_done,
+                        dkv_wait,
+                    )
+                    self._drain_atomics_v11(
+                        drn_vals[(unit - 1) % 2],
+                        drn_coords,
+                        mdKV_acc,
+                        mTopkIdxs,
+                        tile_index,
+                        Int32((unit - 1) % 4),
+                        topk,
+                        token_idx,
+                        batch_idx,
+                        rank,
+                        loop_iter * Int32(8) + Int32(unit - 1),
+                    )
+                    _f, dkv_wait, dkv_rel = self._drain_head_v11(
+                        drn_t2r,
+                        drn_coords,
+                        drn_src_dv,
+                        drn_src_dk,
+                        drn_vals[unit % 2],
+                        loop_iter * Int32(8) + Int32(unit),
+                        pipe_dkv_done,
+                        dkv_wait,
+                        dkv_rel,
+                        True,
+                    )
+                self._drain_atomics_v11(
+                    drn_vals[7 % 2],
+                    drn_coords,
+                    mdKV_acc,
+                    mTopkIdxs,
+                    tile_index,
+                    Int32(7 % 4),
+                    topk,
+                    token_idx,
+                    batch_idx,
+                    rank,
+                    loop_iter * Int32(8) + Int32(7),
+                )
 
         elif warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
@@ -15903,6 +15958,283 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             issue_seq,
         )
         return wait_state, release_state
+
+    @cute.jit
+    def _drain_t2r_views_v11(
+        self,
+        t_slot_dv: cute.Tensor,
+        t_slot_dk: cute.Tensor,
+        rtx: Int32,
+    ):
+        """[v11-C1] The fused drain's T2R view construction, VERBATIM.
+
+        Factored out so the front half of a unit can be issued in two
+        places (prefetched under the previous unit's atomics, or in
+        place) from one geometry source -- lesson #15: the T2R geometry
+        is only ever derived inside its own atom family.
+        Returns (tiled_t2r, coordinates, source_dv, source_dk).
+        """
+
+        dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
+        wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
+        t_core_dv = t_slot_dv[(None, None), 0, 0]
+        t_core_dk = t_slot_dk[(None, None), 0, 0]
+        # The M64-interleaved UMMA_2SM fragment core is
+        # (m64,(n64,h2)) with TMEM-ENCODED strides (lane stride 2^16):
+        # lane = m + 64*h, column = n.  make_tmem_copy needs the
+        # physical (DP, col) congruence, so regroup to ((m64,h2),n64)
+        # -- a pure mode permutation; the encoded strides ride along
+        # verbatim (v32 drain precedent).
+        assert t_core_dv.shape == (
+            self.N_TILE,
+            (self.N_TILE, 2),
+        ), str(t_core_dv.layout)
+        core_stride = t_core_dv.layout.stride
+        phys_layout = cute.make_layout(
+            ((self.N_TILE, 2), self.N_TILE),
+            stride=(
+                (core_stride[0], core_stride[1][1]),
+                core_stride[1][0],
+            ),
+        )
+        t_phys_dv = cute.make_tensor(
+            t_core_dv.iterator,
+            phys_layout,
+        )
+        t_phys_dk = cute.make_tensor(
+            t_core_dk.iterator,
+            phys_layout,
+        )
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+            self.acc_dtype,
+        )
+        tiled_t2r = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            t_phys_dv,
+        )
+        thread_t2r = tiled_t2r.get_slice(dp_idx)
+        c_dkv = cute.make_identity_tensor(
+            ((self.N_TILE, 2), self.N_TILE)
+        )
+        thread_coordinates = self.split_wg(
+            thread_t2r.partition_D(c_dkv),
+            2,
+            wg_idx,
+        )
+        thread_source_dv = self.split_wg(
+            thread_t2r.partition_S(t_phys_dv),
+            2,
+            wg_idx,
+        )
+        thread_source_dk = self.split_wg(
+            thread_t2r.partition_S(t_phys_dk),
+            2,
+            wg_idx,
+        )
+        return (
+            tiled_t2r,
+            thread_coordinates,
+            thread_source_dv,
+            thread_source_dk,
+        )
+
+    @cute.jit
+    def _drain_head_v11(
+        self,
+        tiled_t2r,
+        thread_coordinates,
+        source_dv,
+        source_dk,
+        thread_values_dv,
+        issue_seq: Int32,
+        done_pipeline,
+        wait_state: pipeline.PipelineState,
+        release_state: pipeline.PipelineState,
+        dv_prefetched: cutlass.Constexpr[bool],
+    ):
+        """[v11-C1] Front half of one fused (dV, dK) drain unit.
+
+        The v5.2 fused drain is split at the register-fusion point so
+        that the BACK half of unit u (the red.global stream: ~1.7 us,
+        touching neither TMEM nor any mbarrier) can cover the front
+        half of unit u+1 -- the T2R issue plus the TMEM data latency,
+        which the v11 recon measured as a 1.25 us dead gap per unit.
+
+        dv_prefetched is a COMPILE-TIME flag (the 8-unit loop is
+        constexpr-unrolled): when set, the caller already performed
+        this unit's dV wait and issued its dV copy underneath the
+        previous unit's atomics, so only the dK generation is handled
+        here.  Either way the unit performs exactly two waits, two
+        copies, one fence and two releases, in generation order --
+        only the wall-clock position of the dV pair moves.
+        """
+
+        wait_dk_token = _iket.range_start(
+            "WAIT_dK(i,r)",
+            issue_seq,
+        )
+        if cutlass.const_expr(not dv_prefetched):
+            done_pipeline.consumer_wait(wait_state)
+            wait_state.advance()
+        done_pipeline.consumer_wait(wait_state)
+        wait_state.advance()
+        _iket.range_end(
+            wait_dk_token,
+            issue_seq,
+        )
+
+        reduce_t2r_token = _iket.range_start(
+            "REDUCE_T2R(i,r)",
+            issue_seq,
+        )
+        thread_values_dk = cute.make_rmem_tensor(
+            thread_coordinates.shape,
+            self.acc_dtype,
+        )
+        if cutlass.const_expr(not dv_prefetched):
+            cute.copy(tiled_t2r, source_dv, thread_values_dv)
+        cute.copy(tiled_t2r, source_dk, thread_values_dk)
+        cute.arch.fence_view_async_tmem_load()
+        # Both slots free together (two consecutive releases).
+        done_pipeline.consumer_release(release_state)
+        release_state.advance()
+        done_pipeline.consumer_release(release_state)
+        release_state.advance()
+        _iket.range_end(
+            reduce_t2r_token,
+            issue_seq,
+        )
+
+        assert cute.size(thread_values_dv) == self.N_TILE // 2
+        # Register fusion: d(KV) = dV + dK (same destination rows).
+        for i in cutlass.range_constexpr(self.N_TILE // 2):
+            thread_values_dv[i] = (
+                thread_values_dv[i] + thread_values_dk[i]
+            )
+        return thread_values_dv, wait_state, release_state
+
+    @cute.jit
+    def _drain_prefetch_dv_v11(
+        self,
+        tiled_t2r,
+        source_dv,
+        thread_values_dv,
+        done_pipeline,
+        wait_state: pipeline.PipelineState,
+    ):
+        """[v11-C1] Hoisted dV wait + T2R issue for the NEXT unit.
+
+        Called right before the current unit's atomics so the copy is
+        in flight underneath them.  The wait is unconditional (no
+        runtime branch, no state mutation inside a predicate) but
+        carries a try-wait token, so the generation-ready case -- which
+        the v11 recon measured as the rule INSIDE a bundle, ring
+        WAIT_dK 0.08 us -- skips the barrier entirely.  Bundle-boundary
+        units are never prefetched (unit 0 stays plain), which is where
+        the 9.85 us production hole lives.
+        """
+
+        ready = done_pipeline.consumer_try_wait(wait_state)
+        done_pipeline.consumer_wait(wait_state, ready)
+        wait_state.advance()
+        cute.copy(tiled_t2r, source_dv, thread_values_dv)
+        return wait_state
+
+    @cute.jit
+    def _drain_atomics_v11(
+        self,
+        thread_values_dv,
+        thread_coordinates,
+        mdKV_acc: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        tile_index: Int32,
+        d_round: Int32,
+        topk: Int32,
+        token_idx: Int32,
+        batch_idx: Int32,
+        rank: Int32,
+        issue_seq: Int32,
+    ):
+        """[v11-C1] Back half: the fused pair's red.global stream.
+
+        Body is the v5.2 fused drain's atomic section VERBATIM (decode
+        cache, per-pair kv row, f32x2 atomics); it touches neither TMEM
+        nor any mbarrier, which is exactly why the next unit's T2R may
+        be in flight underneath it.
+        """
+
+        reduce_atomic_token = _iket.range_start(
+            "REDUCE_ATOMIC(i,r)",
+            issue_seq,
+        )
+        # Per-PAIR gather row: the Rep-4 fragment spans multiple fold
+        # rows per thread (v8 precedent: four dp rows), so the kv row
+        # and its topk index are decoded from THIS pair's coordinate
+        # (audit F5: a single hoisted row misroutes 3/4 of the mass).
+        # A one-entry cache elides the redundant index reloads within
+        # a row run.
+        cached_kv_row = Int32(-1)
+        kv_index = Int32(-1)
+        for i in cutlass.range_constexpr(self.N_TILE // 4):
+            v0 = 2 * i
+            v1 = v0 + 1
+            rdkv_frg = cute.make_rmem_tensor(
+                (2,),
+                self.acc_dtype,
+            )
+            rdkv_frg[0] = thread_values_dv[v0]
+            rdkv_frg[1] = thread_values_dv[v1]
+            pair_kv = Int32(
+                cute.get(
+                    thread_coordinates[v0],
+                    mode=[0, 0],
+                )
+            )
+            if pair_kv != cached_kv_row:
+                cached_kv_row = pair_kv
+                pair_global_row = (
+                    tile_index * Int32(2 * self.N_TILE)
+                    + rank * Int32(2 * self.N_TILE_CTA)
+                    + pair_kv
+                )
+                kv_index = Int32(-1)
+                if pair_global_row < topk:
+                    kv_index = mTopkIdxs[
+                        pair_global_row,
+                        (token_idx, batch_idx),
+                    ]
+            if kv_index >= Int32(0):
+                # D within the block = 64 * h(fold half, mode [0,1])
+                # + n (mode [1]); the block's GMEM quadrant is d_round.
+                d_local = Int32(
+                    cute.get(
+                        thread_coordinates[v0],
+                        mode=[1],
+                    )
+                ) + Int32(
+                    cute.get(
+                        thread_coordinates[v0],
+                        mode=[0, 1],
+                    )
+                ) * Int32(2 * self.N_TILE_CTA)
+                dkv_row = mdKV_acc[
+                    None,
+                    kv_index,
+                    (0, batch_idx),
+                ]
+                tile_row = cute.flat_divide(dkv_row, (128,))
+                quad_row = tile_row[None, d_round]
+                pair_row = cute.flat_divide(quad_row, (2,))
+                target_frg = pair_row[None, d_local // Int32(2)]
+                cute.arch.atomic_add(
+                    target_frg.iterator.llvm_ptr,
+                    rdkv_frg.load(),
+                )
+        _iket.range_end(
+            reduce_atomic_token,
+            issue_seq,
+        )
 
     @cute.jit
     def _drain_dkv_v8(
