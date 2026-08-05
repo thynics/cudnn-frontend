@@ -14116,10 +14116,25 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # commit for gen q-1 happens after gen q's TMA is in
                     # flight; barrier q%2 was last waited at iteration q-1,
                     # so it is never re-armed while pending.
-                    mat_qdo_token_0 = _iket.range_start(
-                        "MAT_QDO(m,r)",
-                        pair_iter * Int32(self.D_ROUNDS),
+                    lane0_round0_payload = (
+                        lane0_iter * Int32(self.D_ROUNDS)
                     )
+                    lane1_round0_payload = (
+                        lane1_iter * Int32(self.D_ROUNDS)
+                    )
+                    mat_qdo_lane0_token_0 = _iket.range_start(
+                        "MAT_QDO(m,r)",
+                        lane0_round0_payload,
+                    )
+                    mat_qdo_lane1_token_0 = mat_qdo_lane0_token_0
+                    if has_second:
+                        # One physical materialization feeds both tiles.
+                        # Attribute the same interval to both tile payloads
+                        # so the native per-tile trace schema remains exact.
+                        mat_qdo_lane1_token_0 = _iket.range_start(
+                            "MAT_QDO(m,r)",
+                            lane1_round0_payload,
+                        )
                     for flat_gen in cutlass.range_constexpr(8):
                         grad_round = flat_gen // 4
                         if cutlass.const_expr(flat_gen % 4 < 2):
@@ -14128,15 +14143,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             tensor_kind = 1
                         h_half = flat_gen % 2
                         if cutlass.const_expr(flat_gen == 4):
+                            if has_second:
+                                _iket.range_end(
+                                    mat_qdo_lane1_token_0,
+                                    lane1_round0_payload,
+                                )
                             _iket.range_end(
-                                mat_qdo_token_0,
-                                pair_iter * Int32(self.D_ROUNDS),
+                                mat_qdo_lane0_token_0,
+                                lane0_round0_payload,
                             )
-                            mat_qdo_token_1 = _iket.range_start(
+                            lane0_round1_payload = (
+                                lane0_round0_payload + Int32(1)
+                            )
+                            lane1_round1_payload = (
+                                lane1_round0_payload + Int32(1)
+                            )
+                            mat_qdo_lane0_token_1 = _iket.range_start(
                                 "MAT_QDO(m,r)",
-                                pair_iter * Int32(self.D_ROUNDS)
-                                + Int32(1),
+                                lane0_round1_payload,
                             )
+                            mat_qdo_lane1_token_1 = mat_qdo_lane0_token_1
+                            if has_second:
+                                mat_qdo_lane1_token_1 = _iket.range_start(
+                                    "MAT_QDO(m,r)",
+                                    lane1_round1_payload,
+                                )
                         pipe_round.producer_acquire(round_acq)
                         round_acq.advance()
                         with cute.arch.elect_one():
@@ -14315,10 +14346,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     with cute.arch.elect_one():
                         pipe_round.producer_commit(round_com)
                     round_com.advance()
+                    if has_second:
+                        _iket.range_end(
+                            mat_qdo_lane1_token_1,
+                            lane1_round1_payload,
+                        )
                     _iket.range_end(
-                        mat_qdo_token_1,
-                        pair_iter * Int32(self.D_ROUNDS)
-                        + Int32(1),
+                        mat_qdo_lane0_token_1,
+                        lane0_round1_payload,
                     )
                 pipe_round.producer_tail(round_acq)
 
