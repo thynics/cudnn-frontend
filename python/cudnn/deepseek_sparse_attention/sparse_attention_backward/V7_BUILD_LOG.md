@@ -132,3 +132,14 @@
   死锁审计：hoist 的 kres wait(b+1) ← gather K(b+1) fill ← leader kres release(b)（迭代头已发）——无回边；hoist 的 pass0 strip 等待 ← W17 strips{0,1}(b+1)（其 acquire ← pass1(b) 释放，迭代头已发）——无回边；W17 strips 提升块 acquire 信用实测边界前 ~27µs 即开，g16/g17/g18/g19 会合序与 gather 逐字同序。风险登记：R-低 机械剥离/复制（已 diff=0 自证）；R-perf 三看点——kres wait 上链（余量 ~20µs）、strip 填充挤占 W17 park（余量 ~1.4µs）、dqb_free 显形 ~0.4µs（已入账）。
   验收钩子（待硬件）：correctness 4/4（全局序不变量的硅裁决）→ release 判决（预估 −3~3.5µs/bundle，19.09 → ~17.2-17.6ms 带）→ trace：WAIT_S(8(b+1)) end 边界 +7..+9.6 → ≤+3；dVdK_ISSUE(16(b+1)) ~+13.9 → ~+6.5；LOAD_QDO gen0/1 与 S_ISSUE(4b+0/1) 现身上一 bundle 尾（payload 集合零增删，L2-lite LOAD_K 先例）；MATH_PDS_ACQ 允许出现 ~0.4µs 驻留。
   本轮改动：dsa_bwd_sm100_2cta_v7.py 两区 + 尾 ADDENDUM；本文件 4 条日志（z0/z1/z2/final）。不 commit、不跑测试（纪律）。
+[tail-r2-z0] 硬件判决登记 + 拆刀开工：tail_r1（R1+R3 组合）correctness 4/4、release 19.558 vs 19.093 = **+2.4% 回退**。协调者裁决撤 R3 保 R1（归因待下一轮硬件：R1 单独贡献未测）。手术：leader 区回滚至 035ddf3（=git HEAD）逐字形态；W17 区 R1 全保留；文件尾 ADDENDUM 改口 R1-only + R3 撤刀注记。
+[tail-r2] R3 撤刀终报（拆刀完成，py_compile 全过，不 commit）：
+  基线勘误：协调者已将 R1+R3 提交为 **f8209c9**（tail_r1 硬件构建），故 HEAD ≠ 035ddf3——首次回滚误用 HEAD 做参照成了空操作（leader 区自比自过、diff 零 hunk 暴露异常），当即按指令改用 **035ddf3** 逐字参照重做。锚点唯一性此轮已断言（MMA/LOAD elif 全文件各仅 1 处）。
+  回滚核验表：
+   (1) leader 区（elif MMA_WARP → elif LOAD_WARP）**293 行逐字 == 035ddf3**（列表相等断言）；tail-R3 标记零残留；_issue_score_pass_v6 调用点恢复为 sub_tile 环内单点。
+   (2) W17 区 R1 全保留：hoist/序幕/末迭代剥离标记齐全；剥离体 289=289 行归一化 diff=0 复检过；op 计数 strip acquire/commit 4/4、round 10/12、kdq_barrier 8、producer_tail 2。
+   (3) diff vs 035ddf3 = 5 hunk（W17 区 4 + 尾 ADDENDUM 1），leader 区零 hunk；diff vs HEAD(f8209c9) = +96/−305（= R3 净逆转 + ADDENDUM 改口）。
+   (4) 尾 ADDENDUM 改口：R1 标注 LIVE、R3 标注 RETRACTED（含 f8209c9 台账与失败假设），文件不再记载不存在的代码。
+   (5) py_compile OK（17,221 行）。
+  R3 失败模式复盘（假设，归因待 R1-only 硬件轮；留给 placement-C）：placement-B 把 pass0(b+1) 的**阻塞等待**（strip stage-0/1 consumer_wait 在 _issue_score_pass_v6 体内 + 前置 kres wait）搬进了 leader 串行流的 G5 r0/r1 中段窗——侦察的"strips(b+1) 边界前已 commit"前提取自 v9-LB trace，而 L2-lite 政权下 W17/gather 相位已移（LOAD_K 挪进 mid-bundle 与 strip TMA 争带宽、wide 环节奏变化可使 W17 晚达 hoist 位点），一旦 strips 未就绪，leader 卡在 G5 中段直接堵 G5 r1 发射→ dqb_free → math publish 全链，比同一等待落在原 bundle-head 位置（彼时 r1 填充/strip 填充已自然流逝）严格更贵；次要嫌疑：hoist 的 kres wait(b+1) 在 K 填充受挤压时同型发作。placement-C 设计约束：hoist 必须挂**非阻塞就绪探测门**（_mbarrier_try_wait@3100 探 strip full 边），探测选择两个静态剥离体之一（advance 不入运行时分支的铁律不变）——"落刀前先探，不赌 trace 外推"。另登记：+2.4% 为组合数，R1 单独贡献未测——若 R1-only 轮也回退，W17 空闲窗前提整体死刑，R1 亦撤。
+  本轮改动：dsa_bwd_sm100_2cta_v7.py（leader 区回滚 + ADDENDUM 改口）；本文件 2 条日志（r2-z0/r2）。不 commit（纪律）。

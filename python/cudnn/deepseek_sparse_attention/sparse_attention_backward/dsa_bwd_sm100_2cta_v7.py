@@ -14678,68 +14678,33 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # readers) and the gather's next-bundle fill overlaps
                 # batch0/batch1/G5 -- the "K(i+1) gather gate = last
                 # score pass completion edge" contract, sharpened.
-                # [tail-R3] Cross-bundle rotation (placement B): pass 0 of
-                # bundle b+1 is issued from inside bundle b, BETWEEN the G5
-                # r0 and G5 r1 wave loops -- the TC executes it inside the
-                # kdq-r1 fill bubble (issue ~2us is the leader-warp serial
-                # cost; execution trails ~0.3-0.6us, v9lb trace), so math
-                # (b+1)'s WAIT_S clears ~5us earlier and its T2R/softmax
-                # overlap the tail.  Readiness at the hoist point: K(b+1)
-                # kres commit lands mid-bundle (L2-lite), strip gens 0/1
-                # (b+1) are pre-filled by W17 ([tail-R1]), and the S/dP
-                # TMEM stage-0 WAR (s_done/dp_done producer acquire) was
-                # released by math ~28us before the boundary.  The GLOBAL
-                # pass order pass0(b), pass1(b), pass0(b+1), ... and every
-                # pipeline generation order are VERBATIM unchanged -- only
-                # the leader wall-clock moves; kres wait(b+1)/release(b+1)
-                # generation pairing is intact (wait moves into the b tail,
-                # release stays after pass 1(b+1)).  Prologue peels
-                # pass0(0); the LAST iteration is peeled without a hoist.
-                if tile_count > Int32(0):
-                    # [tail-R3] Prologue: K(0) wait + score pass 0(0).
-                    # edge: gather's K(0) fill commit (pieces + cp.async
-                    # drain + fence).
+                for loop_iter in cutlass.range(tile_count):
+                    dqb_parity = loop_iter & Int32(1)
+
+                    # edge: gather's K(i) fill commit (8 pieces + one
+                    # cp.async drain + fence).
                     pipe_kres.consumer_wait(kres_cons)
-                    strip_cons, s_prod, dp_prod = (
-                        self._issue_score_pass_v6(
-                            0,
-                            score_tiled_mma,
-                            dp_tiled_mma,
-                            t_score,
-                            t_dp,
-                            score_k_fragment,
-                            dp_k_fragment,
-                            score_q_fragment,
-                            score_do_fragment,
-                            pipe_strip,
-                            strip_cons,
-                            pipe_s_done,
-                            s_prod,
-                            pipe_dp_done,
-                            dp_prod,
-                            Int32(0),
-                        )
-                    )
-                    for loop_iter in cutlass.range(
-                        tile_count - Int32(1)
+
+                    # The @cute.jit boundary re-materializes state
+                    # arguments: helper advances must come back through
+                    # the returns (rev3 dominance failure, lesson #14).
+                    # sub_tile is a Python int (range_constexpr), so
+                    # the operand/accumulator selection below is trace-
+                    # time argument routing, not a staged branch.
+                    for sub_tile in cutlass.range_constexpr(
+                        self.SUB_TILES
                     ):
-                        dqb_parity = loop_iter & Int32(1)
-
-                        # The @cute.jit boundary re-materializes state
-                        # arguments: helper advances must come back through
-                        # the returns (rev3 dominance failure, lesson #14).
-                        # sub_tile is a Python int (range_constexpr), so
-                        # the operand/accumulator selection below is trace-
-                        # time argument routing, not a staged branch.
-                        # score pass 1(b) (pass 0(b) was issued by the previous
-                        # iteration's hoist / the prologue).
                         strip_cons, s_prod, dp_prod = (
                             self._issue_score_pass_v6(
-                                1,
+                                sub_tile,
                                 score_tiled_mma,
                                 dp_tiled_mma,
-                                t_score_pp,
-                                t_dp_pp,
+                                t_score
+                                if sub_tile == 0
+                                else t_score_pp,
+                                t_dp
+                                if sub_tile == 0
+                                else t_dp_pp,
                                 score_k_fragment,
                                 dp_k_fragment,
                                 score_q_fragment,
@@ -14753,220 +14718,41 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 loop_iter,
                             )
                         )
-                        # K residency release right after the LAST
-                        # score pass and BEFORE the grads batch:
-                        # tcgen05-tracked, so the tracked set ends
-                        # at S(1) (grads MMAs would only delay the
-                        # empty edge) and fires when score(1)(i)'s
-                        # reads complete -- the gather's K(i+1)
-                        # fill gate.
-                        pipe_kres.consumer_release(kres_cons)
-                        kres_cons.advance()
-                        # v6 rotation point (spec item 4):
-                        # grads(batch0) issues here, hidden under
-                        # score(1)'s execution window (math slices
-                        # (1, j) publish over it and gate batch1).
-                        pds_cons, dkv_prod, round_cons = (
-                            self._issue_grads_pair_v51(
-                                0,
-                                dkv_tiled_mma,
-                                t_dkv_army[0],
-                                t_dkv_army[1],
-                                p_fragment,
-                                ds_fragment,
-                                grad_frags[0],
-                                grad_frags[1],
-                                pipe_pds,
-                                pds_cons,
-                                pipe_dkv_done,
-                                dkv_prod,
-                                pipe_round,
-                                round_cons,
-                                loop_iter,
-                            )
-                        )
-
-                        # grads(batch1): the bundle's last batch has no
-                        # score to hide under (score(0) of bundle b+1
-                        # cannot start before G5(b) frees the TMEM/ring
-                        # order -- bundle boundary shape unchanged).
-                        pds_cons, dkv_prod, round_cons = (
-                            self._issue_grads_pair_v51(
-                                1,
-                                dkv_tiled_mma,
-                                t_dkv_army[0],
-                                t_dkv_army[1],
-                                p_fragment,
-                                ds_fragment,
-                                grad_frags[0],
-                                grad_frags[1],
-                                pipe_pds,
-                                pds_cons,
-                                pipe_dkv_done,
-                                dkv_prod,
-                                pipe_round,
-                                round_cons,
-                                loop_iter,
-                            )
-                        )
-
-                        # v7 G5 RESIDENT plane (v12 lineage restored; the
-                        # v5.2 eviction plane is rolled back): D-round 0
-                        # at the bundle tail, gated per wave on the
-                        # mb_dqb[w] cluster gates armed by the relays
-                        # during THIS bundle's publish (one phase flip
-                        # per bundle).  Each wave MMA accumulates into the
-                        # PERSISTENT t_dq[0] (ACCUMULATE chains across
-                        # waves and bundles; False exactly once -- wave 0
-                        # of bundle 0 initializes the accumulator).
-                        # Ring FIFO: the kdq r0 gens are g16/g17 here.
-                        for wave in cutlass.range_constexpr(
-                            self.DQ_KV_WAVES
+                        if cutlass.const_expr(
+                            sub_tile == self.SUB_TILES - 1
                         ):
-                            # edge: W17 kdq r0 handshake commit
-                            # (gen 16+w).
-                            pipe_round.consumer_wait(round_cons)
-                            # edge: relay arms -- own image stored (math)
-                            # AND peer push landed (errata #2 pair).
-                            _mbarrier_wait_acquire_cluster(
-                                dqb_mbars + wave,
-                                dqb_parity,
+                            # K residency release right after the LAST
+                            # score pass and BEFORE the grads batch:
+                            # tcgen05-tracked, so the tracked set ends
+                            # at S(1) (grads MMAs would only delay the
+                            # empty edge) and fires when score(1)(i)'s
+                            # reads complete -- the gather's K(i+1)
+                            # fill gate.
+                            pipe_kres.consumer_release(kres_cons)
+                            kres_cons.advance()
+                            # v6 rotation point (spec item 4):
+                            # grads(batch0) issues here, hidden under
+                            # score(1)'s execution window (math slices
+                            # (1, j) publish over it and gate batch1).
+                            pds_cons, dkv_prod, round_cons = (
+                                self._issue_grads_pair_v51(
+                                    0,
+                                    dkv_tiled_mma,
+                                    t_dkv_army[0],
+                                    t_dkv_army[1],
+                                    p_fragment,
+                                    ds_fragment,
+                                    grad_frags[0],
+                                    grad_frags[1],
+                                    pipe_pds,
+                                    pds_cons,
+                                    pipe_dkv_done,
+                                    dkv_prod,
+                                    pipe_round,
+                                    round_cons,
+                                    loop_iter,
+                                )
                             )
-                            if cutlass.const_expr(wave == 0):
-                                dq_acc_w = loop_iter != Int32(0)
-                            else:
-                                dq_acc_w = cutlass.Boolean(True)
-                            self._issue_dq_wave_v32(
-                                dq_tiled_mma,
-                                t_dq[0],
-                                dq_kd_frags[wave],
-                                dq_ds_fragment,
-                                wave,
-                                dq_acc_w,
-                            )
-                            pipe_round.consumer_release(round_cons)
-                            round_cons.advance()
-
-                        # [tail-R3] HOIST: K(b+1) wait + score pass 0(b+1),
-                        # issued between the G5 wave rounds so its ~2us leader
-                        # serial issue and TC execution hide inside the kdq-r1
-                        # fill window (G5 r1 issue is delayed <=0.1us: the g18
-                        # ring commit arrives later than this issue completes).
-                        # edge: gather's K(b+1) fill commit (mid-bundle, L2-lite).
-                        pipe_kres.consumer_wait(kres_cons)
-                        strip_cons, s_prod, dp_prod = (
-                            self._issue_score_pass_v6(
-                                0,
-                                score_tiled_mma,
-                                dp_tiled_mma,
-                                t_score,
-                                t_dp,
-                                score_k_fragment,
-                                dp_k_fragment,
-                                score_q_fragment,
-                                score_do_fragment,
-                                pipe_strip,
-                                strip_cons,
-                                pipe_s_done,
-                                s_prod,
-                                pipe_dp_done,
-                                dp_prod,
-                                loop_iter + Int32(1),
-                            )
-                        )
-
-                        # G5 D-round 1 (the LAST dq_b consumers; kdq gens
-                        # g18/g19), then the free group-commit -- it
-                        # tracks every issued MMA, so it covers both
-                        # D-rounds and both waves (errata #1).
-                        for wave in cutlass.range_constexpr(
-                            self.DQ_KV_WAVES
-                        ):
-                            # edge: W17 kdq r1 handshake commit
-                            # (gen 18+w).
-                            pipe_round.consumer_wait(round_cons)
-                            if cutlass.const_expr(wave == 0):
-                                dq_acc_w1 = loop_iter != Int32(0)
-                            else:
-                                dq_acc_w1 = cutlass.Boolean(True)
-                            self._issue_dq_wave_v32(
-                                dq_tiled_mma,
-                                t_dq[1],
-                                dq_kd_frags[wave],
-                                dq_ds_fragment,
-                                wave,
-                                dq_acc_w1,
-                            )
-                            pipe_round.consumer_release(round_cons)
-                            round_cons.advance()
-                        # edge -> math(b+1)'s bundle-head dqb-free wait
-                        # (the group commit tracks every issued MMA, so
-                        # it covers both D-rounds and both waves --
-                        # errata #1 shape).
-                        pipe_dqb_free.producer_acquire(dqb_free_prod)
-                        pipe_dqb_free.producer_commit(dqb_free_prod)
-                        dqb_free_prod.advance()
-                    # [tail-R3] Peeled LAST iteration (loop_iter ==
-                    # tile_count-1): verbatim steady-state body WITHOUT the
-                    # next-bundle hoist (no next bundle).  N==1 degenerates to
-                    # prologue + this block == the original single-bundle
-                    # stream.
-                    last_iter = tile_count - Int32(1)
-                    dqb_parity = last_iter & Int32(1)
-                    # score pass 1(last) (pass 0(last) was issued by the last
-                    # steady iteration's hoist / the prologue).
-                    strip_cons, s_prod, dp_prod = (
-                        self._issue_score_pass_v6(
-                            1,
-                            score_tiled_mma,
-                            dp_tiled_mma,
-                            t_score_pp,
-                            t_dp_pp,
-                            score_k_fragment,
-                            dp_k_fragment,
-                            score_q_fragment,
-                            score_do_fragment,
-                            pipe_strip,
-                            strip_cons,
-                            pipe_s_done,
-                            s_prod,
-                            pipe_dp_done,
-                            dp_prod,
-                            last_iter,
-                        )
-                    )
-                    # K residency release right after the LAST
-                    # score pass and BEFORE the grads batch:
-                    # tcgen05-tracked, so the tracked set ends
-                    # at S(1) (grads MMAs would only delay the
-                    # empty edge) and fires when score(1)(i)'s
-                    # reads complete -- the gather's K(i+1)
-                    # fill gate.
-                    pipe_kres.consumer_release(kres_cons)
-                    kres_cons.advance()
-                    # v6 rotation point (spec item 4):
-                    # grads(batch0) issues here, hidden under
-                    # score(1)'s execution window (math slices
-                    # (1, j) publish over it and gate batch1).
-                    pds_cons, dkv_prod, round_cons = (
-                        self._issue_grads_pair_v51(
-                            0,
-                            dkv_tiled_mma,
-                            t_dkv_army[0],
-                            t_dkv_army[1],
-                            p_fragment,
-                            ds_fragment,
-                            grad_frags[0],
-                            grad_frags[1],
-                            pipe_pds,
-                            pds_cons,
-                            pipe_dkv_done,
-                            dkv_prod,
-                            pipe_round,
-                            round_cons,
-                            last_iter,
-                        )
-                    )
 
                     # grads(batch1): the bundle's last batch has no
                     # score to hide under (score(0) of bundle b+1
@@ -14988,7 +14774,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             dkv_prod,
                             pipe_round,
                             round_cons,
-                            last_iter,
+                            loop_iter,
                         )
                     )
 
@@ -15015,7 +14801,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             dqb_parity,
                         )
                         if cutlass.const_expr(wave == 0):
-                            dq_acc_w = last_iter != Int32(0)
+                            dq_acc_w = loop_iter != Int32(0)
                         else:
                             dq_acc_w = cutlass.Boolean(True)
                         self._issue_dq_wave_v32(
@@ -15040,7 +14826,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         # (gen 18+w).
                         pipe_round.consumer_wait(round_cons)
                         if cutlass.const_expr(wave == 0):
-                            dq_acc_w1 = last_iter != Int32(0)
+                            dq_acc_w1 = loop_iter != Int32(0)
                         else:
                             dq_acc_w1 = cutlass.Boolean(True)
                         self._issue_dq_wave_v32(
@@ -15061,12 +14847,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_dqb_free.producer_commit(dqb_free_prod)
                     dqb_free_prod.advance()
 
-                    # v7 tail (v12 form restored): the per-bundle schedule
-                    # is fully caught up (no rotated grads block to
-                    # drain); commit dq_done -- the group commit tracks
-                    # every issued G5 wave, so the math epilogue starts
-                    # exactly on the last dQ MMA's completion edge -- then
-                    # drain the producer credits.
+                # v7 tail (v12 form restored): the per-bundle schedule
+                # is fully caught up (no rotated grads block to
+                # drain); commit dq_done -- the group commit tracks
+                # every issued G5 wave, so the math epilogue starts
+                # exactly on the last dQ MMA's completion edge -- then
+                # drain the producer credits.
+                if tile_count > Int32(0):
                     tail_token = _iket.range_start(
                         "TAIL",
                         tile_count - Int32(1),
@@ -15082,6 +14869,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         tail_token,
                         tile_count - Int32(1),
                     )
+
         elif warp_idx == Int32(self.LOAD_WARP):
             # --- load, v6 (amendment #1): the Q/dO STRIP stream +
             # 20 round gens per bundle.  Per bundle: 4 strip-pair gens
@@ -17397,34 +17185,37 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 # r1 fill -> W17 strip -> S_ISSUE).
 # ======================================================================
 # ======================================================================
-# TAIL-CHAIN COMPRESSION ADDENDUM (log [tail-recon-final], 2026-08-05):
-# two independent wall-clock reorders, zero bytes, zero protocol
-# change (no pipeline/mbar creation, helper body, or SMEM/TMEM line
-# is touched; every per-pipeline generation ORDER is verbatim
-# unchanged -- symbolic projections checked for N=1,2,3,16):
+# TAIL-CHAIN COMPRESSION ADDENDUM (log [tail-recon-final]/[tail-r2],
+# 2026-08-05): ONE wall-clock reorder is live -- zero bytes, zero
+# protocol change (no pipeline/mbar creation, helper body, or
+# SMEM/TMEM line is touched; every per-pipeline generation ORDER is
+# verbatim unchanged, symbolic projections checked for N=1,2,3,16):
 #
-# [tail-R1] W17 strip split 2+2: gens {0,1}(b+1) are filled from
-# inside iteration b, between the last wide-gen commit and the g16
-# ring acquire (the ~2.6-3.1 us park window), with bundle-0's pair
-# peeled up front and the last iteration peeled hoist-less.  Their
-# acquire credits (pass 1(b) strip releases) open ~27 us before the
-# boundary (v9lb MAT_ACQ ord 0/1 park = 0.03 us), so the boundary
-# chain sheds the ~1.3 us strip link.
-# [tail-R3] Leader cross-bundle rotation (placement B): pass 0(b+1)
-# -- kres wait(b+1) + the full _issue_score_pass_v6(0) call -- moves
-# between the G5 r0 and G5 r1 wave loops of bundle b; pass 0(0) is
-# peeled as a prologue and the last iteration is peeled hoist-less.
-# The ~2 us leader-serial issue plus ~0.3-0.6 us execution tail hide
-# inside the kdq-r1 fill bubble; math(b+1)'s WAIT_S clears ~5 us
-# earlier and its T2R/softmax overlap the old tail.  The math-side
-# dqb_free wait (G5 r1(b) retirement) may become a visible ~0.4 us
-# MATH_PDS_ACQ segment -- budgeted in the estimate.
+# [tail-R1] (LIVE) W17 strip split 2+2: gens {0,1}(b+1) are filled
+# from inside iteration b, between the last wide-gen commit and the
+# g16 ring acquire (the ~2.6-3.1 us park window), with bundle-0's
+# pair peeled up front and the last iteration peeled hoist-less.
+# Their acquire credits (pass 1(b) strip releases) open ~27 us before
+# the boundary (v9lb MAT_ACQ ord 0/1 park = 0.03 us), so the boundary
+# chain sheds the ~1.3 us strip link.  LOAD_QDO/MAT_ACQ payload
+# SEMANTICS are unchanged (same names, sets, counts); the gen 0/1
+# spans merely land ~one bundle earlier in wall-clock (the L2-lite
+# LOAD_K precedent).
 #
-# Span payload SEMANTICS are unchanged everywhere (same names, same
-# payload sets, same counts): LOAD_QDO gens 0/1 and S_ISSUE(4b+0/1)/
-# dP_ISSUE(2b) merely land ~one bundle earlier in wall-clock (the
-# L2-lite LOAD_K precedent).  Trace hooks: WAIT_S(8(b+1)) end should
-# move from boundary +7..+9.6 to <= +3; dVdK_ISSUE(16(b+1)) from
-# ~+13.9 to ~+6.5; expected -3~3.5 us/bundle release-side
-# (19.09 -> ~17.2-17.6 ms band).
+# [tail-R3] (RETRACTED) Leader cross-bundle rotation (placement B)
+# was built, committed (f8209c9) and rolled back after the hardware
+# verdict: correctness 4/4 but release 19.558 vs 19.093 ms = +2.4%
+# on the combined build.  Failure-mode hypothesis (log [tail-r2];
+# attribution pending an R1-only run): the hoisted pass 0(b+1)
+# carries BLOCKING waits (strip stage 0/1, kres) into the G5
+# mid-window on the leader's serial stream -- if strips {0,1}(b+1)
+# have not landed by then (the readiness premise came from the v9-LB
+# trace; the L2-lite regime shifts the W17/gather phase and adds
+# mid-bundle LOAD_K bandwidth), the leader stalls BETWEEN G5 r0 and
+# G5 r1, strictly worse than the same wait at the old bundle-head
+# position.  A future placement-C needs a NON-BLOCKING readiness
+# probe (e.g. _mbarrier_try_wait on the strip full edge) selecting
+# between two statically peeled bodies (pipeline-state advances may
+# not sit under a runtime branch).  The leader region is byte-
+# identical to 035ddf3 again.
 # ======================================================================
