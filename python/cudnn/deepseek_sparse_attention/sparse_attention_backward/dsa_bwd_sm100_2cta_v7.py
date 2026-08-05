@@ -15883,57 +15883,45 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     (token_idx, batch_idx),
                 ]
 
-        # [v11-F] Row-ROTATING order, from the v11-E silicon verdict:
-        # cutting 60% of this loop's instructions made it 2% SLOWER, so
-        # the address arithmetic was riding free under atomic latency
-        # while the ORIGINAL pair order was doing hidden work -- its
-        # ABABABAB pattern sent consecutive atomics to two far-apart kv
-        # rows, i.e. different L2 atomic banks, and row-major grouping
-        # serialized four of them onto one row.  Here the four rows
-        # rotate (A,B,C,D,A,B,C,D...), spreading consecutive atomics
-        # FOUR ways instead of the original two, while keeping v11-E's
-        # verified index-load reduction (16 -> 4).  The bounds
-        # predicate returns to per-pair, but now reads a preloaded
-        # register instead of chasing an index load.
-        for k in cutlass.range_constexpr(4):
-            for slot in cutlass.range_constexpr(4):
-                kv_index = pre_kv_index[slot]
+        for slot in cutlass.range_constexpr(4):
+            kv_index = pre_kv_index[slot]
+            if kv_index >= Int32(0):
+              for k in cutlass.range_constexpr(4):
                 i = (slot // 2) * 8 + 2 * k + (slot % 2)
                 v0 = 2 * i
                 v1 = v0 + 1
-                if kv_index >= Int32(0):
-                    rdkv_frg = cute.make_rmem_tensor(
-                        (2,),
-                        self.acc_dtype,
+                rdkv_frg = cute.make_rmem_tensor(
+                    (2,),
+                    self.acc_dtype,
+                )
+                rdkv_frg[0] = thread_values_dv[v0]
+                rdkv_frg[1] = thread_values_dv[v1]
+                # D within the block = 64 * h(fold half, mode [0,1])
+                # + n (mode [1]); the block's GMEM quadrant is d_round.
+                d_local = Int32(
+                    cute.get(
+                        thread_coordinates[v0],
+                        mode=[1],
                     )
-                    rdkv_frg[0] = thread_values_dv[v0]
-                    rdkv_frg[1] = thread_values_dv[v1]
-                    # D within the block = 64 * h(fold half, mode [0,1])
-                    # + n (mode [1]); the block's GMEM quadrant is d_round.
-                    d_local = Int32(
-                        cute.get(
-                            thread_coordinates[v0],
-                            mode=[1],
-                        )
-                    ) + Int32(
-                        cute.get(
-                            thread_coordinates[v0],
-                            mode=[0, 1],
-                        )
-                    ) * Int32(2 * self.N_TILE_CTA)
-                    dkv_row = mdKV_acc[
-                        None,
-                        kv_index,
-                        (0, batch_idx),
-                    ]
-                    tile_row = cute.flat_divide(dkv_row, (128,))
-                    quad_row = tile_row[None, d_round]
-                    pair_row = cute.flat_divide(quad_row, (2,))
-                    target_frg = pair_row[None, d_local // Int32(2)]
-                    cute.arch.atomic_add(
-                        target_frg.iterator.llvm_ptr,
-                        rdkv_frg.load(),
+                ) + Int32(
+                    cute.get(
+                        thread_coordinates[v0],
+                        mode=[0, 1],
                     )
+                ) * Int32(2 * self.N_TILE_CTA)
+                dkv_row = mdKV_acc[
+                    None,
+                    kv_index,
+                    (0, batch_idx),
+                ]
+                tile_row = cute.flat_divide(dkv_row, (128,))
+                quad_row = tile_row[None, d_round]
+                pair_row = cute.flat_divide(quad_row, (2,))
+                target_frg = pair_row[None, d_local // Int32(2)]
+                cute.arch.atomic_add(
+                    target_frg.iterator.llvm_ptr,
+                    rdkv_frg.load(),
+                )
         _iket.range_end(
             reduce_atomic_token,
             issue_seq,
