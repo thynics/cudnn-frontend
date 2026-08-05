@@ -163,9 +163,3 @@
   (4) 手术面分级（C1）：F1 中危 = _drain_dkv_fused_v52（v5.2 冻结 helper @15693）解冻拆 [wait+T2R+fuse]/[atomic] 两段 + reduce 角色内环重构（@14546-14578；解码/原子体逐字复制断言锚定，try-wait 门 + 末单元剥离）——**全案唯一手术区**；F2 零改 = 协议创建层/SMEM/TMEM/leader/math/W17/gather/relay 全平面；span：WAIT_dK/REDUCE_T2R/REDUCE_ATOMIC 三名保留、payload 不变（跨单元墙钟交叠属语义注记入尾注），29/29 名集零增删。
   (5) 推荐与格局：**C1 单独成刀 = v11 本体；A/B 归档**。边界洞 9.85µs 的真解药在生产侧——v10 死后唯余 h128 单 stage 粗化（压 score 窗，杠杆队列现任主候选），与 C1 完全正交（C1 只动 reduce 警）可叠加：双兑现账面周期 → ~25-27µs、占空比 → ~65-70%；占空比 →90% 终局还需边界洞归零 = 生产侧软件流水（S(0) 跨 bundle 类，placement-C 探测门约束下重启）= 另批 spec。全部收益数为 trace 制（37.05µs/bundle），e2e 带已按 release 21.6/37 折算。
   本轮改动：内核零字节；本文件 2 条日志（z1 心跳 + 本终报）为唯一写入。
-[v11-C1 落刀·协调者本人] drain 软件流水实施（Fable 5 主会话直接实现，非 agent）。形态（比侦察案更简，零运行时分支）：
-  (1) 拆分：_drain_dkv_fused_v52 拆为 _drain_t2r_views_v11（几何，逐字提取，lesson #15 家族内派生保持）+ _drain_head_v11（wait×2/T2R×2/fence/release×2/fuse，dv_prefetched 为 Constexpr 双模）+ _drain_atomics_v11（原子段逐字复制，触 TMEM/mbar 为零）+ _drain_prefetch_dv_v11（提升的 dV 等待+取数发射）。旧 helper 定义留存零调用（防 booby-trap 台账）。
-  (2) 调度：8 单元 constexpr 全展开。单元 0 走原路（其等待 = bundle 边界生产空洞，永不提升，l2l 剥离纪律）；单元 1-7 的 dV wait+copy 提升至**前一单元原子流之下**，ping-pong 双寄存器组承接（峰值 = fused(u)32 + dv(u+1)32 = 64 值 == 现役峰值，侦察半提升账兑现）。
-  (3) 探测门（设计律 b）以**无分支形态**满足：consumer_try_wait 取 token → consumer_wait(state, token) 常见路径跳过屏障（API 语义远端核实：token 真 = 已就绪跳过、不推进状态）；无运行时分支、无谓词内状态推进（fix-r7 纪律零妥协）。风险基础：环内 WAIT_dK 实测 0.08µs≈0 ⇒ bundle 内世代恒早就绪，提升的等待不构成新阻塞点。
-  (4) 自证：序恒等（8 单元 (pair,d_round,payload) 三元组与原双层循环逐项相同，脚本验）；协议守恒（16 wait/16 release/bundle == leader 16 提交）；span 名/payload 零变（跨单元墙钟交叠为语义注记）；SMEM/TMEM/其余角色零字节。py_compile OK。
-  (5) 判读钩子：REDUCE_T2R 均值应塌缩（预取后 fence 已付）、单元节拍 3.42→~2.2-2.6µs、leader 环等待 16.6µs 同步收缩、e2e 预估 19.09 → ~15.5-16.5ms。
