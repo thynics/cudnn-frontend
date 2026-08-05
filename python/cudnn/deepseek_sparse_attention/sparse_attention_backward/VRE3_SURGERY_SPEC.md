@@ -26,6 +26,11 @@ dP 排到迭代尾部的修法都会让 [dP→math→pub→grads] 串进约束�
 - 信用算术（r2 复核）：f0(组k) 等 kdq(组k−1) 的 dq 读（iter k ~+3.8）⇒
   grads(k) 于 iter k+1 +1.4 全预填；kdq(组k) 等自组 f4 释放（+2.6）⇒
   dq 尾部停顿 ~0.5（预算内）。预期 period 4.5-5.0 不变。
+- **r4 死锁修正（r3 dense 30s 挂死尸检）**：单线程 W17 上，若 dos(k+1) 排在
+  "依赖 leader 迭代 k+1 进度"的 ring gen（组 k 的 gen4+，等 grads(k) 释放）
+  之后，则与 leader 的 [S, dP, grads] 序闭合成四方互等环。定序定律：
+  **dos(k+1) 必须先于组 k 的全部 ring gen 生产**。实现：dos(0) 入 prologue；
+  环内 dos 块置于迭代头、供下一迭代、末迭代跳过（动态 if，has_prev 先例）。
 
 以下 r1 原文中与本节冲突处（dOscore 入主环、16 gen、整板 TMA、消费滞后
 论证）一律以 r2 为准。

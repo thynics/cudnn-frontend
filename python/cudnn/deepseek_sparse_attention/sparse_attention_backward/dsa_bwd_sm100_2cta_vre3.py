@@ -13724,46 +13724,85 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         Int32(0),
                     )
 
+                # vre_3 r4: tile 0's dos block (dP(0)'s four score-A
+                # chunks) runs in the prologue so the in-loop blocks can
+                # feed iteration k+1 (deadlock-fix ordering).
+                load_qdo_token = _iket.range_start(
+                    "LOAD_QDO",
+                    Int32(1),
+                )
+                for dos_chunk in cutlass.range_constexpr(
+                    self.K_CHUNKS
+                ):
+                    pipe_dos.producer_acquire(dos_acq)
+                    dos_acq.advance()
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            dos_tma_mbar,
+                            score_a_stage_bytes,
+                        )
+                    cute.copy(
+                        tma_atom_dos,
+                        t_dos_gmem[None, 0, dos_chunk],
+                        t_dos_smem[None, dos_chunk % 2],
+                        tma_bar_ptr=dos_tma_mbar,
+                    )
+                    cute.arch.mbarrier_wait(
+                        dos_tma_mbar,
+                        dos_tma_phase,
+                    )
+                    dos_tma_phase = Int32(1) - dos_tma_phase
+                    with cute.arch.elect_one():
+                        pipe_dos.producer_commit(dos_com)
+                    dos_com.advance()
+                _iket.range_end(
+                    load_qdo_token,
+                    Int32(1),
+                )
+
                 for loop_iter in cutlass.range(tile_count):
                     tile_index = (
                         tile_count - Int32(1) - loop_iter
                     )
-                    # vre_3 r2: dP(t)'s four score-A chunks through the
-                    # DEDICATED 2-slot dos stream (chunk c -> slot c%2),
-                    # off the main ring entirely -- the leader's dP stays
-                    # at its iteration head with no FIFO-order coupling.
-                    load_qdo_token = _iket.range_start(
-                        "LOAD_QDO",
-                        loop_iter + Int32(1),
-                    )
-                    for dos_chunk in cutlass.range_constexpr(
-                        self.K_CHUNKS
-                    ):
-                        pipe_dos.producer_acquire(dos_acq)
-                        dos_acq.advance()
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive_and_expect_tx(
-                                dos_tma_mbar,
-                                score_a_stage_bytes,
+                    # vre_3 r4 (deadlock fix): this dos block feeds the
+                    # NEXT leader iteration's dP -- it must precede every
+                    # ring gen whose credit needs leader progress beyond
+                    # that dP (single-warp W17 program order chains them).
+                    # Tile 0's block lives in the prologue; the last
+                    # iteration produces none (no dP(t) consumes it).
+                    if loop_iter < tile_count - Int32(1):
+                        load_qdo_token = _iket.range_start(
+                            "LOAD_QDO",
+                            loop_iter + Int32(2),
+                        )
+                        for dos_chunk in cutlass.range_constexpr(
+                            self.K_CHUNKS
+                        ):
+                            pipe_dos.producer_acquire(dos_acq)
+                            dos_acq.advance()
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(
+                                    dos_tma_mbar,
+                                    score_a_stage_bytes,
+                                )
+                            cute.copy(
+                                tma_atom_dos,
+                                t_dos_gmem[None, 0, dos_chunk],
+                                t_dos_smem[None, dos_chunk % 2],
+                                tma_bar_ptr=dos_tma_mbar,
                             )
-                        cute.copy(
-                            tma_atom_dos,
-                            t_dos_gmem[None, 0, dos_chunk],
-                            t_dos_smem[None, dos_chunk % 2],
-                            tma_bar_ptr=dos_tma_mbar,
+                            cute.arch.mbarrier_wait(
+                                dos_tma_mbar,
+                                dos_tma_phase,
+                            )
+                            dos_tma_phase = Int32(1) - dos_tma_phase
+                            with cute.arch.elect_one():
+                                pipe_dos.producer_commit(dos_com)
+                            dos_com.advance()
+                        _iket.range_end(
+                            load_qdo_token,
+                            loop_iter + Int32(2),
                         )
-                        cute.arch.mbarrier_wait(
-                            dos_tma_mbar,
-                            dos_tma_phase,
-                        )
-                        dos_tma_phase = Int32(1) - dos_tma_phase
-                        with cute.arch.elect_one():
-                            pipe_dos.producer_commit(dos_com)
-                        dos_com.advance()
-                    _iket.range_end(
-                        load_qdo_token,
-                        loop_iter + Int32(1),
-                    )
 
                     # g0..g7: panel TMA fills, pipelined depth 2.  The
                     # commit for gen q-1 happens after gen q's TMA is in
