@@ -12932,8 +12932,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             # vc_3: the loan now alternates dO/Q contents, so
                             # the vc_2 unchanged-bytes recommit is gone -- the
                             # final tail tile takes a REAL dO refill and a
-                            # REAL Q refill before the potentially blocking
-                            # last-kdq rendezvous.
+                            # REAL Q refill.  ORDER IS LOAD-BEARING: the final
+                            # loanQ acquire waits the final grads' own dV
+                            # passes, and those sit behind dQ, which needs the
+                            # last kdq generations -- so the kdq rendezvous
+                            # MUST run between the two final fills or the
+                            # gather/leader pair deadlocks (r1 lesson).
                             pipe_kscore.producer_acquire(gather_state)
                             loan_phase = self._fill_score_loan_do_r0_vc2(
                                 rank,
@@ -12946,22 +12950,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 t_dot_gmem,
                                 t_dot_loan_smem_a,
                                 t_dot_loan_smem_b,
-                                grad_a_stage_bytes,
-                            )
-                            pipe_kscore.producer_commit(gather_state)
-                            gather_state.advance()
-                            pipe_kscore.producer_acquire(gather_state)
-                            loan_phase = self._fill_score_loan_do_r0_vc2(
-                                rank,
-                                warp_idx,
-                                stationary_q_raw,
-                                score_kv_raw,
-                                loan_tma_mbars,
-                                loan_phase,
-                                tma_atom_qt,
-                                t_qt_gmem,
-                                t_qt_loan_smem_a,
-                                t_qt_loan_smem_b,
                                 grad_a_stage_bytes,
                             )
                             pipe_kscore.producer_commit(gather_state)
@@ -12980,6 +12968,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 kv_copy_atom,
                                 kv_thread_copy,
                             )
+                            pipe_kscore.producer_acquire(gather_state)
+                            loan_phase = self._fill_score_loan_do_r0_vc2(
+                                rank,
+                                warp_idx,
+                                stationary_q_raw,
+                                score_kv_raw,
+                                loan_tma_mbars,
+                                loan_phase,
+                                tma_atom_qt,
+                                t_qt_gmem,
+                                t_qt_loan_smem_a,
+                                t_qt_loan_smem_b,
+                                grad_a_stage_bytes,
+                            )
+                            pipe_kscore.producer_commit(gather_state)
+                            gather_state.advance()
                         else:
                             next_iter = score_iter + Int32(1)
                             load_k_token = _iket.range_start(
