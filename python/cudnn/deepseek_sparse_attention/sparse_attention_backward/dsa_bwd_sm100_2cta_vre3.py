@@ -12335,7 +12335,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.select(
                 (
                     self.H_TILE_CLUSTER,
-                    self.SCORE_MMA_N,
+                    self.N_TILE,
                     self.K_CHUNK,
                 ),
                 mode=[0, 2],
