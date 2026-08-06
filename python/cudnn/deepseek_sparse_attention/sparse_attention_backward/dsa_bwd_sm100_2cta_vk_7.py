@@ -11964,9 +11964,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         groups_total = self.GATHER_THREADS // self.KV_GROUP_SIZE
         rows_per_group = self.N_TILE // groups_total
         assert rows_per_group == 4
+        # v8's exact trace-time form: the comprehension is pure Python,
+        # and the statement loop iterates a Python list (unrolled), NOT
+        # range() -- which the DSL intercepts as a dynamic scf.for that
+        # forbids list growth (r1 compile-gate lesson).
+        kdq_local_n = [
+            row_iteration * groups_total + group_index
+            for row_iteration in range(rows_per_group)
+        ]
         kdq_kv_index = []
-        for row_iteration in range(rows_per_group):
-            local_n = row_iteration * groups_total + group_index
+        for local_n in kdq_local_n:
             global_n = tile_index * Int32(self.N_TILE) + Int32(
                 local_n
             )
