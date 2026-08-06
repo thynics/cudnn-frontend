@@ -101,6 +101,24 @@ interface 层 `cuTensorMapEncodeTiled`（cuda-python bindings）手工编码 128
 - ROUTE_K 大降但 release null ⇒ 停，转 pacer 判读（MAT_QDO / PDS）；
 - 死锁面：W17 新等待 = gather4 mbar；若挂，首查 expect_tx 字节数与实际笔数乘积。
 
+## 5.5 双视图桌面探针终判（2026-08-06，probe_vgpt_dualview r1/r2）
+
+- **S2（score_kv→dq-A own-half alias，K2b）：真 FAIL，永久关闭。**
+  score_kv 按 [own-n32×d64] 4KB 块装（d-半块 stride 2048 元素），dq-A 规范形态
+  要求 4096；仅 (d<64,n<32) 象限字节重合。K2 可建形态的 own 半永久落在 S2S 拷贝腿。
+- **S1（panel→dkv-A 零拷贝视图）：布局锁 PASS，描述符锁 FAIL。**
+  字节层恒等成立（4 窗 × 8192 点零失配，偏移 = 4096·(d0/64) 元素；修正 V2
+  tiler K=H64 后 dkv-A 与 dq-A 同构）。**但消费不可行**：CG2 单描述符地址在
+  两 CTA 各自 SMEM 同偏移解释，每个 h-pass 两 CTA 都需要该 h 的字节——owner
+  侧在面板、peer 侧在环槽，地址不对称即违反描述符锁。面板改 d-split 可解 dkv
+  侧却破坏 score-A（CG2 的 K 维须每 CTA 全量持有 D512）。**own-h×full-D（score
+  要求）与 own-d×full-h（dkv 要求）在 128KB/CTA 下不可调和；全量面板需 256KB
+  = Rubin 容量。** 面板代的"视图化删除"在 SM100 上关闭；SM100 剩余面板杠杆
+  = owner-push（方向 B，改运输不删代）。
+- 方法论备注：本探针只测了四锁链的第 1 锁（布局）就冠名"主钥匙"，第 2 锁
+  （描述符 rank 对称）纸面即可先判——**四锁链应按锁序过，先纸面后探针**。
+  布局恒等这个事实本身归档备用（d-split 重分区/方向 C/Rubin 形态直接受益）。
+
 ## 5. 提案对照记录（外部 agent 方案的三处修正已另行回复）
 
 R3-Late 的 16KB union 地址不连续（ds_blocks 隔断）；PANEL-MCAST 几何不成立
