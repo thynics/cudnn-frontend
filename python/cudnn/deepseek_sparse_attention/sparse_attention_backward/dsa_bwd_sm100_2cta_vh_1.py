@@ -14104,11 +14104,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         Both done pipelines take their credit up front and commit once, at
         the end of the pass: a tcgen05 commit tracks every MMA issued
         before it, so one commit per plane covers all four segments.
+
+        Trace contract (vh_1): the two issue names now denote the two
+        D-HALVES of the interleaved pass, not the two planes -- each span
+        carries half of both planes' atoms.  The segment-0 wait sits BEFORE
+        the first span and the segment-2 wait BETWEEN the two, so a supply
+        starve reads as a pre-span or inter-span gap instead of inflating
+        an issue span (the v7 D-half convention); only the segment-1 and
+        segment-3 waits remain inside, one per span, symmetrically.
+
         RETURNS the advanced (kscore, s, dp) states.
         """
 
         s_done_pipeline.producer_acquire(s_producer_state)
         dp_done_pipeline.producer_acquire(dp_producer_state)
+        # edge: the gather's segment-0 commit -- kept outside the spans so
+        # the tile-head supply wait stays measurable as a gap.
+        kscore_pipeline.consumer_wait(kscore_state)
         score_issue_token = _iket.range_start(
             "S_ISSUE(i)",
             issue_seq,
@@ -14118,24 +14130,37 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         k_blocks_per_chunk = cute.size(k_fragment, mode=[2])
         for chunk in cutlass.range_constexpr(self.K_CHUNKS):
             slot = chunk % self.K_SEG_STAGES
-            # edge: the gather's per-segment commit.
-            kscore_pipeline.consumer_wait(kscore_state)
             if cutlass.const_expr(chunk == 0):
                 s_mma.set(tcgen05.Field.ACCUMULATE, False)
                 dp_mma.set(tcgen05.Field.ACCUMULATE, False)
-            if cutlass.const_expr(chunk == self.K_CHUNKS - 1):
-                _iket.range_end(
-                    score_issue_token,
-                    issue_seq,
-                )
-                score_issue_token = _iket.range_start(
-                    "dP_ISSUE(i)",
-                    issue_seq,
-                )
-            for k_block in cutlass.range_constexpr(
-                k_blocks_per_chunk
-            ):
-                if s_producer_state.index == Int32(0):
+            if cutlass.const_expr(chunk > 0):
+                # Segments 1 and 3 are waited inside their own span;
+                # segment 2's wait brackets the D-half boundary so it
+                # reads as an inter-span gap.
+                if cutlass.const_expr(
+                    chunk == self.K_CHUNKS // 2
+                ):
+                    _iket.range_end(
+                        score_issue_token,
+                        issue_seq,
+                    )
+                    kscore_pipeline.consumer_wait(kscore_state)
+                    score_issue_token = _iket.range_start(
+                        "dP_ISSUE(i)",
+                        issue_seq,
+                    )
+                else:
+                    kscore_pipeline.consumer_wait(kscore_state)
+            # The ping-pong test is hoisted OUT of the k-block body: a
+            # per-atom runtime branch is what tripled v3's issue cost and
+            # blew the leader's register budget.  Both planes take their
+            # credit and commit together on the same 2-stage pipeline, so
+            # their stage indices are equal and ONE test per segment
+            # selects both accumulators.
+            if s_producer_state.index == Int32(0):
+                for k_block in cutlass.range_constexpr(
+                    k_blocks_per_chunk
+                ):
                     cute.gemm(
                         s_mma,
                         t_score_0,
@@ -14143,7 +14168,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         k_fragment[None, None, k_block, slot],
                         t_score_0,
                     )
-                else:
+                    cute.gemm(
+                        dp_mma,
+                        t_dp_0,
+                        do_fragment[None, None, k_block, chunk],
+                        dp_k_fragment[None, None, k_block, slot],
+                        t_dp_0,
+                    )
+                    s_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    dp_mma.set(tcgen05.Field.ACCUMULATE, True)
+            else:
+                for k_block in cutlass.range_constexpr(
+                    k_blocks_per_chunk
+                ):
                     cute.gemm(
                         s_mma,
                         t_score_1,
@@ -14151,15 +14188,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         k_fragment[None, None, k_block, slot],
                         t_score_1,
                     )
-                if dp_producer_state.index == Int32(0):
-                    cute.gemm(
-                        dp_mma,
-                        t_dp_0,
-                        do_fragment[None, None, k_block, chunk],
-                        dp_k_fragment[None, None, k_block, slot],
-                        t_dp_0,
-                    )
-                else:
                     cute.gemm(
                         dp_mma,
                         t_dp_1,
@@ -14167,8 +14195,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         dp_k_fragment[None, None, k_block, slot],
                         t_dp_1,
                     )
-                s_mma.set(tcgen05.Field.ACCUMULATE, True)
-                dp_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    s_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    dp_mma.set(tcgen05.Field.ACCUMULATE, True)
             # The release is UMMA-tracked: it fires once this segment's
             # own reads retire, so the gather may refill slot c % 2 while
             # the next segment is already being issued.

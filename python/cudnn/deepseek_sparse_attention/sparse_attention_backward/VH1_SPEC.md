@@ -100,3 +100,41 @@ tracked set 覆盖交错链——与 v7.py 的 pass 尾双 commit 同构）。
 
 **风险提示**：kscore 现为 2-stage、每 tile 4 gen（4 mod 2 = 0，相位安全）；
 leader 必须**每段 release 一次**，否则 gather 在第 3 段 acquire 上死锁。
+
+---
+
+## Trace 采集 review（2026-08-06，上机前）
+
+**查了四项，两项发现问题并已修**：
+
+| 项 | 结论 |
+|---|---|
+| IKET 名额 | 31 个，与 vc_2/vg_5 完全相同，**零新增**（工具链上限内，vc_2 trace 已验证 31 可用） |
+| span 基数契约 | MAT_QDO **2/tile**（vd_1 正是死在这里：只发 1 → aggregator 报 observed 32 vs expected 64）；ROUTE_K 1、LOAD_K 1、S_ISSUE/dP_ISSUE 各 1、dVdK_ISSUE 8、dQ_ISSUE 2 —— 全部与 vc_2 一致 |
+| **等待落在 issue span 内**（已修） | 见下 |
+| **ping-pong 分支在最内层**（已修） | 见下 |
+
+### 修复 1：kscore 等待与 issue span 的分离
+
+段环让 leader 每 tile 等 4 次 K（vc_2 只等 1 次且在 span 外）。初版把 4 次全包进
+S_ISSUE/dP_ISSUE —— **供给饥饿会伪装成"发射变慢"**，正是 harness 契约
+（"pure issue ranges must remain separate from intervening waits"）点名禁止的形态。
+
+改为 v7 的 D-half 约定：段 0 的等待**提到首个 span 之前**（tile 头供给缺口 = 前置 gap），
+段 2 的等待**夹在两个 span 之间**（= inter-span gap），段 1/3 各留一个在自己 span 内
+（对称，流式消费不可避免）。**两个名字的语义随之改变**：在 vh_1 里
+`S_ISSUE`/`dP_ISSUE` 表示交错 pass 的**两个 D 半区**（每个含两个平面各一半的 atom），
+不再是"S 平面 / dP 平面"——读 trace 与跨版本比较时必须按此口径。
+
+### 修复 2：累加器 ping-pong 分支上提
+
+初版在**每个 atom** 上做 `producer_state.index == 0` 的运行时测试
+（4 chunk × k_blocks × 2 = 数十次/tile）——v3/v4 的血账正是"完全展开的发射体
+把 leader 撑爆寄存器、每 atom 发射成本三倍"。已上提到 **segment 层**：
+两个平面共用同一条 2-stage 管线、同拍 acquire/commit，故 stage index 恒相等，
+**一次测试同时选中两个累加器**（8 次/tile）。
+
+### 未加 span 的已知盲区（供读 trace 时注意）
+
+pad 代的 wait/release 不在任何 span 内。W17 对 pad 是 acquire→立即 commit（零工作），
+正常不阻塞；若环满导致阻塞，会表现为 grads 尾之后一段**无归属的 gap**。
