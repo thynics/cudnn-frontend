@@ -1,4 +1,12 @@
-"""vk_3: vk_2 + stmatrix dQ epilogue (P1: the tail scatter surgery).
+"""vk_3 r2: vk_2 + stmatrix dQ epilogue (P1); r1 rank fix.
+
+r1 hit its own build-gate at compile: partition_D received the flat 2-D
+staging tensor while the tiled copy's tiler carries the fragment-C
+rank-4 profile.  r2 mirrors the publish recipe verbatim -- the staging
+is re-viewed as ((tile), 1, 1, 1) with unit rest modes over the same
+swizzled bytes (inner-swizzle equality asserted against the TMA-side
+layout), partitioned, mode[4]-asserted and sliced exactly like
+ds_image_store.  The TMA path keeps the flat 2-D view.
 
 The dQ epilogue staged each [H128, D128] round through 128 scalar
 STS.U16 per thread (the (d,h)->[H,D] transpose absorbed by indexed
@@ -1552,6 +1560,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         dq_tmem_load: cute.CopyAtom,
         rank_coordinates: cute.Tensor,
         s_dq_epi: cute.Tensor,
+        s_dq_epi_store: cute.Tensor,
         tma_atom_dq_epi: cute.CopyAtom,
         tma_tensor_dq_epi: cute.Tensor,
         round_index: cutlass.Constexpr[int],
@@ -1626,12 +1635,20 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             )
             thread_copy_r2s = tiled_copy_r2s.get_slice(mtx)
             r_dq_store = thread_copy_r2s.retile(r_dq)
-            t_rs_dq = thread_copy_r2s.partition_D(s_dq_epi)
-            assert cute.size(r_dq_store) == cute.size(t_rs_dq)
+            t_rs_dq = thread_copy_r2s.partition_D(
+                s_dq_epi_store
+            )
+            assert cute.size(t_rs_dq, mode=[4]) == 1
+            t_rs_dq_tile = t_rs_dq[
+                None, None, None, None, 0
+            ]
+            assert cute.size(r_dq_store) == cute.size(
+                t_rs_dq_tile
+            )
             cute.copy(
                 tiled_copy_r2s,
                 r_dq_store,
-                t_rs_dq,
+                t_rs_dq_tile,
             )
         cute.arch.fence_view_async_shared()
         self.math_barrier.arrive_and_wait()
@@ -12284,6 +12301,47 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ),
             dq_epi_layout_staged.outer,
         )[None, None, 0]
+        # vk_3 r2: partition_D expects the fragment-C rank-4 profile, not
+        # a flat 2-D tensor (r1 build-gate: "input rank smaller than tiler
+        # rank").  Mirror the publish recipe verbatim: wrap the epi store
+        # layout as ((tile), 1, 1, 1) over the same staging bytes, with
+        # the swizzle equality asserted against the TMA-side layout.
+        dq_store_layout = sm100_utils.make_smem_layout_epi(
+            self.element_dtype,
+            utils.LayoutEnum.COL_MAJOR,
+            (self.D_TILE_CTA, self.H_TILE_CLUSTER),
+            1,
+        )
+        assert (
+            dq_store_layout.inner
+            == dq_epi_layout_staged.inner
+        )
+        assert (
+            cute.cosize(dq_store_layout)
+            == cute.cosize(dq_epi_layout_staged)
+        )
+        dq_store_domain = cute.make_layout(
+            (
+                dq_store_layout.outer.shape,
+                1,
+                1,
+                1,
+            ),
+            stride=(
+                dq_store_layout.outer.stride,
+                0,
+                0,
+                0,
+            ),
+        )
+        s_dq_epi_store = cute.make_tensor(
+            cute.recast_ptr(
+                storage.score_kv.data_ptr(),
+                dq_store_layout.inner,
+                self.element_dtype,
+            ),
+            dq_store_domain,
+        )
         round_kd = (
             storage.round_buf_a.get_tensor(
                 dq_a_layout_staged.outer,
@@ -13605,6 +13663,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     dq_tmem_load,
                     rank_dq_coordinates,
                     s_dq_epi,
+                    s_dq_epi_store,
                     tma_atom_dq_epi,
                     tma_tensor_dq_epi,
                     0,
@@ -13626,6 +13685,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     dq_tmem_load,
                     rank_dq_coordinates,
                     s_dq_epi,
+                    s_dq_epi_store,
                     tma_atom_dq_epi,
                     tma_tensor_dq_epi,
                     1,
