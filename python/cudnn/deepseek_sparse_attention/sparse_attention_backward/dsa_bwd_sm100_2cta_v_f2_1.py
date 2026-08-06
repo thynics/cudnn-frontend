@@ -11851,11 +11851,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             span_seq,
         )
         # Credits for both gens are taken up front (matching W17's old
-        # two-acquire pattern) so round-1 zero rows may be written during
-        # round-0 drain without a second credit stall mid-fill.
-        pipe_round.producer_acquire(g_round_acq)
+        # two-acquire pattern).  r3: the acquires run on warp 0 ONLY, as a
+        # uniform 32-thread warp -- the exact thread shape W17's acquires
+        # had (r2's 128-thread acquire was the first-ever deviation from
+        # that shape and r2 failed correctness at 4.8%).  The barrier then
+        # publishes "credits held" to the other three warps, exactly like
+        # v8's handshake A did.
+        if role_tidx < Int32(32):
+            pipe_round.producer_acquire(g_round_acq)
         g_round_acq.advance()
-        pipe_round.producer_acquire(g_round_acq)
+        if role_tidx < Int32(32):
+            pipe_round.producer_acquire(g_round_acq)
         g_round_acq.advance()
         self.gather_barrier.arrive_and_wait()
 
@@ -11911,8 +11917,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         cute.arch.cp_async_wait_group(0)
         cute.arch.fence_view_async_shared()
         self.gather_barrier.arrive_and_wait()
-        if role_tidx == Int32(0):
-            pipe_round.producer_commit(g_round_com)
+        # r3: v8 commit shape restored -- the committing warp re-fences
+        # after the barrier and commits under elect_one from a uniform
+        # warp (v8's W17 did exactly this; r2 dropped the post-barrier
+        # fence and committed from a single diverged thread).
+        if role_tidx < Int32(32):
+            cute.arch.fence_view_async_shared()
+            with cute.arch.elect_one():
+                pipe_round.producer_commit(g_round_com)
         g_round_com.advance()
 
         # Round 1: fill, drain, fence, commit g1.
@@ -11941,8 +11953,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         cute.arch.cp_async_wait_group(0)
         cute.arch.fence_view_async_shared()
         self.gather_barrier.arrive_and_wait()
-        if role_tidx == Int32(0):
-            pipe_round.producer_commit(g_round_com)
+        if role_tidx < Int32(32):
+            cute.arch.fence_view_async_shared()
+            with cute.arch.elect_one():
+                pipe_round.producer_commit(g_round_com)
         g_round_com.advance()
         _iket.range_end(
             route_k_token,
