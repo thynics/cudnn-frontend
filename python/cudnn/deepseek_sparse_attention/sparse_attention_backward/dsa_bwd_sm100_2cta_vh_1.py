@@ -1,4 +1,16 @@
-"""vg_5: vg_4 + full-width exp band (all 32 EX2 in flight, zero new regs).
+"""vh_1: K segment-ring donation + round ring depth 3 (VH1_SPEC).
+
+score_kv shrinks from a resident 32KB K tile to a 2x8KB D128 segment ring
+(the gather fills and commits per segment; S/dP issue interleaves per chunk
+so each segment is read by both GEMMs before it is overwritten).  The freed
+16KB funds a third round buffer: the gradient-operand ring deepens to three
+slots, the vc_2 score-K/dO loan retires (its dead zone no longer exists) and
+the dO_r0 pair streams through the ring like every other quadrant.  Twelve
+generations per tile (ten real + two pads) keep the slot map tile-invariant
+(12 mod 3 == 0) without a 3-tile macro unroll.  The dQ epilogue staging
+relocates from score_kv to round_buf_a/b, gated by W17's ring producer_tail.
+
+Inherited vg_5 notes: full-width exp band (all 32 EX2 in flight).
 
 vg_2 widened the exponential band to eight values per h-group; vg_5 widens
 it to the whole per-thread fragment by writing each result back into
@@ -199,6 +211,9 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     D_ROUNDS = D_HEAD // D_TILE_CLUSTER
     K_CHUNK = 128
     K_CHUNKS = D_HEAD // K_CHUNK
+    # vh_1: score-B ring depth.  The base keeps the resident form
+    # (one slot per chunk); V2 narrows it to a streaming segment ring.
+    K_SEG_STAGES = K_CHUNKS
 
     DKV_MMA_TILER = (D_TILE_CLUSTER, N_TILE, H_TILE_CLUSTER)
     DQ_MMA_TILER = (D_TILE_CLUSTER, H_TILE_CLUSTER, N_TILE)
@@ -496,11 +511,15 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             self.element_dtype,
             1,
         )
+        # vh_1: the K tile streams through a K_SEG_STAGES-slot ring of
+        # D128 segments (chunk c lives at slot c % K_SEG_STAGES).  The
+        # base value equals K_CHUNKS, so every dormant class keeps its
+        # byte-identical resident layout; only V2 narrows it.
         score_b_layout_staged = sm100_utils.make_smem_layout_b(
             score_tiled_mma,
             score_tiler,
             self.element_dtype,
-            self.K_CHUNKS,
+            self.K_SEG_STAGES,
         )
         dkv_a_layout_staged = sm100_utils.make_smem_layout_a(
             dkv_tiled_mma,
