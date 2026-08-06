@@ -218,6 +218,30 @@ rank 置换的 n 序），属重构级，不是 rider。
 - 附带：vg_5_trace（3bcdde3，MAT_ACQ/MAT_WAIT/RK_ACQ 细化名额）继承共享 pds_com，
   采 C/S1 之前不可用，采定后需 rebase。
 
+## vk_7 多路复核路线表（2026-08-07，6 透镜 ×26 agent 对抗核查，14 确认/6 驳回）
+
+**pacer 精化**（全部行号+时间戳取证）：W17 busy 6.81 / period 6.94（98.2% duty）内
+**等待 ~4.96、真工作仅 ~1.9**；单笔最长等待 = g2-acquire **~2.2µs**，因果链逐 tile
+坐实：g2(t)←g0 release（dQ-r0 MMA 完成）←PDS_WAIT←math publish——**环每 tile 穿过
+math 一次**。math 真工作链 5.3-5.4（MATH_PD 分解修正：⊃PDS_ACQ，不含 T2R×2）。
+T2R_S 的 2.6× 膨胀 = 稳态干扰税（冷窗 0.512，同代码），math 全行含 20-warp 同驻税。
+
+| 序 | 路线 | 家族 | 预期(period) | 风险 | 状态 |
+|---|---|---|---|---|---|
+| R1 | **W3**：LOAD_K(t+1) 索引前提到迭代顶（藏进 loan+K-acquire 复合窗 ~1.5-2.5µs）+ kdq 索引进 K 排空影子 | 延迟暴露（6/6） | −0.1~0.4 | 低（末迭代越界+6×Int32@48reg） | **开工** |
+| R2 | **F1**：kdq 会合 barrier-B 换 cp.async 硬件到达（count-128 mbar），W17 唯一生产者不变 | 边界协议 | −0.1~0.18 | 中 | 前置：容器 wheel 读 cp.async.mbarrier.arrive 语义 ×2 |
+| R3 | M2 复活重测（vk_4 代码在库） | 条件触发 | ~0.3-0.5（**下修**：稳态拥挤地板 SOFTMAX→~1.5-1.7 非 1.1） | 低 | R1/R2 后成对判读"g2-acquire 是否前移" |
+| R4 | reducer r_topk+地址预取到 WAIT_dK 前（与 vk_7 W2 同构） | 延迟暴露 | e2e≈0（off-ring 保护性，L2 恶化时 −0.3-0.5/slot） | 极低 | 搭车 |
+
+**本轮关闭（省 4-5 个必零/负 rev）**：R3-proper（预登记 null：偶数代慢腿=TMA 只打
+本地 mbar+full barrier 在 rank0，中继跳不可删；翻案条件=偶数代滞后因果逐实例核对）｜
+kscore 次序手术（同字节租期锁死 FIFO 序，release 已最优）｜pds 拆分/加深（24KB 无源
++split-publish 前科+池守恒三重挡死）｜T2R_S 干扰刀（变现门=math 弹性池耗尽，未开）｜
+R4a（v_f1_2 已证伪，棘轮律）。
+**记账规则新增**：TAIL 与 DQ_EPI 禁止相加计入 F（TAIL ⊃ dq_done producer_tail =
+把 epilogue 又量一遍）；MATH_PD ⊃ PDS_ACQ；W17 slack 修正 0.368（94.7% duty，
+6.592/6.960，vk_2 时代 97.6% 声明不沿用）。
+
 ## 下一步（按 可兑现额 / 阻塞项）
 
 | 优先 | 杠杆 | 预期 | 阻塞 |
