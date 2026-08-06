@@ -225,3 +225,22 @@ kdq 的 2.0µs（信用 0.6 + 填充 1.4）挪到哪都串行计入，链头反�
   infra，系 vg_1 split publish 注入期卡死**（见结构性发现 #5）；VsmTopologyMapper
   报错是无害噪声（成功 run 同样打印）。baseline/vc_2 通道一直正常。
 - `.git/index.lock` 出现过陈旧残留（0 字节、无 git 进程），清理后正常。
+
+## K2 桌面判决（2026-08-06 晚）：K2a/K2b 纸面否决，改打 v_f2_1（K2c）
+
+**K2a/K2b（kdq 从 score_kv 拿字节）到货边一票否决**：kdq(t) 的 ring 槽 g0/g1(t)
+空闲 ← g6/g7(t−1) 释放 = train(t−1) 末段 dK-r1 MMA 完成（窗口 t 晚段）；而 K(t)
+死亡 = loan(t−1) 填充 ← dP(t) MMA 完成（窗口 t 早段）；loan 又喂同一 train 的头
+两个 pass。强令 copy-before-loan ⇒ copy←槽←train 末段←loan←copy，**闭环死锁**；
+暂存需 16KB（无源）；gen 重排救不了（kdq 需要 ~8 代前瞻，2 槽环只给 2 代）。
+**推论入账（vh_1 教训的推广）：共享字节 = 共享生命期 = 耦合调度。第二次 GMEM
+gather 不是浪费——它就是 kdq 填充时机与 score_kv 生命期的解耦器（且 L2 命中，
+真实代价只有发射/地址工作）。**
+
+**v_f2_1（独立前缀 v_f2）= kdq 供给段自治**：gather 警组自持 g0/g1 信用、自填、
+按 round 拆分提交（fill r0→commit g0→fill r1→commit g1）；W17 的 160 线程
+kdq_barrier 双会合退役（barrier id 7 释放），W17 仅 advance 越过这两代，直入
+panel 火车。双生产者相位记账 = vd_1 已证结构。零字节。预期：W17 串链 6.919→
+~4.9（甩掉 ROUTE_K 段）；dQ r0 提前 ~半个 fill 解锁；release −0.2~0.5ms。
+止损门：correctness 4/4；candidate ≤9.80 且 ratio 同向改善 = 采纳；≥10.0 或
+双指标矛盾 = 证伪归档；超时按 SOFT DEADLOCK 处置流程。
