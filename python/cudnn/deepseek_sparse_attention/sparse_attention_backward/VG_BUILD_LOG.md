@@ -185,6 +185,33 @@ F 账：vk_1 F≈31µs/token（trace 口径）vs baseline 6.8。
 外部复盘（~/proxy/dsa-vk1-traceable-r1）；K3（环深）必须排在 K2（kdq 退役）
 之后。CG1 混流 ISA 裁定仍未落章。
 
+## K2 定价采集（vk_2_trace @ c091522，2026-08-06，稳态 tile 9..24）
+
+- **W17 饱和在现役基座复核成立且更紧**：ROUTE_K 2.041 + MAT_QDO×2 4.878 =
+  6.919 = **97.6%** of period 7.089（vk_1 上为 6.65/6.80，97.8%）。K2 前提 ✓。
+- **判决 2 被推翻（本采集最重要的产出）**：WAIT_dQ 仅 0.071µs/次，其结束贴
+  PDS_WAIT end（+0.028/+0.112），而 kdq commit **早 ready 0.554µs**——
+  **dQ 的门是 pds 发布，不是 kdq 会合**。外部复盘"grads 块头被 kdq 顶住
+  1.3-1.6µs"在现役基座不成立。
+- 新 span 首采：PDS_WAIT 0.506、GRAD_SUP_WAIT 0.260；ROUTE_K 内信用等待
+  （前两个 MAT_ACQ）0.604。可搬上界 Σ1.370µs/tile（三段有重叠，非直接兑现额）。
+- 供给行合计：MAT_ACQ 3.708 / MAT_WAIT 1.368 / RK_ACQ 0.858。
+- dVdK gap 台账：[0.326,0.028,0.436,0.544,0.464,0.492,0.414,0.494]，
+  Σ3.198 vs vc_2 的 3.890（vg 系列净减 0.69；头部 0.99→0.33 已治愈）。
+- math 行（M2 单 warp 口径，现役基座基准）：SOFTMAX **2.047**、PDS_ACQ 1.264、
+  STORE 1.005、T2R×2 1.523——math 串链 ≈5.84，将是 K2 之后的下一个 pacer。
+
+**K2 形态修订：de-rotation 重设计降级为备选，新首选 = K2'（kdq 后置/会合隐藏）**
+判决 2 推翻后 kdq 无需退役：把 W17 的 kdq 会合从链头挪到链尾（gen 序改为
+quads 先、kdq 末两位；2+6 偶数分组 ⇒ 槽位奇偶映射不变，fragment 视图零改动），
+gather 的 ~1.4µs 填充隐藏在 4.9µs panel 火车之下；leader 侧 dQ 从 grads 块头
+移到块尾（dQ 本就是 pds 门控，挪动无代价；dq_done 仅末 tile 相关）。
+零字节、零新管线、零 DSM、无 loan/kscore 改动。**唯一定量疑点**：kdq 尾 gens
+的环信用（g6/g7 等本窗 g4/g5 的 UMMA 释放）在新节拍下何时空出——决定隐藏
+余量，等待图裁决；K3（环深 3）恰好同时缓解此信用尾，阶梯耦合仍成立。
+预期 −0.7~1.0µs/tile（period 7.09→~6.1-6.4，math 5.84 接任 pacer），按 vg_4
+实测汇率（≈0.85ms per µs/tile）折 **−0.5~0.8ms e2e**，风险低中。
+
 ## 工装备忘
 
 - trace 采集在 21:48 后连续超时（exit 124，capture_2cta 阶段）——**已重定性：非
