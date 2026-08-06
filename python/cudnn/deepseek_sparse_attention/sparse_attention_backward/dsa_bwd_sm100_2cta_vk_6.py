@@ -24,6 +24,13 @@ the cargo:
     (S/dP, dQ); the kdq_barrier machinery goes silent (init'd, never
     arrived -- harmless).
 
+r2: the loan halves are cp.async destinations for the 128-bit
+sparse-row atom, so their pointers re-assert the 16-byte alignment the
+ring slots inherited from the struct's Align[..., 1024] (r1's
+recast_ptr off the raw base carried align<16 bits> and failed IR
+verification).  score_kv is 1024-aligned and each half is 16 KiB, so
+the fact is true; the assertion follows the P/dS publish precedent.
+
 Timing edges (pre-registered): dQ slips ~1us behind the loan fill
 (absorbed -- pds release stays gated by the later dK passes); K(t+1)'s
 fill now starts after dQ's UMMA release (~+1us slack at the current
@@ -12292,24 +12299,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )[None, None, 0]
         # vk_6 (K2-swap): the kdq images live in the score_kv loan, one
         # 16KB [N64, D128] dQ-A tile per half, same staged layout the
-        # ring slots used.
-        loan_kd = (
+        # ring slots used.  r2: the halves are cp.async destinations for
+        # the 128-bit sparse-row atom, so their pointers must carry the
+        # 16-byte alignment fact the ring slots got from the struct's
+        # Align[..., 1024].  score_kv is 1024-aligned and 8192 elements
+        # is 16 KiB, so both halves are 16-byte aligned; re-assert it
+        # the way the P/dS publish does (aligned_p_ptr precedent).
+        loan_kd = tuple(
             cute.make_tensor(
                 cute.recast_ptr(
-                    score_kv_raw,
+                    cute.make_ptr(
+                        self.element_dtype,
+                        (
+                            score_kv_raw + Int32(8192 * half)
+                        ).toint(),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    ),
                     dq_a_layout_staged.inner,
                     dtype=self.element_dtype,
                 ),
                 dq_a_layout_staged.outer,
-            ),
-            cute.make_tensor(
-                cute.recast_ptr(
-                    score_kv_raw + Int32(8192),
-                    dq_a_layout_staged.inner,
-                    dtype=self.element_dtype,
-                ),
-                dq_a_layout_staged.outer,
-            ),
+            )
+            for half in range(2)
         )
         round_quad = (
             storage.round_buf_a.get_tensor(
