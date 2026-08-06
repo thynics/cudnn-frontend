@@ -119,6 +119,33 @@ interface 层 `cuTensorMapEncodeTiled`（cuda-python bindings）手工编码 128
   （描述符 rank 对称）纸面即可先判——**四锁链应按锁序过，先纸面后探针**。
   布局恒等这个事实本身归档备用（d-split 重分区/方向 C/Rubin 形态直接受益）。
 
+## 5.6 矿脉 G/B 桌面判定（2026-08-06，probe r3）
+
+**矿脉 G（粒度环）——紧凑形态死于布局锁，视图形态存疑待 S5**：
+- S3/S4 FAIL：make_smem_layout 的 K=32 紧凑 staging 与 K=64 staging 结构不同
+  （A 侧 d-半块 stride 2048 vs 4096；B 侧 swizzle 退化 SW128→SW64）。
+  "同字节自然承载两代描述符"不成立。
+- 幸存形态：**视图描述符**——K=32 的 MMA pass 直接走 K=64 布局的 h 子窗
+  （strides 不变、shape 截短、start_addr 平移 h0·64 元素；LBO/SBO 与 K=64
+  描述符相同）。canonical 合法性待 S5（mma_desc 对视图布局的接受性）。
+- 但成本清单在增长：own 半填充退化为 2×4KB 碎片（K=64 布局里 h 半区不连续）
+  ⇒ 每 tile 引擎操作 6→24 笔；v_gpt_1 验尸刚证明引擎小事务排队是真实毒性
+  （4KB 好于 512B，但计数 ×4）。混合粒度信用（kdq 沿 n、面板沿 h）设计复杂度高。
+- **处置：挂起**。S5 探针便宜可发，但即使 PASS，工程复杂度/风险比已不优于矿脉 B。
+  待 B 落地后按剩余等待再评。
+
+**矿脉 B（owner-push）——全门已过，晋升为下一个 kernel rev（v_gpt_2）**：
+- 布局锁：S1 恒等 = owner 面板窗与 ring 槽内容布局全同 ⇒ **DSM 推送是平坦
+  16KB bulk 拷贝，零转换**；
+- 描述符锁：ring 槽 rank 对称不变（只换填充来源）✓；
+- 字节锁：零新增（mbar 沿用 round_tma/round mbar 结构，DSM 落地 arm 用
+  arrive_and_expect_tx 现成手法）✓；
+- 协议锁：跨 CTA 信用可见性由 UMMA-tracked release 多播保证（v2 文档已核）；
+  死锁面 = 对称推送互等，三路径等待图（稳态/首 tile/tile_count==1）建造前必画；
+- 证据基础：v_gpt_1 验尸的 L2 压力（REDUCE_ATOMIC 1.8→3.49）+ 每 CTA 每 tile
+  省 48-64KB GMEM 往返；填充延迟 DSM ~0.7µs/16KB vs GMEM TMA 1.5-2µs。
+- 预期：MAT_WAIT/供给 L 下降 + L2 让位原子；预登记门照单杠杆纪律另立。
+
 ## 5. 提案对照记录（外部 agent 方案的三处修正已另行回复）
 
 R3-Late 的 16KB union 地址不连续（ds_blocks 隔断）；PANEL-MCAST 几何不成立
