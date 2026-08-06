@@ -41,6 +41,25 @@ LAND_P 0.108 / DKV_ACQ 0.054 / KS2 0.098 / LAND_DS 0.052（cta0 稳态均值）�
 | vre_3 r4 | 环深 2→4 + stationary_do 退役 + dos 流式（v12 基） | 12.675 | 8.311 | 1.5252 | **证伪，归档**（correctness 4/4——r4 治好了 r1 数值污染与 r3 死锁；纯性能负：同日 v12 11.955，慢 6.0%。K3 主钥匙在 SM100 上不成立） |
 | vk_4 | M2：softmax exp2 → deg-6 FFMA（近似替换档，已终裁放行） | 9.818 | 8.442 | 1.1630 | **null（预期内分支），代码保留**——同日 vk_2 9.858，仅 −0.041 < 0.05 门。数值面完美：**四 case max_abs 与 vk_2 逐位相同**（deg6 偏移仅现于 mean/cosine 末位），获准类首次硅上端到端确认。性能面 = pacer 判决第三次独立确认（math 松弛 ~1.2µs 全额吸收 SOFTMAX 缩短）。**M2 应收账款条件：W17 < 5.84**——K2-swap（→~6.4）不够，实质 Rubin 锁定 |
 | **vk_5** | W1'：W17 卸 TMA 等待，W19 提交中继 | **9.757** | 8.555 | **1.1405** | **部分成立（贴上界 0.3µs），建议采纳**——同日 vk_2 9.857，−0.100ms 且**双指标同向**（ratio 1.1405 vs 1.1666），vk 系列首个真实正收益；correctness 四 case max_abs 与 vk_2 逐位相同（纯重排类 ✓）。验尸：仅兑现期望 1/3——**2 槽信用界吃掉了链压缩**（W17 的 TMA 等待转成 acquire 空等；环的供给循环 = release→ready 逐 gen 延迟链，与谁在等无关；省下的只有 W17 串行化的跳数）。顺序不变性定理的信用界推论第二次显形 |
+| v_gpt_1 r2b | kdq 换 TMA tile::gather4（外部 agent 提案 K2-G4，v_gpt 独立谱系） | 11.707 | 8.368 | 1.3989 | **证伪，归档**（correctness 4/4 PASS——tensormap 构造/半平面地址代数/SW128 相位/OOB 零填全对；纯性能回归 +1.8ms；验尸见下） |
+
+**v_gpt_1 验尸（2026-08-06）：TMA 异步引擎是共享串行资源，512B 级小事务在它上面排队**
+- 机制全对（4/4 PASS 证明 gather4 全链路成立，含 holes/-1 与尾 tile 的 OOB 零填）。
+- trace（同口径自比）显示**每条腿都变慢**：period 6.80→9.78；ROUTE_K 2.27→3.17
+  （64 个索引载入挪上 W17 串行路径 + TMA 飞行裸暴露）；MAT_QDO 2.19→2.88/span
+  （**面板也慢了**——64 笔 512B gather4 与面板 bulk 拷贝共用每 SM 异步引擎，
+  小事务排队拖累大事务）；REDUCE_ATOMIC 1.8→3.49/span（L2 通路受离散小读干扰）；
+  dVdK gap 出现单个 2.9µs 大洞。
+- **教训入账**：cp.async（LSU 路径，128 线程并行）→ TMA 引擎（串行队列）对
+  512B 级稀疏小事务是负 EV；"transport 优化 kdq"一族到此测尽（cp.async 的
+  2.27 已是该物化的地板）。
+- **对方向 A 的含义**：kdq 成本无法靠换搬运机器消除，只能**删除物化本身**
+  （canonical-K：own 半区 8KB S2S + peer 半区 8KB DSM，皆引擎友好大块事务）。
+  No-kdq 的架构论证被这次证伪**加强**。
+- 工程遗产：gather4 全套管道（tensormap 经 make_tiled_tma_atom 以 (1,64)-box +
+  SW128 组合布局构造 + copy_tensormap 128B 全局落脚（注意指针对齐标注 ≥64）+
+  inline asm 发射）已硅上验证，归档备用。
+- 另：r2 曾 33 分钟 compile 无输出后 SSH 255（r2b 正常，判环境瞬态，留观）。
 
 **尾段章节关闭（vk_3 验尸，2026-08-06）**：三刀独立手术全部 ≈ 零——TMA 飞行
 （vg_6 双缓冲 null）、标量 scatter（vk_3 stmatrix null）、T2R atom（vk_3 同时把
