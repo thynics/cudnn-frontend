@@ -12219,13 +12219,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ),
             dq_epi_layout_staged.outer,
         )[None, None, 0]
-        # vg_6: round 1 stages in the round ring (round_buf_a + round_buf_b
-        # are adjacent, 1024-aligned, 32 KiB total) -- dead at epilogue
-        # time for the same reason as score-K: its last readers are the
-        # final dQ MMAs, tracked by the dq_done commit the epilogue waits.
+        # vg_6 r2: round 1 stages in the stationary dO panel.  dq_done is
+        # the EARLY commit (it tracks only the two dQ MMAs, deliberately
+        # ahead of the tail dVdK passes), so the round ring and the P/dS
+        # face may still be read when the epilogue starts -- r1 corrupted
+        # exactly that way.  The panels' last readers (final S/dP MMAs and
+        # the last own-half bulk fills) complete strictly earlier, and
+        # nothing writes them after the prologue.
         s_dq_epi_b = cute.make_tensor(
             cute.recast_ptr(
-                storage.round_buf_a.data_ptr(),
+                storage.stationary_do.data_ptr(),
                 dq_epi_layout_staged.inner,
                 self.element_dtype,
             ),
