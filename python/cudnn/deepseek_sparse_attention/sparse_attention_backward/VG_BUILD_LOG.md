@@ -21,7 +21,7 @@
 | vg_6 r2 | epi 双缓冲（round1 → stationary dO panel） | 9.781 | 8.345 | 1.1720 | **null**（修正后正确，但 epi 大头是标量 scatter 不是 TMA 飞行）→ 归档，基座保持 vg_5 |
 | vh_1 | K 段环捐赠（32→2×8KB）→ round 环深 3 | 13.631 | 8.552 | 1.5938 | **证伪，归档**（correctness 4/4 PASS，纯性能崩塌；验尸见结构性发现 #4） |
 | **vk_1** | vg_5 + S1 双 producer state（修注入卡死） | 9.844 | 8.605 | 1.1440 | **采纳**（语义=vg_5，解锁 trace 通道） |
-| **vk_2** | split publish 退役（排他实验 C 转正） | 9.902 | — | — | **现役基座**（与 vg_5/vk_1 漂移内持平，协议面减半） |
+| **vk_2** | split publish 退役（排他实验 C 转正） | 9.902 | 8.609 | 1.1502 | **现役基座**（与 vg_5/vk_1 漂移内持平，协议面减半；记账 run = vk_3 委托单里的对照腿） |
 | vk_3 r2 | dQ epilogue stmatrix 向量化（P1/K1） | 9.857 | 8.519 | 1.1570 | **硬 null，归档**（ms −0.045 但同日 ratio 反而劣于 vk_2 的 1.1502——两指标方向矛盾 = 漂移内为零；correctness 4/4、布局代数正确；验尸见下） |
 
 **尾段章节关闭（vk_3 验尸，2026-08-06）**：三刀独立手术全部 ≈ 零——TMA 飞行
@@ -137,8 +137,13 @@ rank 置换的 n 序），属重构级，不是 rider。
     9.896 @ 8.607，ratio 1.1497。
   - **S1**（vg_5 仅拆 relay 共享 pds_com 为双 producer state）：全绿含 candidate
     trace；9.854 @ 8.508，ratio 1.1582。
-  - S2（单 ready mbar、保留共享 state）：跑动中，作机制分类（挂 ⇒ 指认共享 state
-    的代码形态；过 ⇒ 注入层对 patch-site 形态敏感）。
+  - S2（单 ready mbar、保留共享 state）：**挂**（run_outcome fail，exit 143 @
+    capture_2cta；perf 段 9.809 后 trace 卡死）——共享 state 的代码形态被指认。
+  - a_advance（保留共享 state、仅挪 advance 位置）：**挂**（同 exit 143）——
+    挪相位算术救不了共享结构本身。
+  - s1a（S1 的变体）：过（run_outcome pass, exit 0）。
+  - 机制终判：**触发要件 = relay 两条 pds 管线共享同一 producer state 的代码形态**；
+    拆开（S1/s1a）或删除第二条管线（C）均消除卡死。
   - 静态嫌疑核查记录：pds_mbars 已扩 [4]（无越界）；dS/P 两个 arrive 各有 fence；
     容器内核对 CUTLASS 4.5.0 的 producer_tail 在 num_stages=1 **不** mutate state
     （一度按新版语义误判，已撤回）。**API 语义层无病，病在共享 state 的
@@ -169,7 +174,9 @@ rank 置换的 n 序），属重构级，不是 rider。
 reducer busy 3.98（duty 85.7%）——**drain-bound 实锤**，自身下探空间 ≤0.6µs，
 被钉在 ~8.4-8.6；vk_1 的 reducer busy 仅 2.50/tile（rank 分域体积减半）——
 **CG2 的 1.5µs/tile 结构性 drain 优势首次双边实测确认，超越的物理来源坐实**。
-F 账：vk_1 F≈31µs/token vs baseline 6.8，ΔF≈0.35-0.43ms（缺口 ~30%）。
+F 账：vk_1 F≈31µs/token（trace 口径）vs baseline 6.8。
+~~ΔF≈0.35-0.43ms（缺口 ~30%）~~ **已作废**——vk_3 验尸（见上）证明该折算用了
+全 kernel 平均税率，而 DQ_EPI 区段局部税远超均值；修正 ΔF≈0.10-0.15ms。
 
 **pacer 判决（vk_1 trace，推翻 vre_1 时代的"环松弛"框架）**：W17 供给链自身
 饱和——ROUTE_K 2.27（真身 = kdq 会合区）+ MAT_QDO×2 4.38 = 6.65 ≈ period 6.80，
