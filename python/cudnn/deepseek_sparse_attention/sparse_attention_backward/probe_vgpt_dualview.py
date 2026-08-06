@@ -75,7 +75,11 @@ K_CHUNKS = 4
 D_HEAD = 512
 D_TILE_CLUSTER = 256
 D_TILE_CTA = 128
-DKV_MMA_TILER = (D_TILE_CLUSTER, N_TILE, H_TILE_CLUSTER)
+# V2 override (vk_2): two-pass H reduction -- K = H64 per issue, NOT the
+# base class's H128.  r1 of this probe used the base value by mistake;
+# the 50%-mismatch-at-clean-offsets signature was the wrong M-pair
+# stride (8192 vs 4096), not a real verdict.
+DKV_MMA_TILER = (D_TILE_CLUSTER, N_TILE, 64)
 DQ_MMA_TILER = (D_TILE_CLUSTER, H_TILE_CLUSTER, N_TILE)
 SCORE_TILER = (H_TILE_CLUSTER, N_TILE, K_CHUNK)
 STATIONARY_TILER = (H_TILE_CTA, N_TILE, D_HEAD)
@@ -127,6 +131,8 @@ def body():
     print("L_dkva   (dkv_a)       :", L_dkva)
     print("L_dqa    (dq_a)        :", L_dqa)
     print("L_scoreb (score_b)     :", L_scoreb)
+    assert "((64,2),16),1,4,1" in str(L_dqa), "dq_a calibration vs R4"
+    assert ",8192)" not in str(L_dkva), "dkv_a still on base K=128 tiler"
 
     idx_panel = make_a_indexer(L_panel)   # (h, d, stage)
     idx_dkva = make_a_indexer(L_dkva)     # (d_local, h, stage)
