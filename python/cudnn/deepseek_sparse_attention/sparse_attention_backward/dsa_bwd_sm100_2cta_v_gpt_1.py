@@ -916,12 +916,24 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             gather4_box_layout,
             (1, 64),
         )
-        gather4_desc_ptr = workspace_LSE_OdO.iterator + cute.round_up(
-            2
-            * cute.size(problem_shape[3][0])
-            * cute.round_up(mQ.shape[2][0], 8)
-            * 4,
-            128,
+        # copy_tensormap validates static pointer alignment (>= 64); the
+        # torch allocation is 256B-aligned and the offset is a multiple of
+        # 128, but pointer arithmetic demotes the alignment attribute to
+        # the base's assumed 16 -- re-assert the factual 128.
+        gather4_desc_ptr = cute.make_ptr(
+            cutlass.Int64,
+            (
+                workspace_LSE_OdO.iterator
+                + cute.round_up(
+                    2
+                    * cute.size(problem_shape[3][0])
+                    * cute.round_up(mQ.shape[2][0], 8)
+                    * 4,
+                    128,
+                )
+            ).llvm_ptr,
+            cute.AddressSpace.gmem,
+            assumed_align=128,
         )
 
         self.kernel(
