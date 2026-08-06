@@ -122,11 +122,27 @@ def build_layouts():
     L_scoreb = sm100_utils.make_smem_layout_b(
         score_mma, SCORE_TILER, BFloat16, K_CHUNKS,
     )
-    return L_panel, L_dkva, L_dqa, L_scoreb
+    # Mine G (granularity ring): H_PASSES=4 half-generation layouts.
+    dkv_mma_k32 = sm100_utils.make_trivial_tiled_mma(
+        BFloat16, BFloat16,
+        OperandMajorMode.MN, OperandMajorMode.K,
+        Float32, tcgen05.CtaGroup.TWO, (D_TILE_CLUSTER, N_TILE),
+    )
+    L_dkva32 = sm100_utils.make_smem_layout_a(
+        dkv_mma_k32, (D_TILE_CLUSTER, N_TILE, 32), BFloat16, 1,
+    )
+    L_dkvb64 = sm100_utils.make_smem_layout_b(
+        dkv_mma, DKV_MMA_TILER, BFloat16, 1,
+    )
+    L_dkvb32 = sm100_utils.make_smem_layout_b(
+        dkv_mma_k32, (D_TILE_CLUSTER, N_TILE, 32), BFloat16, 1,
+    )
+    return L_panel, L_dkva, L_dqa, L_scoreb, L_dkva32, L_dkvb64, L_dkvb32
 
 
 def body():
-    L_panel, L_dkva, L_dqa, L_scoreb = build_layouts()
+    (L_panel, L_dkva, L_dqa, L_scoreb,
+     L_dkva32, L_dkvb64, L_dkvb32) = build_layouts()
     print("L_panel  (stationary_a):", L_panel)
     print("L_dkva   (dkv_a)       :", L_dkva)
     print("L_dqa    (dq_a)        :", L_dqa)
@@ -188,6 +204,46 @@ def body():
         s2_all &= mism == 0
     print("PROBE_S2_SCOREB_DQA_VIEW:", "PASS" if s2_all else "FAIL")
     ok &= s2_all
+
+    # ---- S3 (Mine G): half-generation A -- [D128 x h32] vs 16KB gen ----
+    # Identity: the K=32 A staging must be the h-sub-window of the K=64
+    # staging at offset h0*64 elements (h stride 64, 32%8==0 keeps the
+    # swizzle-atom phase).  If true, a half-gen ring needs NO new fill
+    # forms -- the same bytes admit both descriptors.
+    print("L_dkva32 (K=32 A)      :", L_dkva32)
+    print("L_dkvb64 (K=64 B)      :", L_dkvb64)
+    print("L_dkvb32 (K=32 B)      :", L_dkvb32)
+    idx_dkva32 = make_a_indexer(L_dkva32)
+    s3_all = True
+    for h0 in (0, 32):
+        base = idx_dkva(0, h0, 0) - idx_dkva32(0, 0, 0)
+        pts = [((dl, h0 + hh, 0), (dl, hh, 0)) for dl in range(128) for hh in range(32)]
+        mism = sweep(
+            f"S3 h0={h0} (offset {base})",
+            idx_dkva,
+            lambda dl, hh, s, _b=base: idx_dkva32(dl, hh, s) + _b,
+            pts,
+        )
+        s3_all &= mism == 0
+    print("PROBE_S3_HALFGEN_A_VIEW:", "PASS" if s3_all else "FAIL")
+    ok &= s3_all
+
+    # ---- S4 (Mine G): half-block B -- [n32 x h32] sub-block of dkv-B ----
+    idx_dkvb64 = make_b_indexer(L_dkvb64)
+    idx_dkvb32 = make_b_indexer(L_dkvb32)
+    s4_all = True
+    for h0 in (0, 32):
+        base = idx_dkvb64(0, h0, 0) - idx_dkvb32(0, 0, 0)
+        pts = [((n, h0 + hh, 0), (n, hh, 0)) for n in range(N_TILE) for hh in range(32)]
+        mism = sweep(
+            f"S4 h0={h0} (offset {base})",
+            idx_dkvb64,
+            lambda n, hh, s, _b=base: idx_dkvb32(n, hh, s) + _b,
+            pts,
+        )
+        s4_all &= mism == 0
+    print("PROBE_S4_HALFBLOCK_B_VIEW:", "PASS" if s4_all else "FAIL")
+    ok &= s4_all
 
     print("PROBE_VGPT_DUALVIEW_RESULT:", "PASS" if ok else "FAIL")
 
