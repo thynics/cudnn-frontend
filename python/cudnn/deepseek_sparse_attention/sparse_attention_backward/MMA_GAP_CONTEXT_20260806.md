@@ -156,10 +156,10 @@ lengths dq≈0.012、dkv≈0.073。
 | score_kv | 32 KB | 当前 K tile 的 own-n32×D512（S/dP 的 B 半份） | 每 tile 重填（gather） |
 | round_buf_a | 16 KB | ring 槽 0（h0 类的代都进此槽） | 每 tile 4 代 |
 | round_buf_b | 16 KB | ring 槽 1（h1 类的代） | 每 tile 4 代 |
-| p_blocks | 8 KB | P 的 dKV-B 消费形态：**本地 own-n32×h64 块 + 对端 DSM 到货块** | 每 tile |
-| p_xchg | 4 KB | **出站暂存**：math 的非 own-n 警对写入待发 P 半块，relay 从此发出 | 每 tile |
-| ds_image | 8 KB | dS 的 own-n32×H128 完整 h 镜像（G5 的 B 本地半份 + DSM 出站源） | 每 tile |
-| ds_blocks | 8 KB | dS 的 dKV-B 消费形态（本地块 + 对端到货块） | 每 tile |
+| p_blocks | 8 KB | P 的 dKV-B 消费形态：2 个 [own-n32×h64] 块（own-h 块本地写 + peer-h 块 DSM 到货） | 每 tile |
+| p_xchg | 4 KB | **出站暂存**：math 的非 own-n 警对写入 [peer-n32×own-h64] 的 P 出站块，relay 从此发出 | 每 tile |
+| ds_image | 8 KB | dS 的 **[own-h64 × 全 n64]** 镜像 = **dQ 的 B 半份（纯本地）**，兼 DSM 出站源；其 ±2048 元素两半 = n-半块，各与 dkv-B 块字节同构（swizzle inner 相等有断言） | 每 tile |
+| ds_blocks | 8 KB | dS 的 dKV-B 消费形态：2 个 [own-n32×h64] 块（own-h 块本地写 + peer-h 块 DSM 到货） | 每 tile |
 | ds_xchg | 4 KB | **死字段**（v12 P1b 起无读无写，保留分配） | — |
 | stats | 0.5 KB | 列 0=scaled LSE、列 1=Δ（f32，[H64×2]） | 每 token |
 | mbar 头部 | 308 B | **38 个 Int64**（37 个 mbarrier + khot_seq 计数器）+ tmem_holding_buf Int32 | — |
@@ -194,7 +194,7 @@ dQ@256/384），使 math 的 dQ epilogue（读 [128,384)）与 leader 尾段的 
 
 | 管线 | 类型/深度 | 生产者 | 消费者 | 说明 |
 |---|---|---|---|---|
-| kscore | AsyncUmma / 1 | gather（256 线程组） | leader | **每 tile 两代**：K 代（S/dP 的 B；leader 在 dP 发射后 release）→ 借贷 dO_r0 代（grads 里第二次 wait/release）。gather 的 LOAD_K(t+1) 实际被 dP(t) 的 **MMA 完成**解锁 |
+| kscore | AsyncUmma / 1 | gather（256 线程组） | leader | **每 tile 两代**：K 代（S/dP 的 B；leader 在 dP 发射后 release#1）→ 借贷 dO_r0 代（grads 里第二次 wait/release#2）。**depth-1 相位配对**：loan 填充的 acquire ← release#1（即 dP 的 MMA 完成，WAR 保护）；**LOAD_K(下一 tile) 的 acquire ← release#2（即梯度块 round-0 两次 dV MMA 完成）** |
 | round ring | AsyncUmma / 2 槽 | W17（elect lane；kdq 两代由 gather 代填、W17 提交） | leader（grads 的 A） | 每 tile 8 代；每代 release 紧跟对应 MMA 发射后（UMMA-tracked） |
 | pds | AsyncUmma / 1 | **acquire=math，写=math，commit=relay lane0**（commit group=2：两 CTA 的 relay 各 arrive 一次到 leading CTA） | leader（G3/4/5 的 B） | leader 在 grads 块头 consumer_wait（该块第一道门）；grads 发射完后 release |
 | s_done / dp_done | UmmaAsync / 2 | leader MMA | math | ping-pong tmem 信用；math T2R+fence 后 release |
@@ -218,8 +218,9 @@ named barriers（V2 活跃的全部 5 个）：kdq_barrier（id=4 区间，**160
    B=score_kv）→ dP(t) 发射（dP_ISSUE，V≡K 复用 score_kv）→ **kscore release #1**。
 2. 梯度块 grads(t−1)，其**第一道门 = pds consumer_wait**（无 span，即 §1.2 的
    0.41 段位置）。
-3. WAIT_dQ（等 kdq ring 代）→ dQ r0 发射（A=kdq 镜像 g0，B=ds_image 拼装）→
-   ring release → dQ r1 发射（g1）。
+3. WAIT_dQ（等 kdq ring 代）→ dQ r0 发射（A=kdq 镜像 g0；**B=ds_image 整体，
+   纯本地**——`make_fragment_B(ds_image)`，不含任何 DSM 到货数据）→ ring
+   release → dQ r1 发射（g1，B 同）。
 4. **P-landing 等待** → **kscore consumer_wait #2**（loan dO_r0，gather 已把同一
    32KB stage 重新发布为两个 dO 面板 quadrant）→ dVdK head 4 pass（round0，
    dKV 槽 0：dV-h0[A=loan-a]、dV-h1[A=loan-b]，**dS-landing 等待** + ring wait →
@@ -253,12 +254,15 @@ named barriers（V2 活跃的全部 5 个）：kdq_barrier（id=4 区间，**160
    每代须先 acquire ring 信用（等 leader 消费掉两代前的那代）。
 3. 每 token 序幕：stationary Q/dO 两笔 TMA + 拆分就绪 arrive。
 
-**math（w4–7）**：WAIT_S → T2R_S（+s_done release）→ WAIT_dP → T2R_dP
-（+dp_done release）→ SOFTMAX（32 路 exp2 全宽条带 + dS 链 + **bf16 转换**）→
-**PDS_ACQ（pds producer_acquire，先于写入）** → STORE（纯 stmatrix 发布，
-**owner 分裂**：owns_n 警对（w4,5↔rank0；w6,7↔rank1）写 P/dS 终块，非 own 警对
-写 p_xchg 出站暂存；全部 128 线程另写整幅 ds_image——owning 警对的 dS 实际写两处）
-→ 每线程 arrive count-128 pds_ready。
+**math（w4–7）**。坐标系（重要）：S/dP 的 C 沿 M（=H）跨 CTA 分半，**每 CTA 的
+math 看到的是 [own-h64 × 全 n64]**（线程映射 local_h = tidx%64，n_owner =
+tidx//64——128 线程 = 64 个 h × 2 个 n-半区警对）。事件序：WAIT_S → T2R_S
+（+s_done release）→ WAIT_dP → T2R_dP（+dp_done release）→ SOFTMAX（32 路 exp2
+全宽条带 + dS 链 + **bf16 转换**）→ **PDS_ACQ（pds producer_acquire，先于写入）**
+→ STORE（纯 stmatrix 发布，**owner 分裂按 n-半区**：own-n 警对写 P/dS 终块
+[own-n32×own-h64]，非 own 警对写 p_xchg 出站块 [peer-n32×own-h64]；全部 128 线程
+另写整幅 ds_image [own-h64×n64]——own-n 警对的 dS 实际写两处）→ 每线程 arrive
+count-128 pds_ready。
 
 **relay（w18，仅 lane 0）**：等 pds_ready → **ROUTE_P 先**（对对端 landing mbar
 arrive_and_expect_tx(4KB) → bulk 发 p_xchg → 对端 p_blocks 的本 rank 块）→
