@@ -260,3 +260,36 @@ panel 火车。双生产者相位记账 = vd_1 已证结构。零字节。预期
 ~4.9（甩掉 ROUTE_K 段）；dQ r0 提前 ~半个 fill 解锁；release −0.2~0.5ms。
 止损门：correctness 4/4；candidate ≤9.80 且 ratio 同向改善 = 采纳；≥10.0 或
 双指标矛盾 = 证伪归档；超时按 SOFT DEADLOCK 处置流程。
+
+## v_f2_1（K2c）四连败证伪：kdq 供给段整族关闭（2026-08-06 晚）
+
+| rev | 单变量 | 结果 |
+|---|---|---|
+| r1 (d0fe890) | 初版 | 编译错：`cute.jit` 装饰器叠层（脚本回滚残留）；无 GPU 信息 |
+| r2 (77e2d65) | gather 自治 + 拆分提交 | correctness FAIL：dense dQ 4.8%（max 1.029 @ (7,101,57)） |
+| r3 (eda65fb) | + 还原 v8 线程形状（warp0 统一 acquire、barrier 后 fence、elect_one commit） | FAIL：7.0%（max @ (40,66,181)）——线程形状假说证伪 |
+| r4 (b0f3ee0) | + 撤拆分提交（数据路径逐字节 = v8） | FAIL：7.7%（**max 又回到 (7,101,57)**）——与 v8 唯一差异 = 生产者身份 |
+
+**判决**：ring 管线的 kdq 两代生产权**不可从 W17 转移**（至少在当前管线原语的
+使用方式下）。K2a 纸面否决 + K2c 三次实测证伪 ⇒ **kdq 供给段手术整族在 SM100
+上关闭**。v_f2_1 归档，现役基座回 vk_2。
+
+**验尸线索（供后续原语级追因）**：
+1. 损坏有可复现空间签名（r2/r4 同一最差坐标），非纯时序混沌；量级 4.8→7.0→7.7%。
+2. vd_1 先例被我误读：它按**奇偶**拆双生产者 = 每个物理 mbar 只有一个生产者线程；
+   v_f2_1 是**首次让两个生产者在同一 full mbar 上按 tile 内顺序交错到达**
+   （gather: gen0 → W17: gens 2,4,6 同一 slot-0 mbar）。这是唯一未被任何先例
+   覆盖的结构差异，现为头号机制假说。
+3. cluster 管线 full mbar 到达计数 = 2/代（每 CTA 一个 elect lane，双方打到
+   leading CTA；pds 创建处注释自证）。计数错配会相位翻倍失步——但 v_f2_1 的
+   commit 形状每 CTA 恰 1 次，账面成立；矛盾待管线源码裁决。
+4. **待办artifact**：容器 venv 的 CUTLASS pipeline 源码 dump
+   （PipelineAsyncUmma 的 producer_acquire/commit、cluster arrive 语义）——
+   固定格式自动化脚本忽略了该请求，需 runner 会话人工执行。
+5. 教训：'先例覆盖'的判定必须精确到结构同构（谁在哪个 mbar 上到达），
+   不能停留在'双生产者'这个词面。
+
+**棋盘现状**：供给段（K2a/K2c）关闭；K3 资金已被 vre_3 r4 证伪；尾段已关闭
+（vk_3）。剩余杠杆：**M2 FFMA deg6 exp（等近似替换档终裁，唯一大额零风险杠杆）**、
+D1/角色再平衡（~0.4µs 级）、SM100 追平线接受判定（E1 已落章：baseline 被自身
+drain 地板钉在 ~8.4-8.6）。
