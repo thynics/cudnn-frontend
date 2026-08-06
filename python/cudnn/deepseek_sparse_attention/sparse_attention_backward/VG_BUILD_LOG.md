@@ -19,6 +19,7 @@
 | **vg_5** | exp 全宽条带（32 EX2 在飞，结果写回 r_score） | **9.771** | 8.390 | **1.1646** | **采纳，当前最优** |
 | vg_6 r1 | epi 双缓冲（round1 → ring） | — | — | — | **correctness FAIL 5.4%**：dq_done 是早提交（只跟踪 dQ MMA），ring 在 epi 开始时仍被尾部 dVdK 读 → WAR |
 | vg_6 r2 | epi 双缓冲（round1 → stationary dO panel） | 9.781 | 8.345 | 1.1720 | **null**（修正后正确，但 epi 大头是标量 scatter 不是 TMA 飞行）→ 归档，基座保持 vg_5 |
+| vh_1 | K 段环捐赠（32→2×8KB）→ round 环深 3 | 13.631 | 8.552 | 1.5938 | **证伪，归档**（correctness 4/4 PASS，纯性能崩塌；验尸见结构性发现 #4） |
 
 全部版本 correctness 4/4 PASS。累计 10.572 → **9.771（−7.6%）**，ratio 1.2786 → **1.1646**。
 
@@ -94,10 +95,55 @@ vd_1 的 null 排除了两个成分：**生产者串行排队 ≈ 0、跨奇偶 
 要拿这 0.35-0.45 µs 必须先做 exact-P/dS 重布局（[h128 × own-n32] 形态 +
 rank 置换的 n 序），属重构级，不是 rider。
 
+### 4. vh_1 验尸：常驻已预取操作数的 SMEM = 物化的前瞻时间
+
+- 机制：score_kv 32KB 常驻 K 的"大小"就是 K 的前瞻量——整块常驻使 gather 领先
+  leader 一整个 tile；2×8KB 段环把前瞻压到半 tile。K gather 是全 kernel 最慢的
+  供给腿（~1.5µs 纯工作 + 稀疏散射），S/dP 从"从不等 K"变"每段等 K"。叠加
+  vc_2 loan 退役回吐（~0.4µs/tile）与 pad 代协议开销，+2.2µs/tile 与实测吻合。
+- **铁律入账**：把"常驻+已预取"改环 = 按 1:1 拿前瞻时间换字节；只有当该操作数的
+  生产者远快于消费节拍时才是净收益。K gather 恰是最慢生产者 → 负 EV。
+- 环深 3 未被证伪；被证伪的是这笔 16KB 资金。剩余买家：panel 流式化
+  （query-stationary，付 L2 带宽不付前瞻）或 Rubin 容量。
+- 战绩模式定型：本轮 4 胜全是零字节延迟手术（vg_1/2/4/5），4 负全是 SMEM 重布管
+  （vc_3/vd_1/ve_1/vh_1）。227KB 每个字节都在承重。
+
+### 5. trace 停摆重定性：不是 infra，是 split publish 的注入期卡死（2026-08-06）
+
+- **误诊更正**：08-05 21:48 起的 exit 124 曾归档为 infra（VsmTopologyMapper 报错）；
+  直登复核证明该报错在**成功的** baseline/vc_2 采集里同样出现 = 无害噪声，且停摆
+  起点与首次采集 vg_1+ 内核重合。**规则：报错串必须先在成功 run 里做对照，才允许
+  用于归因。**
+- **bisect @9c11a29**（隔离 clone，SHA 全程核对）：vg_1/vg_2/vg_4 全部在 candidate
+  capture 卡死（GPU P0/100%/2.0GiB 自旋 80-100s，已进 kernel 非未启动）→ 首触发 =
+  vg_1 split publish；vg_2/4 仅是继承。cuda-gdb attach 引发次生错误，不可用。
+- **排他变体判决**（同一 clone，--candidate-file 注入，互斥不叠加）：
+  - **C**（vg_5 反向移除 vc_2→vg_1 全部 23 hunk）：全绿含 candidate trace；
+    9.896 @ 8.607，ratio 1.1497。
+  - **S1**（vg_5 仅拆 relay 共享 pds_com 为双 producer state）：全绿含 candidate
+    trace；9.854 @ 8.508，ratio 1.1582。
+  - S2（单 ready mbar、保留共享 state）：跑动中，作机制分类（挂 ⇒ 指认共享 state
+    的代码形态；过 ⇒ 注入层对 patch-site 形态敏感）。
+  - 静态嫌疑核查记录：pds_mbars 已扩 [4]（无越界）；dS/P 两个 arrive 各有 fence；
+    容器内核对 CUTLASS 4.5.0 的 producer_tail 在 num_stages=1 **不** mutate state
+    （一度按新版语义误判，已撤回）。**API 语义层无病，病在共享 state 的
+    lowering/代码形态与注入的交互**——纸面分析原则上摸不到这一层。
+- **性能判读**：当日 baseline 漂移 8.39→8.61（2.6%，远超台账登记的 ±1%）；
+  C/S1/vg_5 的 candidate_ms 与 ratio 两个指标方向互相矛盾 → **split publish 在
+  vg_5 合成里的净贡献 ≈ 0（±0.1ms），与漂移不可分**。vg_1 单刀原始收益
+  （−0.069ms）本就在漂移尺度内。
+- **裁决路径（零 GPU）**：C 与 S1 的解码 trace 均已产出。S1 与 vg_5 语义全同 ⇒
+  **S1 的 trace 就是 vg_5 的 gap 台账**；C 是 split publish 的严格 A/B。读两份
+  trace：若 S1 侧 dQ 头部空洞/`MATH_PDS_ACQ` 显示 split publish 仍买到真实重叠
+  → 采 S1（最小修复）；否则 → 采 C（协议更简：少一条管线、一个 mbar、一次交接）。
+- 附带：vg_5_trace（3bcdde3，MAT_ACQ/MAT_WAIT/RK_ACQ 细化名额）继承共享 pds_com，
+  采 C/S1 之前不可用，采定后需 rebase。
+
 ## 下一步（按 可兑现额 / 阻塞项）
 
 | 优先 | 杠杆 | 预期 | 阻塞 |
 |---|---|---|---|
+| 0 | **读 C/S1 解码 trace**（gap 台账 + split publish A/B → 定 C vs S1 新基座；重排矿点 1/2） | 定当前 pacer | 无（零 GPU，文件已在 scratch） |
 | 1 | **D1 warp 重划 640→512** | −0.5-0.8 µs/tile | 需重新安置 4 个 warp 的角色（gather 128 线程是 ROUTE_K 主力，不能简单砍）；D4 microbench 先定上限 |
 | 2 | **M2 FFMA deg6 exp** | SOFTMAX 2.16→≤1.1 | **等用户对"近似替换"档终裁**（数值半门已 PASS，deg6 与 MUFU 同误差量级） |
 | 3 | M1 条带加宽 8→16/32 | 小 | 寄存器溢出风险（math@128） |
@@ -110,6 +156,7 @@ rank 置换的 n 序），属重构级，不是 rider。
 
 ## 工装备忘
 
-- trace 采集在 21:48 后连续超时（exit 124，capture_2cta 阶段，IKET VsmTopologyMapper
-  报 RmCtrlGetVsmMappings 失败）——`--mode validation` 可绕过，正确性+性能不受影响。
+- trace 采集在 21:48 后连续超时（exit 124，capture_2cta 阶段）——**已重定性：非
+  infra，系 vg_1 split publish 注入期卡死**（见结构性发现 #5）；VsmTopologyMapper
+  报错是无害噪声（成功 run 同样打印）。baseline/vc_2 通道一直正常。
 - `.git/index.lock` 出现过陈旧残留（0 字节、无 git 进程），清理后正常。
