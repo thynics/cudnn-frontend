@@ -22,7 +22,19 @@
 | vh_1 | K 段环捐赠（32→2×8KB）→ round 环深 3 | 13.631 | 8.552 | 1.5938 | **证伪，归档**（correctness 4/4 PASS，纯性能崩塌；验尸见结构性发现 #4） |
 | **vk_1** | vg_5 + S1 双 producer state（修注入卡死） | 9.844 | 8.605 | 1.1440 | **采纳**（语义=vg_5，解锁 trace 通道） |
 | **vk_2** | split publish 退役（排他实验 C 转正） | 9.902 | — | — | **现役基座**（与 vg_5/vk_1 漂移内持平，协议面减半） |
-| vk_3 r2 | dQ epilogue stmatrix 向量化（P1/K1） | 9.857 | 8.519 | 1.1570 | **null**（仅 −0.045 vs vk_2，< 0.1 门；correctness 4/4、布局代数正确；SASS 验尸中——头号嫌疑 math 警组寄存器溢出 f32×128+bf16×64） |
+| vk_3 r2 | dQ epilogue stmatrix 向量化（P1/K1） | 9.857 | 8.519 | 1.1570 | **硬 null，归档**（ms −0.045 但同日 ratio 反而劣于 vk_2 的 1.1502——两指标方向矛盾 = 漂移内为零；correctness 4/4、布局代数正确；验尸见下） |
+
+**尾段章节关闭（vk_3 验尸，2026-08-06）**：三刀独立手术全部 ≈ 零——TMA 飞行
+（vg_6 双缓冲 null）、标量 scatter（vk_3 stmatrix null）、T2R atom（vk_3 同时把
+epilogue T2R 换成 Ld16x256b(Rep4)，也在同一个零里）。唯一自洽解释：
+**trace 的 DQ_EPI 11.9µs/round 被注入税严重放大**——标量循环是指令最稠密的
+区段（128×~6 ops/线程），其局部税率远超全 kernel 平均的 38%，release 侧
+真实 DQ_EPI 估计只有 ~3-4µs/round，store 份额 ~0.4µs（与实测 −0.8µs/token 吻合）。
+**F 账修正**：ΔF 真实 ≈ 0.10-0.15ms（原估 0.35-0.43 作废），剩余缺口
+~85-90% 在稳态侧（W17 饱和链）。教训入账：**跨口径换算不能用全 kernel
+平均税率折算指令密度异常的区段**；span 稀疏 ≠ 局部税低。
+尾段剩余嫌疑（T2R fence/双 barrier/TMA wait 结构）合计 ~0.1ms，不值再开 rev。
+SASS 计数降级为可选存档项，不再花机时。
 
 全部版本 correctness 4/4 PASS。累计 10.572 → **9.771（−7.6%）**，ratio 1.2786 → **1.1646**。
 
