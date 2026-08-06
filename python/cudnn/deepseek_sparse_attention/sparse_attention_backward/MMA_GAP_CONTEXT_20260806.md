@@ -460,12 +460,42 @@ release 口径：candidate_ms @ 同日 baseline_ms（ratio）。
 **汇总模式（事实）**：采纳的 vg_2/4/5 全部是零字节的发射序/延迟手术；4 项证伪/负
 （vc_3、vd_1、ve_1、vh_1）全部涉及 SMEM 重新布管。
 
-**另有平行探索**：vre_3（面板流式化换 ring 深度）在另一会话中途调试未有结论；
+**vre_3 r4 判决落章（2026-08-06 补）**：环深 2→4 + stationary_do 退役 + dO 流式
+（v12 基）= **12.675 @ 8.311 (1.5252)，证伪**。correctness 4/4（r4 已治好 r1 的
+数值污染与 r3 的死锁），纯性能负：比同日 v12（11.955）慢 6.0%。**含义：ring 加深
+的第二个（也是最后一个）已知资金源在 SM100 上不成立**；SMEM 重布管类战绩变为
+5 连败（vc_3/vd_1/ve_1/vh_1/vre_3）。
+
 K2（kdq 退役，用 score_kv 字节 + DSM 替代第二次稀疏 gather）桌面工作已开（其
 几何事实已并入 §4.5/§7.5），未上机。M2（FFMA deg6 exp 替换 MUFU；SOFTMAX
 vc_2 时代 2.156→台账预期 ≤1.1，vk_1_trace 新测 2.22）数值半门已过（deg6 与
 MUFU 同误差量级 1.9–3.9e-6），等"近似替换"档终裁，未上机。D1（warp 重划
 640→512）未上机。
+
+### 8.1 vk_2 K2 定价 trace（2026-08-06，注入口径，稳态窗口 issue_seq 8..23）
+
+诊断 run（无性能判决；baseline 8.481 / candidate 9.858 仅留档）。本次 31 名额
+置换：退役近零的 WAIT_S/WAIT_dP，换入 **PDS_WAIT(i)**、**GRAD_SUP_WAIT(i)**——
+§1.2 两段无标记等待自此有直接测量（vk_2 基座上）。
+
+- **period 7.089/tile**（窗口内 15 个间距，range 6.688–7.520）。与 vk_1_trace 的
+  6.80 **不可直接比**（插桩集合不同，§5 跨版本禁比规则适用）。
+- **W17 串链复核（vk_2 上仍饱和）**：ROUTE_K 2.041 + MAT_QDO×2 4.878 = 6.919 =
+  period 的 **97.6%**（slack 0.170）。
+- **leader 两段等待的直接测量**：PDS_WAIT 0.506/tile；GRAD_SUP_WAIT 0.260/tile。
+- **供给行分解（H128 logical 口径）**：**MAT_ACQ 3.708**/tile（8 次环信用 acquire）
+  ｜MAT_WAIT 1.368/tile（6 次 TMA 完成等待）｜RK_ACQ 0.858/tile。
+  **信用等待主导供给行**。其中 ROUTE_K 内 kdq 两代的 MAT_ACQ 合计 0.604
+  （占 ROUTE_K 包络 27.4%）。
+- **dVdK 逐 pass gap_before（vk_2）**：[0.326, 0.028, 0.436, 0.544, 0.464, 0.492,
+  0.414, 0.494]，Σ3.198（vc_2 时代 Σ3.890）。
+- **math 行（单 warp 均值，M2 定价口径）**：SOFTMAX 2.047｜PDS_ACQ 1.264｜
+  STORE 1.005｜T2R_S 1.030｜T2R_dP 0.493。
+- **WAIT_dQ 0.142/tile（两次合计）；时刻对齐**：round0 的 WAIT_dQ 结束贴合
+  PDS_WAIT/串行前驱（+0.028/+0.112），距 kdq commit（ROUTE_K.end 代理）**晚
+  +0.554**——**kdq 在 vk_2 上先于需求就绪，不再是 dQ 发射的绑定门**。
+  （§9-5"判决 2"是 vk_1（含 split publish）上的测量，在 vk_2 上不成立；
+  绑定门随基座变化。）
 
 ---
 
@@ -540,13 +570,22 @@ MUFU 同误差量级 1.9–3.9e-6），等"近似替换"档终裁，未上机。
 
 ## 11. 开放事实清单（截至 2026-08-06）
 
-1. leader 两段无 span 等待（0.41/0.54）的**时长归属**未直接测量（候选门的代码序
-   已核清，见 §4.5/§9-10）。
-2. vk_1_trace 的 RK_ACQ/MAT_ACQ/MAT_WAIT 细分读数已采集成功但未完成解析。
-3. K2 的两个前置桌面项未闭合：score_kv swizzle 在 MN-major A 视图下的 CG2 描述符
-   合法性推导（K2b 的门）；不闭合则退化为 8KB S2S 拷贝方案（K2a）。
+1. ~~leader 两段无 span 等待的时长归属~~ **已闭合**（§8.1：PDS_WAIT 0.506、
+   GRAD_SUP_WAIT 0.260，vk_2 直接测量）。
+2. ~~细分读数未解析~~ **已闭合**（§8.1 供给行分解，vk_2 基座）。
+3. K2 的前置桌面项：K2b（swizzle 零拷贝别名）的 CG2 描述符合法性推导未闭合；
+   **K2a（拷贝方案）新增一项待核**：score_b_layout（swizzled B）与 dq_a_layout
+   （swizzled A）之间 256B 行片的连续可拷性——最坏退化为每 tile 每 CTA
+   128 个 256B 分片拷贝（warp0 的 32 线程分担，发射成本仍远低于 GMEM gather）。
 4. M2 等用户对"近似替换"档的终裁。
-5. ROUND_STAGES=2→3 无已验证的 16KB 资金来源（vh_1 的来源已证伪；vre_3 未有结论）。
-6. W19（32 线程）与 math 警组 duty ~65%、reducer duty 37% 的富余未被利用。
+5. ROUND_STAGES=2→3/4 在 SM100 上**已无任何已验证资金源**（vh_1、vre_3 r4 双双
+   证伪）——若 MAT_ACQ 主导的信用饥饿（§8.1 已实测）在 K2 之后仍是绑定项，
+   该平台即 SM100 结构地板，转 Rubin 项。
+6. W19（32 线程）与 math 警组、reducer（duty 37%）的富余未被利用。
 7. IKET 局部税率未标定（只有全 kernel 平均 38% 与"指令密集区更高"的间接证据）。
 8. SMEM 真实 slack 仅 1,024 B——任何新增 SMEM 字段的方案必须先解决资金来源。
+9. score_kv 三租户轮转（K(t) → loan 的 dO_r0 → K(t+1)，§4.4 kscore 行的相位配对）
+   已由独立读码二次确认（2026-08-06）：K2a 的拷贝必须插在
+   [dQ(t−1) 环信用释放, loan(t−1) 填充] 窗口内，把拷贝排在 warp0 的
+   loan 填充之前即天然满足（该窗口与现行 kdq 会合窗不同——现行 kdq 从 GMEM
+   取数，不依赖 score_kv 存活；K2a 拷贝依赖）。
