@@ -11814,7 +11814,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
 
     @cute.jit
-    @cute.jit
     def _gather_kdq_v_f2(
         self,
         pipe_round,
