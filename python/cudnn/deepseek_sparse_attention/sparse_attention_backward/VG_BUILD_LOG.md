@@ -223,6 +223,7 @@ rank 置换的 n 序），属重构级，不是 rider。
 - 附带：vg_5_trace（3bcdde3，MAT_ACQ/MAT_WAIT/RK_ACQ 细化名额）继承共享 pds_com，
   采 C/S1 之前不可用，采定后需 rebase。
 
+| v_w3_3 | M2 复活重测：deg6 FFMA exp2 搬上 v_w3_2（helper 与 vk_4 逐字节同） | 9.468 | 8.442 | 1.1216 | **null（预期内分支），归档**——同 run v_w3_2 腿 9.465 @ 8.267（1.1449）：candidate Δ+0.003≈0，ratio 差全来自两腿 baseline 漂移 2.1%。**吸收判决第三次确认（vk_2 基→W17 三刀后基座，结论不变）：M2 正式 Rubin-locked**。"环穿 math publish"因果链为真但 math 弹性池在 release 粒度吸收全部 SOFTMAX 缩短；W17<5.84 的解锁条件维持 |
 | **v_w3_2** | R2：kdq 会合 barrier B → count-128 硬件到达（PTX 成对完成协议，vk_7 基） | **9.441** | 8.305* | **1.1368** | **达标，转正现役**——同 run vk_7 腿 9.527 @ 1.1403，−0.086ms 双指标同向；四 case max_abs 逐位同 vk_7。源码裁决驱动的协议手术首胜：裁决先抓出零填 STS 一票否决点（holes 命门）→ PTX 官方成对协议修补（无-.noinc arrive-on + release arrive）→ W17 的 B 侧等待终点从"最慢线程全量排空后的软件收敛"提前到"真实最后一笔 cp.async 落地"，gather 线程卸下逐线程 drain 即刻解放。选址遵循 v_w3_1 教训（落在 pacer 自己所等的链段上）。*baseline 由 ratio 反推 |
 | v_w3_1 | W3：score-K 索引前提到迭代顶（vk_7 基，R1） | 9.515 | 8.320 | 1.1435 | **null，归档**（同 run vk_7 腿 9.528 @ 8.341=1.1424；Δ ms −0.014 < 0.05 门且 ratio 反高 +0.0012 双指标矛盾；四 case max_abs 逐位同 vk_7）。**机制判读：棘轮律的第五次显形，首次在胜家族内**——被削的是 gather 的 pre-A 段，而 barrier A 的迟到方是 W17（g2-acquire ~2.2µs 顶着），非迟到方的提前被会合吸收。**家族规则精化：延迟暴露刀必须落在 pacer 的串行链上**（W2 落在 W17 所等的 post-A 填充段=兑现 −0.168；W3 落在 gather 的提前段=吸收）。R1 关闭，R2（F17 硬件到达信令，落点=W17 所等的 B 侧）前置源码裁决进行中 |
 
