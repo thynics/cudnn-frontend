@@ -314,3 +314,30 @@ panel 火车。双生产者相位记账 = vd_1 已证结构。零字节。预期
 （vk_3）。剩余杠杆：**M2 FFMA deg6 exp（等近似替换档终裁，唯一大额零风险杠杆）**、
 D1/角色再平衡（~0.4µs 级）、SM100 追平线接受判定（E1 已落章：baseline 被自身
 drain 地板钉在 ~8.4-8.6）。
+
+### v_f2_1 验尸补遗（2026-08-06 晚）：管线源码已本地取证，协议误用假说全灭
+
+**新能力**：CUTLASS DSL 4.5.0 源码已可本地阅读——`nvidia-cutlass-dsl` 是元包，
+真身 `nvidia-cutlass-dsl-libs-base==4.5.0`（pure-python wheel，pip download
+--platform manylinux_2_28_x86_64 可在 macOS 拉取）。pipeline 实现在
+`cutlass/pipeline/{sm90,sm100,helpers}.py`。以后所有协议手术先读源码再动手。
+
+**源码取证结果（全部否定既有假说）**：
+1. `producer_acquire` = 纯 `sync_object_empty.wait(index, phase)`，任意线程、
+   任意数量可调用——r2 的"128 线程 acquire 打爆计数"假说**不成立**；
+2. `producer_commit` = `sync_object_full.arrive(index, producer_mask)`，
+   AsyncThread 下 = 裸 `mbarrier_arrive(bar, dst_rank=leading CTA)`——
+   **线程身份无关**，"同 full mbar 上双生产者交错到达"假说**不被原语语义支持**；
+3. `arrive_count` 仅由 CooperativeGroup.size 决定（load_elect_group=2，
+   每 CTA 一次到达打到 leading CTA），与谁到达无关；
+4. mbarrier init 由 warp0 统一执行 + defer_sync 后的 cluster sync 覆盖全角色；
+5. `_IketProxy` 在 iket 未加载时 trace 期直接 no-op（r2-r4 manifest
+   `iket_instrumented:false` 佐证）——"span 挪警组导致 GMEM scribble"假说**不成立**。
+
+**修订后的机制状态**：损坏机制未定。已排除：协议误用（源码级）、线程形状
+（r3 实测）、拆分提交（r4 实测）、span 副作用（源码+manifest）。剩余嫌疑收敛到
+**新控制流的 DSL lowering 层**（scf.if 包裹的 mbarrier 等待/elect 结构、或
+双状态对象在 trace 期的某种展开差异）——需要 SASS 对比才能推进，EV 不支持
+继续投入。归档判决维持：**kdq 供给段关闭，vk_2/vk_5 基座不变**。
+可复现空间签名（r2/r4 同最差坐标 (7,101,57)）作为未解之谜入档，供未来遇到
+同类损坏时对照。
