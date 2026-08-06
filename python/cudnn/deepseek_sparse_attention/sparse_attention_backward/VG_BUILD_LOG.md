@@ -17,6 +17,8 @@
 | vg_3 | T2R 双发单 fence | 10.454 | 8.313 | 1.2575 | **null**（candidate 与 vg_2 同，ratio 差异=基线漂移） |
 | **vg_4** | topk 索引批量预取（两个 sparse gather） | **9.936** | 8.376 | **1.1862** | **采纳，本轮最大单刀 −0.51ms** |
 | **vg_5** | exp 全宽条带（32 EX2 在飞，结果写回 r_score） | **9.771** | 8.390 | **1.1646** | **采纳，当前最优** |
+| vg_6 r1 | epi 双缓冲（round1 → ring） | — | — | — | **correctness FAIL 5.4%**：dq_done 是早提交（只跟踪 dQ MMA），ring 在 epi 开始时仍被尾部 dVdK 读 → WAR |
+| vg_6 r2 | epi 双缓冲（round1 → stationary dO panel） | 9.781 | 8.345 | 1.1720 | **null**（修正后正确，但 epi 大头是标量 scatter 不是 TMA 飞行）→ 归档，基座保持 vg_5 |
 
 全部版本 correctness 4/4 PASS。累计 10.572 → **9.771（−7.6%）**，ratio 1.2786 → **1.1646**。
 
@@ -44,6 +46,14 @@ T2R + SMEM staging + TMA 的串行结构成本，与 vg_4/vg_5 修掉的是同�
 折合 ~1.0 ms 差距——**约等于当前剩余缺口 1.37 ms 的大头**。
 优先级建议提到 D1 之前：先拍一张 epilogue 的分段 trace（或直接读
 `_store_dq_epi_tma_v12` 找串行点），代价远低于 warp 重划。
+
+**vg_6 已裁决其中两个成分**：TMA 飞行/读等待（双缓冲重叠 = null，非大头）；
+剩余唯一嫌疑 = **标量 scatter（128 STS.U16/线程/round）+ T2R**。对应手术 =
+S2 预登记的"16-DP T2R + stmatrix 向量 store"（v9.3 在 P/dS publish 上的同配方），
+难点是目的地是 [H,D] 而累加器坐标是 (d,h)——需要 transpose 布局代数 +
+get_smem_store_op 在组合布局上的推导，属中风险手术，留给下一轮。
+**vg_6 顺带留下一条可复用结论：epi 时刻真正死透的缓冲只有 stationary panels**
+（dq_done 早提交使 ring 和 P/dS face 都可能仍被尾部 dVdK 读）。
 
 ## 结构性发现（本轮最重要的产出）
 
