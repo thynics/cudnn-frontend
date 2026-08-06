@@ -46,6 +46,25 @@ LAND_P 0.108 / DKV_ACQ 0.054 / KS2 0.098 / LAND_DS 0.052（cta0 稳态均值）�
 | **vk_7 r2** | W2：kdq 索引载入提到 barrier A 前（vk_5 基） | **9.526** | 8.276 | **1.1511** | **达标，转正现役**——同 service 同节点 vk_5 对照 9.694，−0.168ms，双指标同向；correctness 四 case max_abs 逐位相同（纯重排类）。守恒律允许的唯一攻击方向（缩小填充本身）兑现：~0.6µs 索引 GMEM 延迟藏进 gather 在 A 处的空等。vg_4 家族（延迟暴露）战绩 **5/5**。r1 挂 DSL 编译门（语句级 range() = 动态 scf.for 禁 list 增长；v8 形态=推导式+迭代 list），一次往返修复 |
 | v_gpt_1 r2b | kdq 换 TMA tile::gather4（外部 agent 提案 K2-G4，v_gpt 独立谱系） | 11.707 | 8.368 | 1.3989 | **证伪，归档**（correctness 4/4 PASS——tensormap 构造/半平面地址代数/SW128 相位/OOB 零填全对；纯性能回归 +1.8ms；验尸见下） |
 
+| v_gpt_2 r1 | owner-push：peer-h 面板代改走对端面板 DSM 推送（vk_7 基） | 11.618 | 8.257 | 1.4072 | **重度证伪，归档**（correctness 4/4——远程 arm/推送协议全对；+2.09ms vs vk_7；验尸见下） |
+
+**v_gpt_2 验尸（2026-08-06）：owner-push 把并行运输串行化了；但 L2 让位假说获得实锤**
+- 机制双面：**REDUCE_ATOMIC 1.81→0.864**（GMEM 往返 −48KB/tile 让 L2 给原子腾位，
+  v_gpt_1 反向对照 3.49——同一假说两个方向都验证）；WAIT_dQ 0.146→0.064。
+- 但供给形态劣化吃掉一切：vk_7 的每代 = owner 本地 bulk **∥** peer 自发 TMA
+  （两台引擎并行、各自 acquire 即开跑）；v_gpt_2 的每代 = owner bulk **→** push
+  （单引擎串行，peer 份额要等 owner 自己的拷贝完成后才启程）。dVdK gap 呈现
+  新签名——隔对大洞 [0.03, 0.83, 0.06, 1.1, 0.06, 1.14]（peer 源 pass 迟到）；
+  WAIT_dK 0.32→1.392；SMEM 写口压力外溢（MATH_SOFTMAX 2.14→2.544、LOAD_K
+  2.27→2.544）；period 6.8→7.49（注入口径）。
+- **运输家族关闭（第 7 张证伪回执）**：vc_3/vd_1/vh_1/vre_3/vk_6/v_gpt_1/v_gpt_2
+  ——现役供给拓扑（own 本地 bulk + peer L2-hot TMA + gather cp.async）在"谁搬、
+  怎么搬、搬给谁"三个维度上均为局部最优。**守恒律最终形态：饱和供给环上，
+  串行内容与其放置同时守恒；唯二赢法 = 缩小关键路径上的工作本身（延迟暴露
+  家族 6/6）或增加真实槽位（Rubin）。**
+- 净留存资产：L2 让位价值 ~1µs/tile 的 reducer 时间（若能不付串行化税获得）；
+  owner-push 全套协议（远程 arm→push 相位安全）硅上验证归档。
+
 **v_gpt_1 验尸（2026-08-06）：TMA 异步引擎是共享串行资源，512B 级小事务在它上面排队**
 - 机制全对（4/4 PASS 证明 gather4 全链路成立，含 holes/-1 与尾 tile 的 OOB 零填）。
 - trace（同口径自比）显示**每条腿都变慢**：period 6.80→9.78；ROUTE_K 2.27→3.17
