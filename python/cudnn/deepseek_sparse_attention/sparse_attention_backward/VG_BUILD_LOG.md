@@ -49,14 +49,17 @@ LAND_P 0.108 / DKV_ACQ 0.054 / KS2 0.098 / LAND_DS 0.052（cta0 稳态均值）�
 | v_gpt_2 r1 | owner-push：peer-h 面板代改走对端面板 DSM 推送（vk_7 基） | 11.618 | 8.257 | 1.4072 | **重度证伪，归档**（correctness 4/4——远程 arm/推送协议全对；+2.09ms vs vk_7；验尸见下） |
 
 **v_gpt_2 验尸（2026-08-06）：owner-push 把并行运输串行化了；但 L2 让位假说获得实锤**
-- 机制双面：**REDUCE_ATOMIC 1.81→0.864**（GMEM 往返 −48KB/tile 让 L2 给原子腾位，
-  v_gpt_1 反向对照 3.49——同一假说两个方向都验证）；WAIT_dQ 0.146→0.064。
+- 机制双面（**2026-08-07 审计修正**：原文 1.81 是 vk_1 时代每 tile 包络、0.864 是
+  每 span 实例——三重跨口径。同 parser 每 span 实例中位数、对照 = vk_7 干净 trace）：
+  REDUCE_ATOMIC 0.976→0.864（**−11.5%**，非原文暗示的 ~50%；"L2 让位 ~1µs/tile
+  应收账款"撤销）；v_gpt_1 反向 0.976→3.49（+258%，恶化方向的结论不变）。
 - 但供给形态劣化吃掉一切：vk_7 的每代 = owner 本地 bulk **∥** peer 自发 TMA
   （两台引擎并行、各自 acquire 即开跑）；v_gpt_2 的每代 = owner bulk **→** push
   （单引擎串行，peer 份额要等 owner 自己的拷贝完成后才启程）。dVdK gap 呈现
   新签名——隔对大洞 [0.03, 0.83, 0.06, 1.1, 0.06, 1.14]（peer 源 pass 迟到）；
-  WAIT_dK 0.32→1.392；SMEM 写口压力外溢（MATH_SOFTMAX 2.14→2.544、LOAD_K
-  2.27→2.544）；period 6.8→7.49（注入口径）。
+  WAIT_dK 0.56→1.392（前值改锚 vk_7 同 parser）；SOFTMAX 2.208→2.544（+0.34）；
+  **审计修正：LOAD_K 证据腿作废**（vk_7 同 parser =2.528，差 +0.016≈0）——"SMEM
+  写口外溢"降级为单证据腿存疑；period 6.96→7.49（注入口径）。
 - **运输家族关闭（第 7 张证伪回执）**：vc_3/vd_1/vh_1/vre_3/vk_6/v_gpt_1/v_gpt_2
   ——现役供给拓扑（own 本地 bulk + peer L2-hot TMA + gather cp.async）在"谁搬、
   怎么搬、搬给谁"三个维度上均为局部最优。**守恒律最终形态：饱和供给环上，
@@ -67,10 +70,12 @@ LAND_P 0.108 / DKV_ACQ 0.054 / KS2 0.098 / LAND_DS 0.052（cta0 稳态均值）�
 
 **v_gpt_1 验尸（2026-08-06）：TMA 异步引擎是共享串行资源，512B 级小事务在它上面排队**
 - 机制全对（4/4 PASS 证明 gather4 全链路成立，含 holes/-1 与尾 tile 的 OOB 零填）。
-- trace（同口径自比）显示**每条腿都变慢**：period 6.80→9.78；ROUTE_K 2.27→3.17
-  （64 个索引载入挪上 W17 串行路径 + TMA 飞行裸暴露）；MAT_QDO 2.19→2.88/span
+- trace 对照（**2026-08-07 审计修正**：原文"同口径自比"的前值实为 vk_1_trace 时代
+  数字，标注不实；此处重锚 vk_7 干净 trace 同 parser）：period 6.960→9.78（+41%）；
+  ROUTE_K 1.760→3.17（+1.41）；MAT_QDO 2.416→2.88/span
   （**面板也慢了**——64 笔 512B gather4 与面板 bulk 拷贝共用每 SM 异步引擎，
-  小事务排队拖累大事务）；REDUCE_ATOMIC 1.8→3.49/span（L2 通路受离散小读干扰）；
+  小事务排队拖累大事务）；REDUCE_ATOMIC 0.976→3.49/span（+258%，L2 通路受离散
+  小读干扰）；
   dVdK gap 出现单个 2.9µs 大洞。
 - **教训入账**：cp.async（LSU 路径，128 线程并行）→ TMA 引擎（串行队列）对
   512B 级稀疏小事务是负 EV；"transport 优化 kdq"一族到此测尽（cp.async 的
