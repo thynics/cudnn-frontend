@@ -11913,21 +11913,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     Int32(local_n),
                     index_in_group,
                 )
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.fence_view_async_shared()
-        self.gather_barrier.arrive_and_wait()
-        # r3: v8 commit shape restored -- the committing warp re-fences
-        # after the barrier and commits under elect_one from a uniform
-        # warp (v8's W17 did exactly this; r2 dropped the post-barrier
-        # fence and committed from a single diverged thread).
-        if role_tidx < Int32(32):
-            cute.arch.fence_view_async_shared()
-            with cute.arch.elect_one():
-                pipe_round.producer_commit(g_round_com)
-        g_round_com.advance()
+        # r4: split-round commit retired -- both rounds fill back to
+        # back and commit together after one drain+fence+barrier, the
+        # byte-exact v8 data path (r2/r3 both failed correctness with the
+        # split; the only remaining delta vs v8 is the producer warp).
 
-        # Round 1: fill, drain, fence, commit g1.
+        # Round 1 fill follows immediately.
         for row_iteration in cutlass.range_constexpr(rows_per_group):
             local_n = kdq_local_n[row_iteration]
             kv_index = kdq_kv_index[row_iteration]
@@ -11955,6 +11946,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         self.gather_barrier.arrive_and_wait()
         if role_tidx < Int32(32):
             cute.arch.fence_view_async_shared()
+            with cute.arch.elect_one():
+                pipe_round.producer_commit(g_round_com)
+        g_round_com.advance()
+        if role_tidx < Int32(32):
             with cute.arch.elect_one():
                 pipe_round.producer_commit(g_round_com)
         g_round_com.advance()
