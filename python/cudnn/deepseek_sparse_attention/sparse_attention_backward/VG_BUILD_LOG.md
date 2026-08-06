@@ -150,9 +150,18 @@ rank 置换的 n 序），属重构级，不是 rider。
 | 4 | exact-P/dS 重布局 | 解锁 M3 + 省 8 KB | 重构级 |
 | 5 | ve_1 复活 | 大 | 需 24 KB（panel 流式化） |
 
-**E1（baseline 内部分解）与 CG1 混流 ISA 裁定仍未落章**——前者决定"超越"是否物理可能
-（若 baseline 本身 drain-bound ~4.6，追平线即地板），后者决定 P1 梯度归位这条
-4.7-5.2 µs 备用路是否存在。两项都是零 GPU 成本。
+**E1 已落章（2026-08-06，vk_1_trace 同 run 双采）**：baseline period 4.648，
+reducer busy 3.98（duty 85.7%）——**drain-bound 实锤**，自身下探空间 ≤0.6µs，
+被钉在 ~8.4-8.6；vk_1 的 reducer busy 仅 2.50/tile（rank 分域体积减半）——
+**CG2 的 1.5µs/tile 结构性 drain 优势首次双边实测确认，超越的物理来源坐实**。
+F 账：vk_1 F≈31µs/token vs baseline 6.8，ΔF≈0.35-0.43ms（缺口 ~30%）。
+
+**pacer 判决（vk_1 trace，推翻 vre_1 时代的"环松弛"框架）**：W17 供给链自身
+饱和——ROUTE_K 2.27（真身 = kdq 会合区）+ MAT_QDO×2 4.38 = 6.65 ≈ period 6.80，
+零 slack。这重释了两桩旧案：vd_1 null（拓扑等价、槽没变多）与 vh_1 里环深 3
+即使资金无害也兑现不了（供给链饱和时加槽无用）。手术梯子 K1-K5 见
+外部复盘（~/proxy/dsa-vk1-traceable-r1）；K3（环深）必须排在 K2（kdq 退役）
+之后。CG1 混流 ISA 裁定仍未落章。
 
 ## 工装备忘
 
