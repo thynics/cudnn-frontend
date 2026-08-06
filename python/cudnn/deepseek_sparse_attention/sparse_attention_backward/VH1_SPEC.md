@@ -66,3 +66,37 @@ pad gen 的信用节拍（+4 协议操作/tile，~0.2µs 摊销，账已计）�
 三槽 fragment 静态绑定的核对表（上表即合同）；
 交错发射后 s_done/dp_done 的 commit 位置（两 GEMM 全部发完后各 commit 一次，
 tracked set 覆盖交错链——与 v7.py 的 pass 尾双 commit 同构）。
+
+---
+
+## 实现进度（2026-08-06，vh_1 建造中）
+
+**已落地**（`dsa_bwd_sm100_2cta_vh_1.py`，py_compile 过，DSL trace 未过）：
+
+- host：score_b layout 由 K_CHUNKS 段改 `K_SEG_STAGES=2` 分段；断言 ≤8192；
+- V2 常量：`ROUND_STAGES=3`、`ROUND_GENS_PER_TILE=12`、`K_SEG_STAGES=2`；
+- 存储：score_kv 16384→8192 elem（捐 16KB）、新增 `round_buf_c`、
+  kscore_mbars 2→4、round_mbars 4→6、round_tma_mbars 2→3、loan_tma_mbars 删除；
+- 视图/片段：loan_quad 全删、`round_quad` 三元组、`quad_fragment_c`、
+  dot/qt 的 buf-c TMA partition、`s_dq_epi` 改骑 round_buf_a；
+- gather 分支**整段重写**为段流（4 段/tile 逐段 acquire/fill/commit +
+  每 tile 一次 kdq 会合），`_load_score_kv_segment` 新增（沿用 vg_4 索引预取）；
+- grads head 的 dV(r0) 两 pass 改读 slot 2/0（`quad_fragment_c` / `quad_fragment_a`）。
+
+**未完成（下一步接手清单，按依赖序）**：
+
+1. **leader 的 S/dP 逐 chunk 交错**：`_issue_score_v2` / `_issue_score_chunks_v7`
+   目前一次性跑完 4 chunk 且假设 K 全驻。需改为
+   `for c in 0..3: kscore.consumer_wait → S-gemm(c) → dP-gemm(c) → kscore.consumer_release`，
+   ACCUMULATE=False 仅 c==0；两个 done pipe 在 4 段全发完后各 commit 一次。
+   注意：leader 现在持 **两个** kscore consumer state（S/dP 共用同一段，单 state 即可）。
+2. **W17 round 循环改 12 gen**：dO_r0 对回环（原 loan 位）、pad×2、
+   TMA mbar 按 slot mod 3、lag-1 commit 保持；`t_*_smem_c` 已就绪。
+3. **grads tail 的 4 个 pass** 按 slot map 换 fragment（当前仍是 a/b 交替）。
+4. **epi-safe 门迁移**：原由 gather 在 `pipe_kscore.producer_tail` 后 arrive，
+   现 staging 在 round_buf_a/b ⇒ 改由 **W17 在 `pipe_round.producer_tail` 后** arrive
+   （math 侧 wait 点不变，`loan_epi_safe_mbar` 字段名保留）。
+5. 尾/单 tile 路径复核（gather 已统一，无分叉；leader/W17 的 tile_count==1 分支需重看）。
+
+**风险提示**：kscore 现为 2-stage、每 tile 4 gen（4 mod 2 = 0，相位安全）；
+leader 必须**每段 release 一次**，否则 gather 在第 3 段 acquire 上死锁。
