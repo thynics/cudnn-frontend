@@ -33,20 +33,23 @@ mKV.stride[0]（运行时值，测试负载 512）。列坐标单位 = 元素。
   → cutlass 4.5.0 选择 **MN_SW128**（2048 bits % 1024 == 0，源码逻辑核实）。
 - 驱动约束：swizzle≠NONE 时 box 内维 ≤ swizzle 尺寸（128B）
   ⇒ **提案原文的 16×[4行×256B] 非法**，必须切半宽。
-- MN_SW128 原子 = (64 elem × 8 row)，Sw<3,4,3>，1KB/原子；全镜像 16KB =
-  2 个 M-原子（d 半块）× 8 个 K-原子行。推导的寻址（元素单位）：
+- **实测布局（R4 容器 compile 探针，2026-08-06）**：
+  `S<3,4,3> ∘ 0 ∘ (((64,2),16),1,4,1):(((1,4096),64),0,1024,0)`，cosize 8192 元素。
+  化简（注意 (16,4):(64,1024) 因 16·64=1024 合并为 n·64）：
   ```
-  addr(d, n) = base + 1KB·(d÷64) + 2KB·(n÷8) + Sw₃,₄,₃(128B·(n mod 8) + 2B·(d mod 64))
+  addr(d, n) = base + Sw₃,₄,₃( 2B·(d mod 64) + 128B·n + 8192B·(d÷64) )
   ```
+  即**半平面主序**：d 半块 0 的 64 行（128B/行，连续 8KB）在前，半块 1 在后。
+  （我最初推导的 1KB/2KB 原子交错式是错的，以实测为准——实测形态对 gather4
+  更有利：行距恒 128B、行组永不跨结构边界。）
 - TMA 的 SW128 XOR 按**绝对 SMEM 地址位**作用（与 CuTe Swizzle 同构），
-  因此 4 行一组的 box 无论落在原子的 0-3 行还是 4-7 行相位都正确；
-  box 内行距 = box 内维字节数 = 128B，恰等于原子内 K 行距 ✓。
+  box 内行距 = box 内维字节数 = 128B，恰等于半平面内行距 ✓。
 
 **最终几何**：每 round **32 笔 gather4**（16 个行组 × 2 个 d 半块），每笔
 [4 行 × 64 elem(128B)] = 512B：
 ```
-col(round r, half h)   = 256·r + 128·rank + 64·h        （元素）
-smem_base(n0, h)       = slot_base + 1024·h + 2048·(n0÷8) + 128·(n0 mod 8)  （字节）
+col(round r, half h)   = 256·r + 128·rank + 64·h     （元素，tensormap dim0 坐标）
+smem_base(n0, h)       = slot_base + 8192·h + 128·n0 （字节）
 rows                   = topk_idx[n0 .. n0+3]（无效行钳位，见 §2.3）
 ```
 每 tile 2 round × 32 = 64 笔，expect_tx = 16384B/round。发射成本 ~64×几 ns，可忽略。
@@ -77,14 +80,18 @@ holes（索引 -1）与尾 tile（global_n ≥ topk）统一钳位：
 `row = valid ? idx : S_kv`（S_kv 必 OOB → 零填）。每索引一条 select，
 不依赖"负坐标零填"这个文档未明示的行为（R1 的保险）。
 
-## 3. 残余风险（容器侧核查项）
+## 3. 残余风险核查结果（容器侧，2026-08-06，任务 dsa-vgpt1-g4-desk-r1）
 
-| # | 风险 | 核查方式 | 失败退路 |
-|---|---|---|---|
-| R1 | gather4 的 OOB 行是否确定零填 | 容器内 PTX ISA 9.3 原文 §tile::gather4 | 钳位到 S_kv 已是保险；若 OOB 语义整体缺失 → 预清零 SMEM 槽（+成本，需重估） |
-| R2 | gather4 的 tensormap boxDim[1] 约定（1 还是 4） | ISA 原文 + CUTLASS copy_traits_sm100_tma.hpp | 编码探针（compile-only）两种各试 |
-| R3 | DSL 能否在 kernel 内取 tma_atom 的描述符指针供 inline_asm | grep 容器 cutlass 4.5.0 CuTeDSL（gather4 原生封装？descriptor 访问器？） | 若有原生封装直接用；都没有 → 描述符经 kernel 参数手工传递 |
-| R4 | §1 推导的原子平铺 stride（1KB/2KB）与实际 dq_a_staged 串比对 | 一行 layout_report 打印（vk_3 诊断同款，compile-only） | 若不符按实测串重推 smem_base 公式 |
+| # | 结果 |
+|---|---|
+| R1 | **PASS**：OOB_ZERO tensormap 下越界行零填（signed s32 坐标 + OOB 通则 + gather4 继承 tiled 规则的组合推论，非逐字明示）。§2.3 的 S_kv 钳位保留作保险。 |
+| R2 | **PASS**：ISA 明示 boxDim[1] 必须 = 1（不是 4）。tensormap = rank-2、interleave 不支持、swizzle 未被禁止、dim0 box = 行长。 |
+| R3 | **PASS（无原生封装，显式描述符路径可行）**：cutlass **4.5.1**（容器实际版本）Python 包只有内部 IR 枚举 `TmaLoadMode.gather4`，无公开 atom。可行路径：`cpasync.copy_tensormap(tma_atom, tensormap_ptr)`（公开导出，helpers.py:396-413）把 atom 描述符复制进显式 128B workspace 指针 → 指针作 kernel 参数 → inline asm（"l" 约束，CCCL `cp_async_bulk_tensor_tile_gather4` 签名佐证）。禁读私有 `_trait.value`。 |
+| R4 | **实测与推导不符，已按实测重推**（见 §1）：实际为半平面主序，smem_base = slot + 8192·h + 128·n0。 |
+
+**新增实现风险（R5）**：host 侧 `make_tiled_tma_atom` 是否接受 [64×1]-box + SW128
+的 smem 布局来产出 boxDim=[64,1] 的 tensormap——需 compile 探针；不行则退
+interface 层 `cuTensorMapEncodeTiled`（cuda-python bindings）手工编码 128B 描述符。
 
 ## 4. 预登记判据（沿用外部提案 + 本线补充）
 
