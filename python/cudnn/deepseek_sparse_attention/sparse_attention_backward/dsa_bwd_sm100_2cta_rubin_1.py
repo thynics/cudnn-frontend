@@ -4012,8 +4012,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # within the tile; g0/g1 are the kdq pair on slots 0/1, panels are
     # g2..g9).  Consumption order == fill order (FIFO):
     #   dO_r0 h0/h1, Q_r0 h0/h1, dO_r1 h0/h1, Q_r1 h0/h1.
-    PANEL_SLOTS = tuple(
-        (gen + 2) % ROUND_STAGES for gen in range(8)
+    # NOTE: no comprehension here -- a class-body genexp cannot see
+    # class-scope names (GR100 r2 receipt: NameError ROUND_STAGES).
+    PANEL_SLOTS = (
+        2 % ROUND_STAGES,
+        3 % ROUND_STAGES,
+        4 % ROUND_STAGES,
+        5 % ROUND_STAGES,
+        6 % ROUND_STAGES,
+        7 % ROUND_STAGES,
+        8 % ROUND_STAGES,
+        9 % ROUND_STAGES,
     )
 
     # P/dS publication faces (tile parity).  Face f serves tiles with
