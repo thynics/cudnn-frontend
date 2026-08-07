@@ -6019,10 +6019,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             _iket.mark("ROLE_MATH", rank)
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
             if warp_idx == Int32(self.MATH_WARP_BEGIN):
-                load_stats_token = _iket.range_start(
-                    "LOAD_STATS",
-                    Int32(0),
-                )
                 if tile_count > Int32(0):
                     cute.copy(
                         stats_copy_atom,
@@ -6037,10 +6033,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
-                _iket.range_end(
-                    load_stats_token,
-                    Int32(0),
-                )
             self.math_barrier.arrive_and_wait()
 
             s_state = pipeline.make_pipeline_state(
@@ -6224,19 +6216,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
 
             for loop_iter in cutlass.range(tile_count):
-                wait_s_token = _iket.range_start(
-                    "WAIT_S(i)",
-                    loop_iter,
-                )
                 pipe_s_done.consumer_wait(s_state)
-                _iket.range_end(
-                    wait_s_token,
-                    loop_iter,
-                )
-                t2r_s_token = _iket.range_start(
-                    "T2R_S(i)",
-                    loop_iter,
-                )
                 if s_state.index == Int32(0):
                     cute.copy(score_copy, score_source, r_score)
                 else:
@@ -6248,10 +6228,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.arch.fence_view_async_tmem_load()
                 pipe_s_done.consumer_release(s_state)
                 s_state.advance()
-                _iket.range_end(
-                    t2r_s_token,
-                    loop_iter,
-                )
 
                 wait_dp_token = _iket.range_start(
                     "WAIT_dP(i)",
@@ -6262,10 +6238,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     wait_dp_token,
                     loop_iter,
                 )
-                t2r_dp_token = _iket.range_start(
-                    "T2R_dP(i)",
-                    loop_iter,
-                )
                 if dp_state.index == Int32(0):
                     cute.copy(dp_copy, dp_source, r_dp)
                 else:
@@ -6273,10 +6245,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.arch.fence_view_async_tmem_load()
                 pipe_dp_done.consumer_release(dp_state)
                 dp_state.advance()
-                _iket.range_end(
-                    t2r_dp_token,
-                    loop_iter,
-                )
 
                 math_pd_token = _iket.range_start(
                     "MATH_PD(i)",
@@ -6434,17 +6402,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     math_store_token,
                     loop_iter,
                 )
-                math_bar1_token = _iket.range_start(
-                    "MATH_BAR1(i)",
-                    loop_iter,
-                )
                 cute.arch.mbarrier_arrive(
                     pds_ready_mbars,
                     rank,
-                )
-                _iket.range_end(
-                    math_bar1_token,
-                    loop_iter,
                 )
                 pds_state.advance()
                 _iket.range_end(
@@ -6460,10 +6420,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     loan_epi_safe_mbar,
                     Int32(0),
                 )
-                dq_epi_0_token = _iket.range_start(
-                    "DQ_EPI(r)",
-                    Int32(0),
-                )
                 self._store_dq_epi_tma_v12(
                     t_dq[0],
                     dq_tmem_load,
@@ -6477,14 +6433,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     rank,
                     mtx,
                 )
-                _iket.range_end(
-                    dq_epi_0_token,
-                    Int32(0),
-                )
-                dq_epi_1_token = _iket.range_start(
-                    "DQ_EPI(r)",
-                    Int32(1),
-                )
                 self._store_dq_epi_tma_v12(
                     t_dq[1],
                     dq_tmem_load,
@@ -6497,10 +6445,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     batch_idx,
                     rank,
                     mtx,
-                )
-                _iket.range_end(
-                    dq_epi_1_token,
-                    Int32(1),
                 )
                 pipe_dq_done.consumer_release(dq_done_state)
                 dq_done_state.advance()
@@ -6700,10 +6644,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
                 # Drain the final tile's gradients.
                 if tile_count > Int32(0):
-                    tail_token = _iket.range_start(
-                        "TAIL",
-                        tile_count - Int32(1),
-                    )
                     dq_acc = tile_count != Int32(1)
                     (
                         round_cons,
@@ -6765,10 +6705,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_dp_done.producer_tail(dp_prod)
                     pipe_dkv_done.producer_tail(dkv_prod)
                     pipe_dq_done.producer_tail(dq_done_prod)
-                    _iket.range_end(
-                        tail_token,
-                        tile_count - Int32(1),
-                    )
 
         elif warp_idx == Int32(self.LOAD_WARP):
             _iket.mark("ROLE_KV_LOAD", rank)
@@ -6786,10 +6722,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # v_s1: only the Q panel is token-resident; dO readiness is
                 # per-chunk through the stream (gather warp 1).  LOAD_QDO
                 # therefore spans the Q half only.
-                load_qdo_token = _iket.range_start(
-                    "LOAD_QDO",
-                    Int32(0),
-                )
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         stationary_tma_mbars,
@@ -6800,10 +6732,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     t_q_gmem[None, rank, 0],
                     t_q_smem[None, 0],
                     tma_bar_ptr=stationary_tma_mbars,
-                )
-                _iket.range_end(
-                    load_qdo_token,
-                    Int32(0),
                 )
                 cute.arch.mbarrier_wait(
                     stationary_tma_mbars,
@@ -7050,10 +6978,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         route_p_token,
                         loop_iter,
                     )
-                    route_ds_token = _iket.range_start(
-                        "ROUTE_dS(i)",
-                        loop_iter,
-                    )
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         landing_mbars + 1,
                         self.PDS_BLOCK_BYTES,
@@ -7075,10 +6999,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
-                    _iket.range_end(
-                        route_ds_token,
-                        loop_iter,
-                    )
                     pipe_pds.producer_commit(pds_com)
                     pds_com.advance()
                     _mbarrier_wait_acquire_cluster(
@@ -7604,10 +7524,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             packed_issue,
         )
 
-        reduce_t2r_token = _iket.range_start(
-            "REDUCE_T2R(i,r)",
-            packed_issue,
-        )
         dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
         wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
         # Baseline slices the fragment-C TMEM tensor down to its atom core
@@ -7681,10 +7597,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         cute.arch.fence_view_async_tmem_load()
         done_pipeline.consumer_release(release_state)
         release_state.advance()
-        _iket.range_end(
-            reduce_t2r_token,
-            packed_issue,
-        )
 
         assert cute.size(thread_values_0) == self.N_TILE // 2
         reduce_atomic_token = _iket.range_start(
@@ -7735,18 +7647,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             wait_dk_token_1,
             packed_issue + Int32(1),
         )
-        reduce_t2r_token_1 = _iket.range_start(
-            "REDUCE_T2R(i,r)",
-            packed_issue + Int32(1),
-        )
         cute.copy(tiled_t2r_1, thread_source_1, thread_values_1)
         cute.arch.fence_view_async_tmem_load()
         done_pipeline.consumer_release(release_state)
         release_state.advance()
-        _iket.range_end(
-            reduce_t2r_token_1,
-            packed_issue + Int32(1),
-        )
 
         reduce_atomic_token_1 = _iket.range_start(
             "REDUCE_ATOMIC(i,r)",
