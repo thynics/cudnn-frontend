@@ -1,13 +1,21 @@
 """v_s1 desk probe: layout algebra behind the dO chunk stream.
 
-CPU-only (no GPU, no pipeline lock): replicates the host-side layout
-construction of v_s1's __call__ verbatim and asserts the identities the
-kernel relies on:
+r2 (post-mortem of dsa-vs1-r1-1786082768): every cute layout/MMA
+construction needs an active MLIR trace context -- bare host calls die
+with "Expected an MLIR object (got None)" inside make_trivial_tiled_mma
+(_pack_x -> MakeShapeOp with no insertion point; verified against the
+nvidia-cutlass-dsl-libs-base 4.5.0 sources).  The probe body therefore
+lives in a @cute.jit function driven by cute.compile: the asserts are
+plain Python on static values, so they fire at trace time; no kernel is
+launched and no GPU is required (arch falls back to CUTE_DSL_ARCH or
+the sm_100 default).
+
+Asserted identities (the ones the v_s1 kernel relies on):
 
 1. family identity: the 2-stage stream member's per-stage layout equals
    the 4-stage score family's per-stage layout (outer AND swizzle) --
-   the TMA atom is built from the latter, the staging view from the
-   former, so their byte orders must coincide;
+   the chunk TMA atom is built from the latter, the staging view from
+   the former, so their byte orders must coincide;
 2. size ledger: 2-stage cosize 16384 elements (32 KiB), per-stage
    16 KiB == score_a_stage_bytes == the per-chunk expect_tx.
 
@@ -24,6 +32,10 @@ probe_v_s1_layouts.py
 
 Expected output ends with "ALL PROBES PASS".
 """
+
+import os
+
+os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 
 import cutlass
 import cutlass.cute as cute
@@ -43,7 +55,8 @@ ELEM = cutlass.BFloat16
 ACC = cutlass.Float32
 
 
-def main():
+@cute.jit
+def probe():
     cg2 = tcgen05.CtaGroup.TWO
     score_tiler = (H_TILE_CLUSTER, N_TILE, K_CHUNK)
     score_tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -71,6 +84,7 @@ def main():
     stream_chunk = cute.select(stream_a_layout_staged, mode=[0, 1, 2])
     score_a_stage_bytes = cute.size_in_bytes(ELEM, score_a_layout)
 
+    # Trace-time record (plain prints run once, during tracing).
     print("score_a_staged :", score_a_layout_staged)
     print("stream_a_staged:", stream_a_layout_staged)
     print("per-stage score:", score_a_layout)
@@ -90,6 +104,10 @@ def main():
         "per-stage layouts diverged: the chunk TMA box (built from the"
         " score family) would no longer match the stream staging view"
     )
+
+
+def main():
+    cute.compile(probe)
     print("ALL PROBES PASS")
 
 
