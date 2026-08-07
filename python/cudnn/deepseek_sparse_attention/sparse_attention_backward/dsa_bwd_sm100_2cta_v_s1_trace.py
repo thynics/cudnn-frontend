@@ -4781,8 +4781,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         baked into the partition (dp CG2 slice), so no rank index is
         needed here.  Both slots of the pair share one phase generation.
         DOS_ACQ(i,c) spans each slot-credit wait (blocks on the leader's
-        chunk release); DOS_BRIDGE(i,p) spans the pair's TMA-completion
-        bridging (exposed GMEM flight).
+        chunk release); DOS_BRIDGE(i,c) spans each chunk's TMA-completion
+        bridging (exposed GMEM flight), per chunk so the two in-flight
+        boxes stay separable.
         """
 
         for pair_index in cutlass.range_constexpr(2):
@@ -4809,12 +4810,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 t_dochunk_smem[None, slot],
                 tma_bar_ptr=dostream_tma_mbars + slot,
             )
-        dos_bridge_token = _iket.range_start(
-            "DOS_BRIDGE(i,p)",
-            issue_seq * Int32(4) + Int32(first_chunk),
-        )
         for pair_index in cutlass.range_constexpr(2):
             slot = (first_chunk + pair_index) % 2
+            dos_bridge_token = _iket.range_start(
+                "DOS_BRIDGE(i,c)",
+                issue_seq * Int32(4) + Int32(first_chunk + pair_index),
+            )
             cute.arch.mbarrier_wait(
                 dostream_tma_mbars + slot,
                 dostream_phase,
@@ -4822,10 +4823,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             with cute.arch.elect_one():
                 dostream_pipeline.producer_commit(dostream_com)
             dostream_com.advance()
-        _iket.range_end(
-            dos_bridge_token,
-            issue_seq * Int32(4) + Int32(first_chunk),
-        )
+            _iket.range_end(
+                dos_bridge_token,
+                issue_seq * Int32(4) + Int32(first_chunk + pair_index),
+            )
         return dostream_acq, dostream_com, Int32(1) - dostream_phase
 
     @cute.jit
@@ -6783,10 +6784,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # commit for gen q-1 happens after gen q's TMA is in
                     # flight; barrier q%2 was last waited at iteration q-1,
                     # so it is never re-armed while pending.
-                    mat_qdo_token_0 = _iket.range_start(
-                        "MAT_QDO(m,r)",
-                        loop_iter * Int32(self.D_ROUNDS),
-                    )
                     for flat_gen in cutlass.range_constexpr(8):
                         if cutlass.const_expr(flat_gen < 2):
                             grad_round = 0
@@ -6801,16 +6798,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             grad_round = 1
                             tensor_kind = 1  # Q_r1
                         h_half = flat_gen % 2
-                        if cutlass.const_expr(flat_gen == 4):
-                            _iket.range_end(
-                                mat_qdo_token_0,
-                                loop_iter * Int32(self.D_ROUNDS),
-                            )
-                            mat_qdo_token_1 = _iket.range_start(
-                                "MAT_QDO(m,r)",
-                                loop_iter * Int32(self.D_ROUNDS)
-                                + Int32(1),
-                            )
                         mat_acq_token = _iket.range_start(
                             "MAT_ACQ(m,q)",
                             loop_iter * Int32(8) + Int32(flat_gen),
@@ -6819,6 +6806,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         round_acq.advance()
                         _iket.range_end(
                             mat_acq_token,
+                            loop_iter * Int32(8) + Int32(flat_gen),
+                        )
+                        mat_qdo_token = _iket.range_start(
+                            "MAT_QDO(m,r)",
                             loop_iter * Int32(8) + Int32(flat_gen),
                         )
                         with cute.arch.elect_one():
@@ -6926,13 +6917,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                         t_qt_smem_b[None, 0],
                                         tma_bar_ptr=round_tma_mbars + 1,
                                     )
+                        _iket.range_end(
+                            mat_qdo_token,
+                            loop_iter * Int32(8) + Int32(flat_gen),
+                        )
                     for _ in cutlass.range_constexpr(8):
                         round_com.advance()
-                    _iket.range_end(
-                        mat_qdo_token_1,
-                        loop_iter * Int32(self.D_ROUNDS)
-                        + Int32(1),
-                    )
                 pipe_round.producer_tail(round_acq)
 
         elif warp_idx == Int32(self.RELAY_WARP):
@@ -7034,6 +7024,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 commit_com.advance()
                 commit_com.advance()
                 for flat_gen in cutlass.range_constexpr(8):
+                    mat_wait_token = _iket.range_start(
+                        "MAT_WAIT(m,q)",
+                        loop_iter * Int32(8) + Int32(flat_gen),
+                    )
                     if cutlass.const_expr(flat_gen % 2 == 0):
                         cute.arch.mbarrier_wait(
                             round_tma_mbars,
@@ -7046,6 +7040,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             w19_phase_1,
                         )
                         w19_phase_1 = Int32(1) - w19_phase_1
+                    _iket.range_end(
+                        mat_wait_token,
+                        loop_iter * Int32(8) + Int32(flat_gen),
+                    )
                     with cute.arch.elect_one():
                         pipe_round.producer_commit(commit_com)
                     commit_com.advance()
@@ -7284,7 +7282,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             relay_mbars + 1,
             relay_phase,
         )
+        rng_acq_token = _iket.range_start(
+            "RNG_ACQ(i,g)",
+            packed_issue + Int32(2),
+        )
         round_pipeline.consumer_wait(round_consumer_state)
+        _iket.range_end(
+            rng_acq_token,
+            packed_issue + Int32(2),
+        )
         dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(2),
@@ -7302,7 +7308,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
+        rng_acq_token = _iket.range_start(
+            "RNG_ACQ(i,g)",
+            packed_issue + Int32(3),
+        )
         round_pipeline.consumer_wait(round_consumer_state)
+        _iket.range_end(
+            rng_acq_token,
+            packed_issue + Int32(3),
+        )
         dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(3),
@@ -7358,7 +7372,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             issue_seq * Int32(self.D_ROUNDS * 4) + Int32(4)
         )
         dkv_done_pipeline.producer_acquire(dkv_producer_state)
+        rng_acq_token = _iket.range_start(
+            "RNG_ACQ(i,g)",
+            packed_issue,
+        )
         round_pipeline.consumer_wait(round_consumer_state)
+        _iket.range_end(
+            rng_acq_token,
+            packed_issue,
+        )
         dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue,
@@ -7376,7 +7398,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
+        rng_acq_token = _iket.range_start(
+            "RNG_ACQ(i,g)",
+            packed_issue + Int32(1),
+        )
         round_pipeline.consumer_wait(round_consumer_state)
+        _iket.range_end(
+            rng_acq_token,
+            packed_issue + Int32(1),
+        )
         dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(1),
@@ -7394,7 +7424,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
+        rng_acq_token = _iket.range_start(
+            "RNG_ACQ(i,g)",
+            packed_issue + Int32(2),
+        )
         round_pipeline.consumer_wait(round_consumer_state)
+        _iket.range_end(
+            rng_acq_token,
+            packed_issue + Int32(2),
+        )
         dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(2),
@@ -7412,7 +7450,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
+        rng_acq_token = _iket.range_start(
+            "RNG_ACQ(i,g)",
+            packed_issue + Int32(3),
+        )
         round_pipeline.consumer_wait(round_consumer_state)
+        _iket.range_end(
+            rng_acq_token,
+            packed_issue + Int32(3),
+        )
         dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(3),
