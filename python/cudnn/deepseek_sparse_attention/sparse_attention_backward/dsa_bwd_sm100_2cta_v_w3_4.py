@@ -13014,27 +13014,37 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
             cute.arch.mbarrier_init(loan_epi_safe_mbar, 1)
             _store_shared_seq_v4(khot_seq, Int32(0))
-        # v_w3_4 knife 2: gather warps issue gen0's two per-thread row
-        # index loads before the barrier -- their GMEM latency hides
-        # under the init sync window.  Clamp covers tile_count==0.
+        # v_w3_4 knife 2: gen0's two per-thread row-index loads issue
+        # before the barrier -- their GMEM latency hides under the init
+        # sync window.  Executed by ALL warps unconditionally (r1 hit the
+        # DSL's no-rewrite rule for helper-internal dynamic ifs inside an
+        # explicit scf.if region): non-gather warps compute valid-but-
+        # unused indices (the topk_slot predicate still bounds every
+        # load), and only the gather warps' gen0 call consumes them.
+        # The tile clamp covers tile_count==0 (path unused there).
         w34_g0_tile = tile_count - Int32(1)
         if w34_g0_tile < Int32(0):
             w34_g0_tile = Int32(0)
-        w34_g0_local_n = [Int32(0), Int32(0)]
-        w34_g0_kv_index = [Int32(-1), Int32(-1)]
-        if warp_idx < Int32(self.GATHER_WARPS):
-            (
-                w34_g0_local_n,
-                w34_g0_kv_index,
-            ) = self._score_kv_row_indices(
-                mTopkIdxs,
-                token_idx,
-                batch_idx,
-                w34_g0_tile,
-                topk,
-                rank,
-                tidx,
+        w34_group_index = tidx // self.KV_GROUP_SIZE
+        w34_g0_local_n = [
+            row_iteration * self.KV_NUM_GROUPS + w34_group_index
+            for row_iteration in range(
+                self.N_TILE_CTA // self.KV_NUM_GROUPS
             )
+        ]
+        w34_g0_kv_index = []
+        for w34_local_n in w34_g0_local_n:
+            w34_logical_n = rank * Int32(self.N_TILE_CTA) + w34_local_n
+            w34_topk_slot = (
+                w34_g0_tile * Int32(self.N_TILE) + w34_logical_n
+            )
+            w34_kv_index = Int32(-1)
+            if w34_topk_slot < topk:
+                w34_kv_index = mTopkIdxs[
+                    w34_topk_slot,
+                    (token_idx, batch_idx),
+                ]
+            w34_g0_kv_index.append(w34_kv_index)
         cute.arch.fence_view_async_shared()
         self.cta_barrier.arrive_and_wait()
 
