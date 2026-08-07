@@ -1,7 +1,9 @@
 # v_s1 设计草案：dO 切片流 + loan 退役（基座 = final）
 
-**日期**：2026-08-07 ｜ **状态**：桌面设计中（步骤 1：读 loan 机器，进行到
-_fill_score_loan_do_r0_vc2 @ final:4575）｜ **用户已确认方向与基座**
+**日期**：2026-08-07 ｜ **状态**：⚠️已被 V_S1_SPEC.md 取代（终稿修正本稿三处：
+①own-h S2S/别名被 CG2 同址锁+驱逐论证判死，dO quadrant 代全走 GMEM TMA；
+②byte 账实为净增 +96KB/tile/CTA 而非 +16KB——本稿把 loan own-half 的 SMEM bulk
+误记为 GMEM；③流生产者 = gather warp1，非 W17/W19）｜ **用户已确认方向与基座**
 
 ## 提案（用户原案 + 账面精化）
 
