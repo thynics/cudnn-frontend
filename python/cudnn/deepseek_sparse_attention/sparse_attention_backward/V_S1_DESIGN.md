@@ -40,9 +40,14 @@ dV/dK 中 P/dS 常驻不动；把 dO 面板从 token 常驻改为**每 tile 2-st
 
 ## 待做（步骤 1 余量）
 
-1. 读 dP 的 A 描述符构造（stationary_do 面板 → 换流 staging 的布局等价性：
-   面板 layout = stationary_a_layout_staged K-major 4-chunk staged——流 staging
-   直接复用该布局的 2 个 stage 即可？核对 stage stride 与 TMA box）；
+1. ✅ **已核（2026-08-07）：布局面零新发明**。final:4885-4888——dP 消费
+   stationary_do 用的就是 `score_a_layout_staged`（4-chunk staged），且
+   final:506 断言 stationary 与 score_a 的 swizzle inner 相等。流式化 =
+   staging 物理缩为该家族的 2-stage 形态（chunk c 落 slot c%2），dP 的
+   chunk-issue 描述符 stage 索引 c→c%2——vh_1 的 12-gen 定相代码可回收，
+   且 dO 是 TMA 快生产者（vh_1 铁律例外侧，与其 K-gather 死因本质不同）。
+   TMA 侧：stationary_do_tma 视图（final:4893）换 2-stage 布局 + 逐 chunk
+   发射（4 笔 16KB/tile，box 天然存在）。
 2. 新流水线信用环设计：2-stage FIFO（producer = W17 或 gather？dO slice TMA
    发射点、mbar 账、与 S/dP chunk 发射的相位配对）；三路径等待图
    （稳态/首 tile/tile_count==1）；
