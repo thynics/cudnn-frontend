@@ -32,6 +32,33 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
 
+class _IketProxy:
+    """Forward to real IKET when loaded; otherwise make annotations no-ops."""
+
+    @staticmethod
+    def _api():
+        experimental = getattr(cute, "experimental", None)
+        return getattr(experimental, "iket", None)
+
+    @classmethod
+    def mark(cls, *args):
+        api = cls._api()
+        return None if api is None else api.mark(*args)
+
+    @classmethod
+    def range_start(cls, *args):
+        api = cls._api()
+        return None if api is None else api.range_start(*args)
+
+    @classmethod
+    def range_end(cls, *args):
+        api = cls._api()
+        return None if api is None else api.range_end(*args)
+
+
+_iket = _IketProxy()
+
+
 @dsl_user_op
 def _map_smem_to_cluster_rank(
     smem_ptr: cute.Pointer,
@@ -6279,6 +6306,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
             # executes no pipeline operation at all (FA4 rule).
+            _iket.mark(
+                self.IKET_V2_NATIVE_PROVENANCE,
+                rank,
+            )
             if is_leader_cta:
                 s_prod = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
