@@ -110,6 +110,31 @@ all_empty：tile_count==0 守卫，全机器不转。
 - host 探针 probe_v_s1_layouts.py：布局代数断言。本机无 cutlass wheel，
   **改为 B200 容器内先跑**（委托 prompt 要求 validation 腿前执行）。
 
+## 6. 硅上判决（2026-08-07，r3 = dsa-vs1-r3-1786083915，rev e281049）——负停
+
+- **数值全胜**：探针 PASS；候选/参照两腿 validation PASS、correctness 4/4，
+  四 case max_abs 指纹程序化比对**逐位同**（dense/lengths/holes/all_empty 全部
+  与 final 指纹一致）。手术的协议面（10 代环、dostream 管线、warp1 职责、
+  loan 退役、kscore 单代）全部正确。
+- **性能负停**：候选 13.467873ms vs 参照 v_w3_2 9.456525ms（同 service/job/
+  node/container），Δ=+4.011ms ≈ **+2.27µs/tile**；two_cta_over_baseline
+  1.6216 vs 1.1441 同向。远超 0.05ms 负停门。
+- **量级判读**（未 trace，假说排序）：+2.27µs/tile 落在约束清单"暴露态"
+  预测区间（vd_1：2 固定槽=每奇偶深度 1，+1.4~2.5µs/tile）顶部——
+  首要嫌疑 = dP 头暴露（chunk2/3 TMA 起飞被 chunk0/1 的 MMA 源读 +
+  umma→warp1→TMA→中继 的整圈往返闸住，且 dP 拉长 1:1 顺延 pds→math→
+  grads 脊柱）+ dV r0 环代 just-in-time 三角接力（leader 放 g0→W17→W19→
+  leader）取代 loan 预装。次要嫌疑 = +96KB/tile/CTA L2。**需 trace 腿裁决**。
+- r1（探针 MLIR context）、r2（provenance mark）两轮 prepare 教训已各自
+  修复入库（62cf799 / e281049）。
+- 候选修补方向（未开工，待裁决）：
+  (a) **S/dP chunk 交错发射**——leader 把 S(t) 的 4 个 chunk 与 dP(t) 的
+      chunk 等待交错（S 在常驻 Q 上零等待），让 dP c0/c1 的源读提早完成、
+      c2/c3 的 TMA 飞行藏进 S 剩余 chunk 的执行影子里；不加 SMEM、
+      每 accumulator 累加序不变 ⇒ 数值逐位同保持。
+  (b) 流深 2→3（+16KB，SMEM 净省降为 16KB，违单杠杆纪律需重裁）。
+  (c) 若 trace 判 L2 为主因，v_s1 家族按 byte 账接近死刑。
+
 ## 5. 对抗核查回执（2026-08-07，6 视角 workflow，零 blocker/major）
 
 - 等待图/死锁：warp1 职责序、kdq_barrier 各方、10 代环链、冷启动/单
