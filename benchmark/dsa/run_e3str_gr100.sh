@@ -95,21 +95,50 @@ if os.environ.get("E3STR_ALLOW_ANY_CC") != "1":
     assert flag == "sm_107a", f"gpu_arch_flag()={flag}, expected sm_107a"
 PY
 
-# ncu discovery, identical to run_e3ncu_gr100.sh.
+# ncu discovery with per-candidate chip validation (e3str r1 lesson:
+# the NGC image's PATH ncu 2026.2.1 does not know GR100 -- query-metrics
+# prints "Skipping unsupported chip Unknown" and an empty list).  A
+# candidate is accepted only if its metric list contains
+# gpu__time_duration for the present chip.
 STAGE=ncu_discovery
-NCU="${E3STR_NCU:-}"
-if [[ -z "${NCU}" ]]; then
-    if command -v ncu >/dev/null 2>&1; then
-        NCU="$(command -v ncu)"
-    elif [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/ncu" ]]; then
-        NCU="${CUDA_HOME}/bin/ncu"
-    else
-        NCU="$(ls -1 /usr/local/cuda*/bin/ncu /opt/nvidia/nsight-compute/*/ncu 2>/dev/null | sort -V | tail -1 || true)"
+ncu_knows_chip() {
+    "$1" --query-metrics 2>/dev/null | awk '{print $1}' \
+        | grep -qx "gpu__time_duration"
+}
+if [[ -n "${E3STR_NCU:-}" ]]; then
+    # Explicit contract: if the caller pins a binary, it must work.
+    if [[ ! -x "${E3STR_NCU}" ]] || ! ncu_knows_chip "${E3STR_NCU}"; then
+        echo "ERROR pinned E3STR_NCU=${E3STR_NCU} is not executable or does not support this chip" >&2
+        false
     fi
-fi
-if [[ -z "${NCU}" || ! -x "${NCU}" ]]; then
-    echo "ERROR ncu binary not found (set E3STR_NCU=/path/to/ncu)" >&2
-    false
+    NCU="${E3STR_NCU}"
+else
+    CANDIDATES=()
+    if [[ -n "${CUDA_HOME:-}" ]]; then
+        CANDIDATES+=("${CUDA_HOME}/ncu" "${CUDA_HOME}/bin/ncu")
+    fi
+    if command -v ncu >/dev/null 2>&1; then
+        CANDIDATES+=("$(command -v ncu)")
+    fi
+    while IFS= read -r g; do
+        CANDIDATES+=("${g}")
+    done < <(ls -1 /usr/local/cuda*/bin/ncu /opt/nvidia/nsight-compute/*/ncu 2>/dev/null | sort -V)
+    NCU=""
+    for cand in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
+        if [[ ! -x "${cand}" ]]; then
+            echo "E3STR_NCU_REJECT ${cand} (not executable)"
+            continue
+        fi
+        if ncu_knows_chip "${cand}"; then
+            NCU="${cand}"
+            break
+        fi
+        echo "E3STR_NCU_REJECT ${cand} ($({ "${cand}" --query-metrics 2>&1 || true; } | head -1))"
+    done
+    if [[ -z "${NCU}" ]]; then
+        echo "ERROR no ncu candidate supports this chip (set E3STR_NCU to a chip-aware binary, e.g. the internal CUDA 13.4 toolkit's ncu)" >&2
+        false
+    fi
 fi
 echo "E3STR_NCU_BIN ${NCU}"
 "${NCU}" --version | tee "${OUT}/ncu_version.log"
