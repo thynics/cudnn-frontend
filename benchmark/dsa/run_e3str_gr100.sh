@@ -101,9 +101,22 @@ PY
 # candidate is accepted only if its metric list contains
 # gpu__time_duration for the present chip.
 STAGE=ncu_discovery
+# Capture BOTH streams of every probe (e3str r6 lesson: the failure
+# reason lived on stderr and 2>/dev/null hid it), and allow exactly one
+# logged retry for init transients.
 ncu_knows_chip() {
-    "$1" --query-metrics 2>/dev/null | awk '{print $1}' \
-        | grep -qx "gpu__time_duration"
+    local probe_log="${OUT}/ncu_query_probe_$(basename "$1").log"
+    local attempt
+    for attempt in 1 2; do
+        "$1" --query-metrics > "${probe_log}" 2>&1 || true
+        if awk '{print $1}' "${probe_log}" | grep -qx "gpu__time_duration"; then
+            return 0
+        fi
+        echo "E3STR_NCU_QUERY_ATTEMPT ${attempt} failed for $1; head:"
+        head -5 "${probe_log}" | sed 's/^/    | /'
+        [[ "${attempt}" == "1" ]] && sleep 10
+    done
+    return 1
 }
 if [[ -n "${E3STR_NCU:-}" ]]; then
     # Explicit contract: if the caller pins a binary, it must work.
@@ -117,7 +130,7 @@ if [[ -n "${E3STR_NCU:-}" ]]; then
         echo "ERROR pinned E3STR_NCU=${E3STR_NCU} exists but is not executable" >&2
         false
     elif ! ncu_knows_chip "${E3STR_NCU}"; then
-        echo "ERROR pinned E3STR_NCU=${E3STR_NCU} runs but does not know this chip: $({ "${E3STR_NCU}" --query-metrics 2>&1 || true; } | head -1)" >&2
+        echo "ERROR pinned E3STR_NCU=${E3STR_NCU} runs but its metric query lacks gpu__time_duration after 2 attempts; full output saved to ${OUT}/ncu_query_probe_$(basename "${E3STR_NCU}").log" >&2
         false
     fi
     NCU="${E3STR_NCU}"
