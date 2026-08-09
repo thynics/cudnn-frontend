@@ -109,7 +109,10 @@ ncu_knows_chip() {
     local attempt
     for attempt in 1 2; do
         "$1" --query-metrics > "${probe_log}" 2>&1 || true
-        if awk '{print $1}' "${probe_log}" | grep -qx "gpu__time_duration"; then
+        # Pipe-free on purpose: under pipefail, `awk | grep -q` dies of
+        # SIGPIPE (141) whenever the match sits above ~4k lines of
+        # output -- the exact r6/r7 failure.
+        if awk '$1=="gpu__time_duration"{found=1} END{exit !found}' "${probe_log}"; then
             return 0
         fi
         echo "E3STR_NCU_QUERY_ATTEMPT ${attempt} failed for $1; head:"
