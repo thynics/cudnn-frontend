@@ -65,3 +65,4 @@ run_dsa_b200_pipeline.sh --task-dir <dir> --impl v_s1_a  --mode validation --not
 | 日期 | service/node | v_w3_2 ms | ratio | 备注 |
 |---|---|---|---|---|
 | 2026-08-07 | 20260807T055917Z-1873583 / umb-b200-248 | 9.456525 | 1.144074 | r3 参照腿 |
+| 2026-08-09 | 20260809T094229Z-4074329 / umbriel-b200-068 | 10.045306 | 1.067867 | vfinalexgh r3 锚定腿；该 node 绝对值慢 ~6%、baseline 慢 ~14%，冻结值判读在此窗口失效，必须同窗配对 |

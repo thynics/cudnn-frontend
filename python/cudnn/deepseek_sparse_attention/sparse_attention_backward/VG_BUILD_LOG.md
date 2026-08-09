@@ -231,6 +231,8 @@ rank 置换的 n 序），属重构级，不是 rider。
 
 | v_w3_5 | D1 保守探针：640→512（reducer 8→4，时间半区 drain，寄存器预算不动） | 9.480 | 8.381 | 1.1312 | **null，归档**（同 run v_w3_2 腿 9.451 @ 8.373：Δ +0.029 < 0.05 门，双指标同向轻微偏差；四 case 逐位同）。**F16 同驻干扰税假设证伪**：20→16 warp 不改善环。时间半区 drain 重构数值正确（原子序改变但行不相交，第五次逐位命中）+ 512 线程全链路可跑——两项入 Rubin 资产。**SM100 落点定格 9.44（v_w3_2），判定书终稿：超越 baseline = Rubin-locked** |
 
+| v_final_exgh | P-early split publish（2026-08-09 用户令复验三重挡死判决：P 相位先发布先飞 DSM，dS 相位垫飞行；单 pds 管线+双 count-128 ready mbar，刻意避开 vg_1 共享 producer state 前科形态；rev 9411c76） | 10.251 | 9.420 | 1.0882 | **有效负结论，归档**——r3 同窗锚定 v_w3_2 10.045 @ 9.407（ratio 1.0679；service 20260809T094229Z-4074329 / umbriel-b200-068，两腿 baseline Δ0.14%）：候选 Δ+0.2056ms 且 ratio +0.0203 双口径同向 > 0.05 门。四 case 指纹逐位同 final（手术无 bug）。**r4 同窗双 trace 裁决（rev d1be44a，31 名顶格孪生）：设计税，非实现瑕疵**——机制完全兑现：LAND_P/LAND_DS/KS2 全部落在 64ns 计时地板（三门本就是空靶，v_f1_1_trace2 的 0.108/0.052/0.098 第二次确认），RELAY_DSW 2.11µs = P 确实提前飞了一个 dS 相位的窗口，但买空。代价三重：①**拆环 ILP 损失**：融合 exp2+dS 循环 2.296µs → 1.168+1.768=2.936µs（+0.64µs 纯计算，SFU/FFMA 交织被切断）；②**dS-ready 位移**：P 发布（~1.1µs stmatrix+fence+arrive）插进 dS 相位之前，而 dQ（环的真门）等的是 dS——leader PDS_WAIT 从 0.5 时代值涨到 2.46µs；③空靶。trace 周期 6.912→8.032（+1.12µs，span 载荷放大；release 净 +0.141µs/tile）。**结构判语：手术方向与依赖结构精确相反——加速了非绑定操作数（P），推迟了绑定操作数（dS）。与 vg_1（dS-early，净≈0 已退役）合并，split-publish 两种排列均有硅上判决：dS-early≈0、P-early<0。三重挡死升级为四重（+排列实测），家族终审关闭** |
+
 ## 交付定稿（2026-08-07，revision cc107c4，硅上验收 PASS）
 
 | 交付件 | candidate_ms | vs v_w3_2 参照 | correctness |
