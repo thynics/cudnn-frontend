@@ -53,6 +53,22 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 _RUBIN1_B200_COMPAT = (
     os.environ.get("DSA_RUBIN1_B200_COMPAT", "0") == "1"
 )
+# E3-240 probe profile (oversized-cliff tax isolation).  The COMPAT
+# protocol and its live byte layout are reused verbatim; a dead tail
+# pad pushes SharedStorageV2 past the 232,448 B legacy opt-in line so
+# the launch is forced into the R-394 oversized mode (328 KB carveout,
+# 8 KB L1) while every live byte keeps its COMPAT offset (< 232 KB,
+# hence also below the 256 KB descriptor-window line).  E3PAD minus
+# COMPAT on the same node/toolchain is the fused oversized-mode tax.
+_RUBIN1_E3PAD = (
+    os.environ.get("DSA_RUBIN1_E3PAD", "0") == "1"
+)
+assert not (_RUBIN1_B200_COMPAT and _RUBIN1_E3PAD), (
+    "DSA_RUBIN1_B200_COMPAT and DSA_RUBIN1_E3PAD are mutually exclusive"
+)
+# Structure selector: E3PAD runs the COMPAT (ring-2 / single-face)
+# machine in full; only the storage size and the SMEM cap differ.
+_RUBIN1_COMPAT_STRUCTURE = _RUBIN1_B200_COMPAT or _RUBIN1_E3PAD
 
 
 @dsl_user_op
@@ -3961,6 +3977,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     THREADS_PER_CTA = 640
 
     B200_COMPAT = _RUBIN1_B200_COMPAT
+    # E3-240 probe: COMPAT structure + dead tail pad forcing the
+    # oversized launch mode.  Pad size keeps the storage inside
+    # (232,448, 262,144): above the legacy opt-in line, below the
+    # 256 KB window line even including the (dead) pad itself.
+    E3PAD = _RUBIN1_E3PAD
+    E3PAD_ELEMENTS = 8_192 if _RUBIN1_E3PAD else 0  # bf16 -> 16,384 B
 
     # Warp roles (5 warps per named group where applicable).
     GATHER_WARPS = 4
@@ -4006,7 +4028,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # and per-slot machinery for the two coupled profiles only:
     # Rubin (5 slots, 2 P/dS faces) and COMPAT (2 slots, 1 face).
     ROUND_GENS_PER_TILE = 10
-    ROUND_STAGES = 2 if _RUBIN1_B200_COMPAT else 5
+    ROUND_STAGES = 2 if _RUBIN1_COMPAT_STRUCTURE else 5
     assert ROUND_GENS_PER_TILE % ROUND_STAGES == 0
     # Static slot of each panel generation (ring position = gen index
     # within the tile; g0/g1 are the kdq pair on slots 0/1, panels are
@@ -4028,11 +4050,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # P/dS publication faces (tile parity).  Face f serves tiles with
     # t % PDS_FACES == f; every per-face raw mbarrier therefore flips
     # once per PDS_FACES tiles: phase(t) = (t // PDS_FACES) % 2.
-    PDS_FACES = 1 if _RUBIN1_B200_COMPAT else 2
+    PDS_FACES = 1 if _RUBIN1_COMPAT_STRUCTURE else 2
     # The storage struct variants and per-slot/per-face machinery are
     # built for exactly these two coupled profiles.
     assert (ROUND_STAGES, PDS_FACES) in ((5, 2), (2, 1))
 
+    # E3PAD keeps the COMPAT protocol but must clear the storage assert
+    # at its padded size, and its launch must request > 232,448 B.
     MAX_SMEM_BYTES = 232_448 if _RUBIN1_B200_COMPAT else 334_848
 
     MMA_DONE_STAGES = 2
@@ -4117,10 +4141,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         assert cute.cosize(dq_a_layout_staged) <= 8192
         assert cute.cosize(dq_b_layout_staged) <= 4096
 
-        # Two fully-literal struct variants (one per profile): cute.struct
-        # bodies cannot carry conditional annotations, and the field set
-        # itself differs (ring depth, P/dS faces).  ds_xchg (dead in the
-        # final machine) and khot_seq are retired in both.
+        # Three fully-literal struct variants (one per profile):
+        # cute.struct bodies cannot carry conditional annotations, and
+        # the field set itself differs (ring depth, P/dS faces, E3 pad).
+        # ds_xchg (dead in the final machine) and khot_seq are retired
+        # in all of them.
         if self.ROUND_STAGES == 5:
 
             @cute.struct
@@ -4214,6 +4239,83 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     1024,
                 ]
 
+        elif self.E3PAD:
+
+            @cute.struct
+            class SharedStorageV2:
+                # E3-240 probe variant: byte-identical COMPAT live
+                # layout (every field name, size, and offset matches
+                # the COMPAT struct below) plus one dead tail pad that
+                # no role ever touches.  Its only purpose is to push
+                # size_in_bytes() past the 232,448 B legacy opt-in
+                # line so the launch enters the oversized mode.
+                # Pipeline barrier arrays (full+empty per stage).
+                s_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+                dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+                kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                round_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+                pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+                dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                # Raw single-phase-per-tile barriers.
+                stationary_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                stationary_ready_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+                landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                round_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                epi_safe_mbar: cutlass.Int64
+                pds_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
+                kdq_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+                tmem_dealloc_mbar: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+
+                stationary_q: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 32768],
+                    1024,
+                ]
+                stationary_do: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 32768],
+                    1024,
+                ]
+                score_kv: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 16384],
+                    1024,
+                ]
+                round_buf_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 8192],
+                    1024,
+                ]
+                round_buf_1: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 8192],
+                    1024,
+                ]
+                p_blocks_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 4096],
+                    1024,
+                ]
+                p_xchg_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 2048],
+                    1024,
+                ]
+                ds_image_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 4096],
+                    1024,
+                ]
+                ds_blocks_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 4096],
+                    1024,
+                ]
+                stats: cute.struct.Align[
+                    cute.struct.MemRange[Float32, 128],
+                    1024,
+                ]
+                # Dead oversize pad -- never formed into a tensor,
+                # never addressed by any warp.
+                e3_oversize_pad: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 8192],
+                    1024,
+                ]
+
         else:
 
             @cute.struct
@@ -4286,8 +4388,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             f"SharedStorageV2 {storage_bytes}B exceeds "
             f"cap {self.MAX_SMEM_BYTES}B "
             f"(ROUND_STAGES={self.ROUND_STAGES}, "
-            f"PDS_FACES={self.PDS_FACES})"
+            f"PDS_FACES={self.PDS_FACES}, "
+            f"E3PAD={self.E3PAD})"
         )
+        if self.E3PAD:
+            # The probe is only valid if the launch actually crosses
+            # the legacy opt-in line (else it silently runs in normal
+            # mode) while every byte, pad included, stays below the
+            # 256 KiB window line.
+            assert storage_bytes > 232_448, (
+                f"E3PAD storage {storage_bytes}B does not cross the "
+                f"232,448B legacy opt-in line -- probe void"
+            )
+            assert storage_bytes < 262_144, (
+                f"E3PAD storage {storage_bytes}B crosses the 256KiB "
+                f"window line -- probe no longer isolates the mode tax"
+            )
         return SharedStorageV2
 
 
