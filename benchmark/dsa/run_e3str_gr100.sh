@@ -107,8 +107,17 @@ ncu_knows_chip() {
 }
 if [[ -n "${E3STR_NCU:-}" ]]; then
     # Explicit contract: if the caller pins a binary, it must work.
-    if [[ ! -x "${E3STR_NCU}" ]] || ! ncu_knows_chip "${E3STR_NCU}"; then
-        echo "ERROR pinned E3STR_NCU=${E3STR_NCU} is not executable or does not support this chip" >&2
+    # Split the rejection reasons (e3str r2 lesson: "not executable or
+    # unsupported" was ambiguous between a missing container mount and
+    # a chip-support problem).
+    if [[ ! -e "${E3STR_NCU}" ]]; then
+        echo "ERROR pinned E3STR_NCU=${E3STR_NCU} does not exist inside this container (host mount missing?)" >&2
+        false
+    elif [[ ! -x "${E3STR_NCU}" ]]; then
+        echo "ERROR pinned E3STR_NCU=${E3STR_NCU} exists but is not executable" >&2
+        false
+    elif ! ncu_knows_chip "${E3STR_NCU}"; then
+        echo "ERROR pinned E3STR_NCU=${E3STR_NCU} runs but does not know this chip: $({ "${E3STR_NCU}" --query-metrics 2>&1 || true; } | head -1)" >&2
         false
     fi
     NCU="${E3STR_NCU}"
