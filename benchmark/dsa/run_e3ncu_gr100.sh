@@ -26,7 +26,14 @@
 # ncu binary that supports CC 10.7 and profiling permission
 # (ERR_NVGPUCTRPERM is detected and reported as a named failure).
 #
-# Knobs: E3NCU_TOPK (512), E3NCU_SKIP (35), E3NCU_COUNT (28),
+# r2 lessons baked in: profiling is gated on the probe's ``dsa_bwd``
+# NVTX range (a launch-skip counted from process start lands inside
+# build_case's torch/cuBLAS reference machinery and never reaches the
+# DSA kernels); metrics are read back via ``ncu --import`` (live
+# ``--csv`` prints no metric table); the summary hard-gates on the main
+# kernel NOT being a torch/nvjet reference kernel.
+#
+# Knobs: E3NCU_TOPK (512), E3NCU_SKIP (8), E3NCU_COUNT (24),
 # E3NCU_NCU (ncu binary path), E3NCU_ALLOW_ANY_CC=1.
 
 set -Eeuo pipefail
@@ -34,8 +41,8 @@ set -Eeuo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${E3NCU_OUT:-${REPO}/benchmark/dsa/e3ncu_out}"
 TOPK="${E3NCU_TOPK:-512}"
-SKIP="${E3NCU_SKIP:-35}"
-COUNT="${E3NCU_COUNT:-28}"
+SKIP="${E3NCU_SKIP:-8}"
+COUNT="${E3NCU_COUNT:-24}"
 PROBE="${REPO}/benchmark/dsa/ncu_e3_probe.py"
 
 mkdir -p -- "${OUT}"
@@ -171,9 +178,9 @@ profile_arm() {
         "${NCU}" --target-processes all -f \
         --export "${OUT}/ncu_${arm}" \
         --metrics "${METRICS}" \
+        --nvtx --nvtx-include "dsa_bwd/" \
         --launch-skip "${SKIP}" \
         --launch-count "${COUNT}" \
-        --csv \
         python3 "${PROBE}" --topk "${TOPK}" --warmup 2 --repeat 8 \
         2>&1 | tee "${OUT}/ncu_${arm}.log"
     if grep -q "ERR_NVGPUCTRPERM" "${OUT}/ncu_${arm}.log"; then
@@ -182,6 +189,14 @@ profile_arm() {
     fi
     grep -q "E3NCU_PROBE_OK" "${OUT}/ncu_${arm}.log" || {
         echo "ERROR probe did not complete for arm=${arm}" >&2
+        false
+    }
+    # Live profiling prints no metric table; read the report back as a
+    # wide-format CSV (header row + units row + one row per launch).
+    "${NCU}" --import "${OUT}/ncu_${arm}.ncu-rep" --csv --page raw \
+        > "${OUT}/ncu_${arm}_import.csv"
+    [[ -s "${OUT}/ncu_${arm}_import.csv" ]] || {
+        echo "ERROR empty import CSV for arm=${arm}" >&2
         false
     }
 }
@@ -201,52 +216,67 @@ from pathlib import Path
 
 out = Path(os.environ["OUT_DIR"])
 
-def parse(log_path):
-    """Parse ncu --csv long-format rows embedded in the run log."""
-    launches = {}
-    header = None
-    idx = {}
-    with open(log_path, newline="") as f:
-        for row in csv.reader(f):
-            if header is None:
-                if "Kernel Name" in row and "Metric Name" in row:
-                    header = row
-                    idx = {name: header.index(name) for name in
-                           ("ID", "Kernel Name", "Metric Name",
-                            "Metric Value")}
-                continue
-            if len(row) != len(header):
-                continue
-            lid = row[idx["ID"]]
-            kname = row[idx["Kernel Name"]]
-            metric = row[idx["Metric Name"]]
-            raw = row[idx["Metric Value"]].replace(",", "")
+def parse_wide(csv_path):
+    """Parse an `ncu --import --csv --page raw` wide-format table.
+
+    Row 0 = column names, row 1 = units, then one row per launch with
+    one column per metric.  Returns (launches, units).
+    """
+    with open(csv_path, newline="") as f:
+        rows = list(csv.reader(f))
+    assert len(rows) >= 3, f"no launch rows in {csv_path.name}"
+    hdr, units = rows[0], rows[1]
+    ik = hdr.index("Kernel Name")
+    launches = []
+    for r in rows[2:]:
+        if len(r) != len(hdr):
+            continue
+        m = {}
+        for j, name in enumerate(hdr):
             try:
-                value = float(raw)
+                m[name] = float(r[j].replace(",", ""))
             except ValueError:
-                continue
-            launches.setdefault(lid, {"kernel": kname, "m": {}})
-            launches[lid]["m"][metric] = value
-    assert launches, f"no CSV metric rows parsed from {log_path.name}"
-    return launches
+                pass
+        launches.append({"kernel": r[ik], "m": m})
+    assert launches, f"no parsable launch rows in {csv_path.name}"
+    return launches, dict(zip(hdr, units))
+
+def is_reference_kernel(name):
+    """torch/cuBLAS machinery from build_case -- never a valid target."""
+    return name.startswith("void at::") or "nvjet" in name
 
 def main_kernel_medians(launches):
     totals = {}
-    for entry in launches.values():
+    for entry in launches:
         d = entry["m"].get("gpu__time_duration.sum", 0.0)
         totals[entry["kernel"]] = totals.get(entry["kernel"], 0.0) + d
     main = max(totals, key=totals.get)
-    rows = [e["m"] for e in launches.values() if e["kernel"] == main]
-    assert len(rows) >= 3, f"only {len(rows)} instances of main kernel"
+    # r2 validity gate: if the NVTX gating failed, the window fills up
+    # with reference kernels again -- refuse to classify on them.
+    if is_reference_kernel(main):
+        raise SystemExit(
+            "HARD GATE: dominant profiled kernel is reference machinery "
+            f"({main[:80]}); NVTX gating did not reach the DSA kernels"
+        )
+    rows = [e["m"] for e in launches if e["kernel"] == main]
+    assert len(rows) >= 2, f"only {len(rows)} instances of main kernel"
     metrics = set().union(*rows)
     med = {m: statistics.median([r[m] for r in rows if m in r])
            for m in metrics}
     return main, len(rows), med
 
+def kbyte_to_bytes(value, unit):
+    # ncu's "Kbyte" is decimal (233.472 Kbyte == 233,472 bytes).
+    if value is None:
+        return None
+    return value * 1000.0 if unit.startswith("Kbyte") else value
+
 arms = {}
 for arm in ("compat", "e3pad"):
-    name, n, med = main_kernel_medians(parse(out / f"ncu_{arm}.log"))
-    arms[arm] = {"kernel": name, "instances": n, "metrics": med}
+    launches, units = parse_wide(out / f"ncu_{arm}_import.csv")
+    name, n, med = main_kernel_medians(launches)
+    arms[arm] = {"kernel": name, "instances": n, "metrics": med,
+                 "units": units}
 
 assert arms["compat"]["kernel"] == arms["e3pad"]["kernel"], (
     "main kernels differ between arms: "
@@ -278,10 +308,27 @@ if r_ld is not None and r_st is not None:
 elif r_ld is not None or r_st is not None:
     bank = r_ld if r_ld is not None else r_st
 
+def unit_of(arm, metric):
+    return arms[arm]["units"].get(metric, "")
+
 disc = {
+    # NOTE: on GR100 the config-size metric may report the legacy
+    # (R-394 compat) value even for oversized launches -- record, do
+    # not gate.  dynamic_smem is the per-arm proof the pad took effect
+    # (compat ~226,816 B vs e3pad ~243,712 B).
     "carveout_bytes": {
-        "compat": g("compat", "launch__shared_mem_config_size"),
-        "e3pad": g("e3pad", "launch__shared_mem_config_size"),
+        arm: kbyte_to_bytes(
+            g(arm, "launch__shared_mem_config_size"),
+            unit_of(arm, "launch__shared_mem_config_size"),
+        )
+        for arm in ("compat", "e3pad")
+    },
+    "dynamic_smem_bytes": {
+        arm: kbyte_to_bytes(
+            g(arm, "launch__shared_mem_per_block_dynamic"),
+            unit_of(arm, "launch__shared_mem_per_block_dynamic"),
+        )
+        for arm in ("compat", "e3pad")
     },
     "local_ld_miss_pct": {
         "compat": miss_pct("compat"),
