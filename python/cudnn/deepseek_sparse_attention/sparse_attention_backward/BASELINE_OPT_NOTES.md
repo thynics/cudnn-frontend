@@ -1,5 +1,26 @@
 # baseline_opt 运行与判读笔记（2026-08-09）
 
+## ★ r5 实测定局（B200 umb-b200-239，22c036d，warmup20/repeat200，venv=dsa_iket_h128_venv_2606/DSL 4.6.1）
+
+三门全 PASS（dq 位级恒等 / dkv 底噪 / 节点稳定 0.75%）+ ENV_ANCHOR PASS（baseline@2048=8.814）。
+
+| topk | baseline(wrapper腿) | all_off(直调) | all_on | **harness 不对称** | **三刀真值** | Δ①epi | Δ②dq_early | Δ③split |
+|---|---|---|---|---|---|---|---|---|
+| 128 | 1.378 | 1.106 | 1.079 | 0.272 | +0.028 (2.5%) | −0.001 | +0.036 | −0.001 |
+| 256 | 1.834 | 1.564 | 1.530 | 0.270 | +0.034 (2.2%) | +0.004 | +0.043 | −0.001 |
+| 512 | 2.780 | 2.553 | 2.535 | 0.227 | +0.018 (0.7%) | +0.000 | +0.029 | −0.002 |
+| 1024 | 4.764 | 4.573 | 4.569 | 0.191 | +0.004 (0.1%) | −0.014 | +0.018 | −0.008 |
+| 2048 | 8.814 | 8.647 | 8.641 | 0.166 | +0.006 (0.07%) | −0.010 | +0.033 | +0.000 |
+
+判决：**②是唯一真刀（+20-40µs/call，随 topk 近常量=per-launch 固定项，符合设计）；
+①判 null（大 topk 侧 −10µs 噪声级偏害——baseline 串行 epilogue 本就大半藏在 reduce
+尾部 drain 之下）；③判 null（0，序幕 K-gather-bound 预判命中，分支 E）。**
+sweep 的 wrapper腿-vs-直调腿不对称实测 0.17-0.27ms/call（本 venv），**比三刀本身大
+一个量级**——一切历史 sweep ratio（含旧 final 面板与"final 小 topk 甜点"）都含此
+美化。final 腿本轮 13.19ms@2048 vs 台账 9.44 = **本 venv（IKET 补丁 DSL 4.6.1）对
+2-CTA final 严重失真**（1-CTA 家族在锚点内），final 绝对值以台账/标准管线为准；
+本 venv 禁用于 2-CTA 判读。产物：~/proxy/dsa-bopt-sweep-r5-1786288559/。
+
 `dsa_bwd_sm100_2cta_baseline_opt.py` = 生产 baseline（dsa_bwd_sm100.py）的子类 fork，
 回移植 2-CTA 战役发现的三把每-launch 固定成本刀。数值位级等同 baseline，只改发射
 顺序与 SMEM staging。动机：新 final 的 topk 扫描显示其 ~4%@topk128 的领先全部来自
