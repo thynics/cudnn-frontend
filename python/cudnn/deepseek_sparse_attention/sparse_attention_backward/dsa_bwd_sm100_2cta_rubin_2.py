@@ -43,6 +43,7 @@ red.global.add into an f32 workspace.
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -59,6 +60,58 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
+# M2 knob (measurement pairing only): deg-6 FFMA exp2 replaces MUFU in
+# the V2 math role.  Numerics: max rel err 2.166e-7 over [-126, 0]
+# (user-adjudicated deg6 lineage, vk_4/HANDOFF_20260803).
+_RUBIN2_M2 = os.environ.get("DSA_RUBIN2_M2", "0") == "1"
+
+
+
+@dsl_user_op
+def _exp2_ffma_deg6(
+    x: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """exp2(x) on the FMA pipe: deg-6 Taylor + magic-number reduction.
+
+    Coefficients are (ln2)^k/k! rounded to f32; the -126 clamp keeps
+    masked-column underflow finite (2^-126, below bf16 resolution).
+    Verified max rel err 2.166e-7 over [-126, 0] against exp2 of the
+    f32 input -- inside MUFU.EX2's own error class.
+    """
+
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "{\n\t"
+            ".reg .f32 fx, fz, ff, fp;\n\t"
+            ".reg .b32 rn, rp;\n\t"
+            "max.f32 fx, $1, 0fC2FC0000;\n\t"
+            "add.rn.f32 fz, fx, 0f4B400000;\n\t"
+            "mov.b32 rn, fz;\n\t"
+            "shl.b32 rn, rn, 23;\n\t"
+            "sub.rn.f32 fz, fz, 0f4B400000;\n\t"
+            "sub.rn.f32 ff, fx, fz;\n\t"
+            "mov.f32 fp, 0f39218489;\n\t"
+            "fma.rn.f32 fp, fp, ff, 0f3AAEC3FF;\n\t"
+            "fma.rn.f32 fp, fp, ff, 0f3C1D955B;\n\t"
+            "fma.rn.f32 fp, fp, ff, 0f3D635847;\n\t"
+            "fma.rn.f32 fp, fp, ff, 0f3E75FDF0;\n\t"
+            "fma.rn.f32 fp, fp, ff, 0f3F317218;\n\t"
+            "fma.rn.f32 fp, fp, ff, 0f3F800000;\n\t"
+            "mov.b32 rp, fp;\n\t"
+            "add.s32 rp, rp, rn;\n\t"
+            "mov.b32 $0, rp;\n\t"
+            "}",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
 @dsl_user_op
 def _map_smem_to_cluster_rank(
@@ -4039,6 +4092,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     MMA_DONE_STAGES = 2
 
     SOFTMAX_GROUPED_STATS = True
+    M2_EXP = _RUBIN2_M2
 
     OWN_HALF_BULK = True
 
@@ -6052,14 +6106,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     for h_group in cutlass.range_constexpr(4):
                         lse = softmax_stats[group_local_h[h_group], 0]
                         for value_index in band_indices[h_group]:
-                            r_score[value_index] = cute.math.exp2(
-                                (
+                            if cutlass.const_expr(self.M2_EXP):
+                                r_score[value_index] = _exp2_ffma_deg6(
                                     r_score[value_index]
                                     * softmax_scale_log2_e
                                     + lse
-                                ),
-                                fastmath=True,
-                            )
+                                )
+                            else:
+                                r_score[value_index] = cute.math.exp2(
+                                    (
+                                        r_score[value_index]
+                                        * softmax_scale_log2_e
+                                        + lse
+                                    ),
+                                    fastmath=True,
+                                )
                     for h_group in cutlass.range_constexpr(4):
                         delta = softmax_stats[
                             group_local_h[h_group], 1
@@ -6092,14 +6153,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         ) % Int32(self.H_TILE_CTA)
                         lse = softmax_stats[local_h, 0]
                         delta = softmax_stats[local_h, 1]
-                        p_value = cute.math.exp2(
-                            (
+                        if cutlass.const_expr(self.M2_EXP):
+                            p_value = _exp2_ffma_deg6(
                                 r_score[local_n]
                                 * softmax_scale_log2_e
                                 + lse
-                            ),
-                            fastmath=True,
-                        )
+                            )
+                        else:
+                            p_value = cute.math.exp2(
+                                (
+                                    r_score[local_n]
+                                    * softmax_scale_log2_e
+                                    + lse
+                                ),
+                                fastmath=True,
+                            )
                         ds_value = (
                             (r_dp[local_n] + delta)
                             * p_value
