@@ -31,7 +31,8 @@ _spec.loader.exec_module(sweep)
 import torch  # noqa: E402  (after sweep import sets sys.path)
 
 
-def candidate_leg_nvtx(case, topk: int, warmup: int, repeat: int):
+def candidate_leg_nvtx(case, topk: int, warmup: int, repeat: int,
+                       impl: str = "rubin_1"):
     """sweep_topk_2cta.candidate_leg with an NVTX range around the DSA call."""
     import cutlass
     import cutlass.cute as cute
@@ -45,7 +46,7 @@ def candidate_leg_nvtx(case, topk: int, warmup: int, repeat: int):
 
     impl_mod = importlib.import_module(
         "cudnn.deepseek_sparse_attention.sparse_attention_backward."
-        "dsa_bwd_sm100_2cta_rubin_1")
+        f"dsa_bwd_sm100_2cta_{impl}")
     impl_cls = impl_mod.FlashAttentionDSABackwardSm100TwoCTAV2
 
     q, kv = case["q"], case["kv"]
@@ -115,15 +116,17 @@ def main() -> int:
     p.add_argument("--topk", type=int, default=512)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--repeat", type=int, default=8)
+    p.add_argument("--impl", default="rubin_1",
+                   help="dsa_bwd_sm100_2cta_<impl> module suffix")
     args = p.parse_args()
 
     case = sweep.build_case(4096, args.topk, 128, 512)
     ms, dq, dkv = candidate_leg_nvtx(
-        case, args.topk, args.warmup, args.repeat
+        case, args.topk, args.warmup, args.repeat, impl=args.impl
     )
     assert torch.isfinite(dq).all(), "non-finite dq"
     assert torch.isfinite(dkv).all(), "non-finite dkv"
-    print(f"E3NCU_PROBE topk={args.topk} candidate_ms={ms:.4f}")
+    print(f"E3NCU_PROBE impl={args.impl} topk={args.topk} candidate_ms={ms:.4f}")
     print("E3NCU_PROBE_OK")
     return 0
 
