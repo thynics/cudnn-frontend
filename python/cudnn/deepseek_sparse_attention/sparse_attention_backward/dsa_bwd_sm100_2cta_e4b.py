@@ -5968,12 +5968,41 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         gather_state.advance()
 
                         if score_iter == tile_count - Int32(1):
-                            # dO is token-stationary.  After grads(i-1)
-                            # releases the loan, recommit the unchanged C/D
-                            # bytes for the final tail tile before entering
-                            # the potentially blocking last-kdq rendezvous.
+                            # E4b FIX: the base fence-recommit is dead --
+                            # the borrowed dO_r1 h0 fill of grads(tc-2)
+                            # dirties the loan h1 bytes (16-32K) between
+                            # the two loan consumptions, so the tail
+                            # tile's loan must be REFILLED.  Ordering:
+                            # wait borrow_free(tc-2) (the leader's
+                            # commit after dV_r1 pass a) -- at that
+                            # arrival the old loan (pipe acquire), the
+                            # borrowed tenant (this signal) and the K
+                            # bytes (dP(tc-1) < dVr1a in-order) are all
+                            # provably dead, so the full refill races
+                            # nobody.  The phase continues the steady
+                            # session-B counter (fills consumed
+                            # 0..tc-3; this waits tc-2).
                             pipe_kscore.producer_acquire(gather_state)
-                            cute.arch.fence_view_async_shared()
+                            cute.arch.mbarrier_wait(
+                                kchunk_mbars + 3,
+                                gather_borrow_phase,
+                            )
+                            gather_borrow_phase = (
+                                Int32(1) - gather_borrow_phase
+                            )
+                            loan_phase = self._fill_score_loan_do_r0_vc2(
+                                rank,
+                                warp_idx,
+                                stationary_do_raw,
+                                score_kv_raw,
+                                loan_tma_mbars,
+                                loan_phase,
+                                tma_atom_dot,
+                                t_dot_gmem,
+                                t_dot_loan_smem_a,
+                                t_dot_loan_smem_b,
+                                grad_a_stage_bytes,
+                            )
                             pipe_kscore.producer_commit(gather_state)
                             gather_state.advance()
                             self._gather_kdq_v8(
