@@ -1,5 +1,11 @@
 """DeepSeek Sparse Attention backward, SM100 two-CTA implementation.
 
+v_final_exp E1: chunk-streamed score-K.  The K gather publishes each
+D128 chunk on its own mbarrier (cp.async commit-group ladder, no drain
+of younger chunks), and the S GEMM consumes chunk c on that signal
+while chunks c+1.. are still filling.  dP, the kscore lease pipeline,
+the loan, and the ring are untouched.
+
 Fixed GQA128 / D512 shape.  One 2-CTA cluster per token; all five GEMMs
 run cta_group::2.  Stationary Q/dO panels are token-resident in SMEM;
 the score K tile is gathered per KV tile; gradient operands stream
@@ -4114,6 +4120,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             s_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            # E1: per-chunk score-K readiness (leader-CTA barriers).
+            kchunk_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             round_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
@@ -4180,6 +4188,91 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         assert SharedStorageV2.size_in_bytes() <= self.MAX_SMEM_BYTES
         return SharedStorageV2
 
+    @cute.jit
+    def _load_score_kv_streamed(
+        self,
+        mKV: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        destination: cute.Tensor,
+        kchunk_mbars: cute.Pointer,
+        token_idx: Int32,
+        batch_idx: Int32,
+        tile_index: Int32,
+        topk: Int32,
+        rank: Int32,
+        tidx: Int32,
+        copy_atom: cute.CopyAtom,
+        thread_copy: cute.TiledCopy,
+    ):
+        """Chunk-streamed score-K gather (E1).
+
+        Same per-row copy protocol as _load_score_kv, restructured
+        chunk-major: one cp.async commit group per D128 chunk, then a
+        wait-group ladder -- wait_group(K_CHUNKS-1-c) retires chunk c's
+        group while the younger chunks' copies stay in flight, so the
+        crew never drains its own pipeline.  Chunk c's landing (both
+        halves: every gather thread of both CTAs arrives once) is
+        published on the leader CTA's kchunk_mbars[c] for the S GEMM.
+        """
+
+        index_in_group = tidx % self.KV_GROUP_SIZE
+        group_index = tidx // self.KV_GROUP_SIZE
+        rows_per_group = self.N_TILE_CTA // self.KV_NUM_GROUPS
+        row_local_n = [
+            row_iteration * self.KV_NUM_GROUPS + group_index
+            for row_iteration in range(rows_per_group)
+        ]
+        row_kv_index = []
+        for local_n in row_local_n:
+            logical_n = rank * self.N_TILE_CTA + local_n
+            topk_slot = tile_index * self.N_TILE + logical_n
+            kv_index = Int32(-1)
+            if topk_slot < topk:
+                kv_index = mTopkIdxs[
+                    topk_slot,
+                    (token_idx, batch_idx),
+                ]
+            row_kv_index.append(kv_index)
+
+        for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+            destination_rows = cute.composition(
+                destination[None, None, None, chunk],
+                cute.make_layout(
+                    (self.N_TILE_CTA, self.K_CHUNK)
+                ),
+            )
+            for row_iteration in cutlass.range_constexpr(
+                rows_per_group
+            ):
+                local_n = row_local_n[row_iteration]
+                kv_index = row_kv_index[row_iteration]
+                if kv_index >= 0:
+                    self._copy_sparse_k_d128_row(
+                        mKV,
+                        destination_rows,
+                        local_n,
+                        kv_index,
+                        batch_idx,
+                        Int32(chunk * self.K_CHUNK),
+                        index_in_group,
+                        copy_atom,
+                        thread_copy,
+                    )
+                else:
+                    self._zero_sparse_k_d128_row(
+                        destination_rows,
+                        local_n,
+                        index_in_group,
+                    )
+            cute.arch.cp_async_commit_group()
+
+        for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+            cute.arch.cp_async_wait_group(self.K_CHUNKS - 1 - chunk)
+            cute.arch.fence_view_async_shared()
+            cute.arch.mbarrier_arrive(
+                kchunk_mbars + chunk,
+                Int32(0),
+            )
 
     @cute.jit
     def _kd_round_rows_v2(
@@ -4863,6 +4956,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         loan_tma_mbars = storage.loan_tma_mbars.data_ptr()
         loan_epi_safe_mbar = storage.loan_epi_safe_mbar.ptr
         kdq_ready_mbar = storage.kdq_ready_mbar.data_ptr()
+        kchunk_mbars = storage.kchunk_mbars.data_ptr()
         khot_seq = cute.recast_ptr(
             storage.khot_seq.data_ptr(),
             dtype=cutlass.Int32,
@@ -5375,6 +5469,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 kdq_ready_mbar,
                 self.GATHER_THREADS,
             )
+            # E1: chunk c ready when every gather thread of BOTH CTAs
+            # has arrived once (remote arrives land on the leader CTA).
+            cute.arch.mbarrier_init(
+                kchunk_mbars,
+                2 * self.GATHER_THREADS,
+            )
+            cute.arch.mbarrier_init(
+                kchunk_mbars + 1,
+                2 * self.GATHER_THREADS,
+            )
+            cute.arch.mbarrier_init(
+                kchunk_mbars + 2,
+                2 * self.GATHER_THREADS,
+            )
+            cute.arch.mbarrier_init(
+                kchunk_mbars + 3,
+                2 * self.GATHER_THREADS,
+            )
             cute.arch.mbarrier_init(loan_epi_safe_mbar, 1)
             _store_shared_seq_v4(khot_seq, Int32(0))
         cute.arch.fence_view_async_shared()
@@ -5486,12 +5598,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             gather_kd_rows_0 = self._kd_round_rows_v2(round_kd[0])
             gather_kd_rows_1 = self._kd_round_rows_v2(round_kd[1])
             if tile_count > Int32(0):
-                # Prologue: K(0).
+                # Prologue: K(0), chunk-streamed (E1).
                 pipe_kscore.producer_acquire(gather_state)
-                self._load_score_kv(
+                self._load_score_kv_streamed(
                     mKV,
                     mTopkIdxs,
                     k_n,
+                    kchunk_mbars,
                     token_idx,
                     batch_idx,
                     tile_count - Int32(1),
@@ -5501,9 +5614,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     kv_copy_atom,
                     kv_thread_copy,
                 )
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.fence_view_async_shared()
                 pipe_kscore.producer_commit(gather_state)
                 gather_state.advance()
 
@@ -5547,10 +5657,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # first recycled score stage still carries K(1).
                     next_iter = Int32(1)
                     pipe_kscore.producer_acquire(gather_state)
-                    self._load_score_kv(
+                    self._load_score_kv_streamed(
                         mKV,
                         mTopkIdxs,
                         k_n,
+                        kchunk_mbars,
                         token_idx,
                         batch_idx,
                         tile_count - Int32(1) - next_iter,
@@ -5560,9 +5671,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         kv_copy_atom,
                         kv_thread_copy,
                     )
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.fence_view_async_shared()
                     pipe_kscore.producer_commit(gather_state)
                     gather_state.advance()
                     self._gather_kdq_v8(
@@ -5633,10 +5741,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         else:
                             next_iter = score_iter + Int32(1)
                             pipe_kscore.producer_acquire(gather_state)
-                            self._load_score_kv(
+                            self._load_score_kv_streamed(
                                 mKV,
                                 mTopkIdxs,
                                 k_n,
+                                kchunk_mbars,
                                 token_idx,
                                 batch_idx,
                                 tile_count - Int32(1) - next_iter,
@@ -5646,9 +5755,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 kv_copy_atom,
                                 kv_thread_copy,
                             )
-                            cute.arch.cp_async_commit_group()
-                            cute.arch.cp_async_wait_group(0)
-                            cute.arch.fence_view_async_shared()
                             pipe_kscore.producer_commit(gather_state)
                             gather_state.advance()
                             self._gather_kdq_v8(
@@ -6165,11 +6271,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipe_dq_done.producer_acquire(dq_done_prod)
 
                 relay_phase = Int32(0)
+                kchunk_phase = Int32(0)
                 for loop_iter in cutlass.range(tile_count):
                     has_prev = loop_iter > Int32(0)
 
-                    pipe_kscore.consumer_wait(kscore_cons)
-                    s_prod = self._issue_score_v2(
+                    # E1: S consumes K chunk-by-chunk as the gather
+                    # lands each one; the whole-tile kscore lease wait
+                    # moves down to dP (trivially satisfied by then).
+                    s_prod = self._issue_score_v2_streamed(
                         score_tiled_mma,
                         t_score,
                         t_score_pp,
@@ -6177,9 +6286,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         score_k_fragment,
                         pipe_s_done,
                         s_prod,
-                        loop_iter,
-                        False,
+                        kchunk_mbars,
+                        kchunk_phase,
                     )
+                    kchunk_phase = Int32(1) - kchunk_phase
 
                     # dP(t) then early K recycle.  The first dP also
                     # gates on the dO half of the split stationary load.
@@ -6188,6 +6298,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             stationary_ready_mbar + 1,
                             Int32(0),
                         )
+                    pipe_kscore.consumer_wait(kscore_cons)
                     dp_prod = self._issue_score_v2(
                         dp_tiled_mma,
                         t_dp,
@@ -6758,6 +6869,85 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # index only): the fully unrolled 32-atom body bloated the leader
         # warp past its register budget and tripled the per-atom issue cost.
         for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+            for k_block in cutlass.range(
+                0,
+                k_blocks_per_chunk,
+                unroll=4,
+            ):
+                cute.gemm(
+                    mma,
+                    accumulator,
+                    a_fragment[None, None, k_block, chunk],
+                    b_fragment[None, None, k_block, chunk],
+                    accumulator,
+                )
+                mma.set(tcgen05.Field.ACCUMULATE, True)
+
+    @cute.jit
+    def _issue_score_v2_streamed(
+        self,
+        tiled_mma: cute.TiledMma,
+        accumulator_0: cute.Tensor,
+        accumulator_1: cute.Tensor,
+        a_fragment: cute.Tensor,
+        b_fragment: cute.Tensor,
+        done_pipeline,
+        producer_state: pipeline.PipelineState,
+        kchunk_mbars: cute.Pointer,
+        kchunk_phase: Int32,
+    ) -> pipeline.PipelineState:
+        """S with chunk-gated B (E1): consume chunk c on kchunk_mbars[c].
+
+        Structure mirrors _issue_score_v2; the data gate moves from one
+        whole-tile kscore consumer_wait (now taken later, before dP) to
+        four per-chunk waits inside the issue loop, so S's chunk c
+        overlaps the gather of chunks c+1 and onward.
+        """
+
+        done_pipeline.producer_acquire(producer_state)
+        if producer_state.index == Int32(0):
+            self._issue_score_chunks_streamed(
+                tiled_mma,
+                accumulator_0,
+                a_fragment,
+                b_fragment,
+                kchunk_mbars,
+                kchunk_phase,
+            )
+        else:
+            self._issue_score_chunks_streamed(
+                tiled_mma,
+                accumulator_1,
+                a_fragment,
+                b_fragment,
+                kchunk_mbars,
+                kchunk_phase,
+            )
+        cute.arch.fence_view_async_tmem_store()
+        done_pipeline.producer_commit(producer_state)
+        producer_state.advance()
+        return producer_state
+
+    @cute.jit
+    def _issue_score_chunks_streamed(
+        self,
+        tiled_mma: cute.TiledMma,
+        accumulator: cute.Tensor,
+        a_fragment: cute.Tensor,
+        b_fragment: cute.Tensor,
+        kchunk_mbars: cute.Pointer,
+        kchunk_phase: Int32,
+    ):
+        """One full-K S GEMM, each chunk gated on its own landing."""
+
+        mma = tiled_mma.with_()
+        mma.set(tcgen05.Field.ACCUMULATE, False)
+        k_blocks_per_chunk = cute.size(a_fragment, mode=[2])
+        for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+            _mbarrier_wait_acquire_cluster(
+                kchunk_mbars + chunk,
+                kchunk_phase,
+            )
             for k_block in cutlass.range(
                 0,
                 k_blocks_per_chunk,
