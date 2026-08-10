@@ -177,3 +177,25 @@ pantry 无写者重入；Q own-half bulk 只读 stationary_q）。
    g3(t-1)（dK r0 h1）的 release；rubin_1 深 5 时等的是 g5(t-1)（dO_r1
    h0）。门更早、无环（FIFO 保持），但 gather→W17 rendezvous 的实时位置
    随之前移；若实测 kdq_barrier 变 pacer，属性能面而非正确性面。
+
+---
+
+## 附：k5 判读后的两个预备分支（等待窗口预写，2026-08-11）
+
+### 分支 A：r2_effective → rubin_3 候选形态（Q-pantry 字节账预算）
+
+Q 象限同为 token 不变量（供 dK 的 A），但**全量 Q-pantry 超预算**：
+308,736 + 4×16,384(Q 槽) − 16,384(环 3→2，kdq 专用) = 357,888 > 334,848 ✗
+（超 23,040B）。可行变体：
+- **半 pantry**（只钉 round-1 的 2 个 Q 槽）：+32,768 − 0 = 341,504 ✗ 仍超 6.7KB；
+  再减环深 3→2（kdq+Q_r0 共 4 代 %2=0 合法）−16,384 = 325,120 ✓ **装得下**。
+  形态：ring2 携带 kdq×2 + Q_r0×2（每 tile 4 代），Q_r1 钉死。W17 减半再减半。
+- 决策依据：k5 的 r2 trace/stall 里若供应环仍现（RK_ACQ/credit 平台），半 pantry
+  立即立项；若环已让位（pacer=math/drain），Q-pantry 全族搁置，转 M2。
+
+### 分支 B：k4 anomalous 或 k5 后 pacer=math → M2 deg6 exp 移植清单
+
+代码在库：vk_4 / v_w3_3（deg6 FFMA 多项式替 MUFU exp2，数值面硅上完美，
+B200 判 −0.3~0.5ms，门=W17 链 <5.84µs——rubin_2 的 W17 已减半，门大概率开）。
+移植 = 把 vk_4 的 math 角色 exp 段替换进 rubin_2 的对应函数（单知识点、
+单旋钮 DSA_RUBIN2_M2），配对腿复用 k5 kit 换臂。
