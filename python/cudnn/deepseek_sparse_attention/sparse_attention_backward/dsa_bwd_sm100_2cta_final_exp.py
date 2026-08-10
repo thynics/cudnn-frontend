@@ -4122,6 +4122,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             # E1: per-chunk score-K readiness (leader-CTA barriers).
             kchunk_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+            # E3: per-chunk score-K retirement (dP's tcgen05 release
+            # train, multicast to both CTAs; count 1).
+            krel_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             round_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
@@ -4235,6 +4238,104 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             row_kv_index.append(kv_index)
 
         for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+            destination_rows = cute.composition(
+                destination[None, None, None, chunk],
+                cute.make_layout(
+                    (self.N_TILE_CTA, self.K_CHUNK)
+                ),
+            )
+            for row_iteration in cutlass.range_constexpr(
+                rows_per_group
+            ):
+                local_n = row_local_n[row_iteration]
+                kv_index = row_kv_index[row_iteration]
+                if kv_index >= 0:
+                    self._copy_sparse_k_d128_row(
+                        mKV,
+                        destination_rows,
+                        local_n,
+                        kv_index,
+                        batch_idx,
+                        Int32(chunk * self.K_CHUNK),
+                        index_in_group,
+                        copy_atom,
+                        thread_copy,
+                    )
+                else:
+                    self._zero_sparse_k_d128_row(
+                        destination_rows,
+                        local_n,
+                        index_in_group,
+                    )
+            cute.arch.cp_async_commit_group()
+
+        for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+            cute.arch.cp_async_wait_group(self.K_CHUNKS - 1 - chunk)
+            cute.arch.fence_view_async_shared()
+            cute.arch.mbarrier_arrive(
+                kchunk_mbars + chunk,
+                Int32(0),
+            )
+
+    @cute.jit
+    def _load_score_kv_streamed_early(
+        self,
+        mKV: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        destination: cute.Tensor,
+        kchunk_mbars: cute.Pointer,
+        krel_mbars: cute.Pointer,
+        kscore_pipeline,
+        kscore_producer_state: pipeline.PipelineState,
+        token_idx: Int32,
+        batch_idx: Int32,
+        tile_index: Int32,
+        topk: Int32,
+        rank: Int32,
+        tidx: Int32,
+        copy_atom: cute.CopyAtom,
+        thread_copy: cute.TiledCopy,
+    ):
+        """Prologue-K(1)-only early fill (E3).
+
+        dP(0)'s per-chunk tcgen05 release train retires K(0)'s chunks
+        in order; chunks 0..2 of K(1) start filling on those signals
+        (phase 0 -- the train's first ever firing), while chunk 3
+        keeps the whole-tile pipe lease so the kscore state machine is
+        untouched.  ONLY legal where K directly succeeds K: in the
+        steady loop the loan lives in score_kv between two K
+        generations, so the release train must never gate fills there.
+        """
+
+        index_in_group = tidx % self.KV_GROUP_SIZE
+        group_index = tidx // self.KV_GROUP_SIZE
+        rows_per_group = self.N_TILE_CTA // self.KV_NUM_GROUPS
+        row_local_n = [
+            row_iteration * self.KV_NUM_GROUPS + group_index
+            for row_iteration in range(rows_per_group)
+        ]
+        row_kv_index = []
+        for local_n in row_local_n:
+            logical_n = rank * self.N_TILE_CTA + local_n
+            topk_slot = tile_index * self.N_TILE + logical_n
+            kv_index = Int32(-1)
+            if topk_slot < topk:
+                kv_index = mTopkIdxs[
+                    topk_slot,
+                    (token_idx, batch_idx),
+                ]
+            row_kv_index.append(kv_index)
+
+        for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+            if cutlass.const_expr(chunk < self.K_CHUNKS - 1):
+                cute.arch.mbarrier_wait(
+                    krel_mbars + chunk,
+                    Int32(0),
+                )
+            else:
+                kscore_pipeline.producer_acquire(
+                    kscore_producer_state
+                )
             destination_rows = cute.composition(
                 destination[None, None, None, chunk],
                 cute.make_layout(
@@ -4957,6 +5058,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         loan_epi_safe_mbar = storage.loan_epi_safe_mbar.ptr
         kdq_ready_mbar = storage.kdq_ready_mbar.data_ptr()
         kchunk_mbars = storage.kchunk_mbars.data_ptr()
+        krel_mbars = storage.krel_mbars.data_ptr()
         khot_seq = cute.recast_ptr(
             storage.khot_seq.data_ptr(),
             dtype=cutlass.Int32,
@@ -5487,6 +5589,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 kchunk_mbars + 3,
                 2 * self.GATHER_THREADS,
             )
+            # E3: one tcgen05 commit arrival per chunk per tile.
+            cute.arch.mbarrier_init(krel_mbars, 1)
+            cute.arch.mbarrier_init(krel_mbars + 1, 1)
+            cute.arch.mbarrier_init(krel_mbars + 2, 1)
+            cute.arch.mbarrier_init(krel_mbars + 3, 1)
             cute.arch.mbarrier_init(loan_epi_safe_mbar, 1)
             _store_shared_seq_v4(khot_seq, Int32(0))
         cute.arch.fence_view_async_shared()
@@ -5656,12 +5763,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     # No preceding gradient exists after score(0), so the
                     # first recycled score stage still carries K(1).
                     next_iter = Int32(1)
-                    pipe_kscore.producer_acquire(gather_state)
-                    self._load_score_kv_streamed(
+                    # E3: chunks 0..2 of K(1) enter as dP(0) retires
+                    # K(0)'s chunks; the pipe lease gates only chunk 3.
+                    self._load_score_kv_streamed_early(
                         mKV,
                         mTopkIdxs,
                         k_n,
                         kchunk_mbars,
+                        krel_mbars,
+                        pipe_kscore,
+                        gather_state,
                         token_idx,
                         batch_idx,
                         tile_count - Int32(1) - next_iter,
@@ -6271,6 +6382,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipe_dq_done.producer_acquire(dq_done_prod)
 
                 relay_phase = Int32(0)
+                # E3: multicast mask for the dP release train (self |
+                # peer), same recipe as the kscore pipe's UMMA release.
+                krel_peer_mask = (
+                    pipeline.PipelineAsyncUmma._compute_peer_cta_mask(
+                        cluster_layout_vmnk
+                    )
+                )
                 # E2: consumer side byte-identical to base -- ONE kscore
                 # lease wait per tile, then all four chunks' MMAs issue
                 # with no dependency and no barrier in between.  The E1
@@ -6302,7 +6420,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             stationary_ready_mbar + 1,
                             Int32(0),
                         )
-                    dp_prod = self._issue_score_v2(
+                    dp_prod = self._issue_dp_v2_release(
                         dp_tiled_mma,
                         t_dp,
                         t_dp_pp,
@@ -6310,8 +6428,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         dp_k_fragment,
                         pipe_dp_done,
                         dp_prod,
-                        loop_iter,
-                        True,
+                        krel_mbars,
+                        krel_peer_mask,
                     )
                     pipe_kscore.consumer_release(kscore_cons)
                     kscore_cons.advance()
@@ -6813,6 +6931,90 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
         tmem.free(tmem_ptr)
+
+    @cute.jit
+    def _issue_dp_v2_release(
+        self,
+        tiled_mma: cute.TiledMma,
+        accumulator_0: cute.Tensor,
+        accumulator_1: cute.Tensor,
+        a_fragment: cute.Tensor,
+        b_fragment: cute.Tensor,
+        done_pipeline,
+        producer_state: pipeline.PipelineState,
+        krel_mbars: cute.Pointer,
+        krel_peer_mask: Int32,
+    ) -> pipeline.PipelineState:
+        """dP issue with the E3 per-chunk release train.
+
+        After chunk c's k_blocks one tcgen05.commit (elect_one, CG2,
+        multicast to both CTAs) arms krel_mbars[c]; the hardware
+        arrival fires when every prior MMA completes, i.e. no earlier
+        than S's and dP's chunk-c reads, so chunk c of score_kv is
+        provably dead from that arrival.  Commits are fire-and-forget:
+        zero waits added to the leader (the E1 lesson -- probes on the
+        pacer cost, commits do not).
+        """
+
+        done_pipeline.producer_acquire(producer_state)
+        if producer_state.index == Int32(0):
+            self._issue_score_chunks_v7_release(
+                tiled_mma,
+                accumulator_0,
+                a_fragment,
+                b_fragment,
+                krel_mbars,
+                krel_peer_mask,
+            )
+        else:
+            self._issue_score_chunks_v7_release(
+                tiled_mma,
+                accumulator_1,
+                a_fragment,
+                b_fragment,
+                krel_mbars,
+                krel_peer_mask,
+            )
+        cute.arch.fence_view_async_tmem_store()
+        done_pipeline.producer_commit(producer_state)
+        producer_state.advance()
+        return producer_state
+
+    @cute.jit
+    def _issue_score_chunks_v7_release(
+        self,
+        tiled_mma: cute.TiledMma,
+        accumulator: cute.Tensor,
+        a_fragment: cute.Tensor,
+        b_fragment: cute.Tensor,
+        krel_mbars: cute.Pointer,
+        krel_peer_mask: Int32,
+    ):
+        """chunks_v7 plus one retirement commit per chunk (E3)."""
+
+        mma = tiled_mma.with_()
+        mma.set(tcgen05.Field.ACCUMULATE, False)
+        k_blocks_per_chunk = cute.size(a_fragment, mode=[2])
+        for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+            for k_block in cutlass.range(
+                0,
+                k_blocks_per_chunk,
+                unroll=4,
+            ):
+                cute.gemm(
+                    mma,
+                    accumulator,
+                    a_fragment[None, None, k_block, chunk],
+                    b_fragment[None, None, k_block, chunk],
+                    accumulator,
+                )
+                mma.set(tcgen05.Field.ACCUMULATE, True)
+            with cute.arch.elect_one():
+                tcgen05.commit(
+                    krel_mbars + chunk,
+                    krel_peer_mask,
+                    tcgen05.CtaGroup.TWO,
+                )
 
     @cute.jit
     def _issue_score_v2(
