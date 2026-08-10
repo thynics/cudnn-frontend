@@ -17,7 +17,7 @@ set -euo pipefail
 script_rel="${1:?usage: run_remote_probe.sh <repo-relative-script> [label] [KEY=VALUE ...]}"
 label="${2:-dsa-probe}"
 extra_env=("${@:3}")
-for kv in "${extra_env[@]}"; do
+for kv in ${extra_env[@]+"${extra_env[@]}"}; do
   [[ "${kv}" == *=* ]] || { echo "bad env assignment: ${kv}" >&2; exit 2; }
 done
 frontend="${COMPUTELAB_B200_FRONTEND:-computelab-sc-01}"
@@ -78,7 +78,8 @@ ssh -o BatchMode=yes "${frontend}" "chmod 700 '${remote_root}/probe.sh'"
 remote_command="$(printf "%q " \
   "${remote_manager}" with-lock --label "${label}" --sync-repo "${remote_repo}" -- \
   "${remote_root}/probe.sh" "${script_rel}" "${remote_repo}" \
-  "${remote_root}/result" "${remote_root}/worktree" "${extra_env[@]}")"
+  "${remote_root}/result" "${remote_root}/worktree" \
+  ${extra_env[@]+"${extra_env[@]}"})"
 set +e
 ssh -o BatchMode=yes "${frontend}" "${remote_command}"
 run_rc=$?
