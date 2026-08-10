@@ -86,6 +86,21 @@ _RUBIN1_REG_K1A = (
     os.environ.get("DSA_RUBIN1_REG_K1A", "0") == "1"
 )
 
+# K2 despill probe (e3sassk1 r1 verdict): every mbarrier wait loop
+# reloads its spilled mbar-base slot ([R1+0x108]-class) once per poll
+# iteration -- the reduce dkv_done wait alone is 45.5M LDL/launch (~48%
+# of post-K1a compat LDL), and the disease family was 60% of pre-K1a
+# LDL.  Register funding is ruled out (the same loop spun 48.5M times
+# under the original 128-register reduce budget).  K2 pre-spins on the
+# UNIFORM try_wait datapath (the compiler's own fast path, pointer in
+# UR registers, zero LDL) and hands the satisfied token to the pipeline
+# call, whose slow path is then statically skipped (if_generate on
+# token in the DSL pipeline base).  Protocol semantics are unchanged:
+# same mbarrier, same phase, same release order.
+_RUBIN1_SPIN_K2 = (
+    os.environ.get("DSA_RUBIN1_SPIN_K2", "0") == "1"
+)
+
 
 @dsl_user_op
 def _map_smem_to_cluster_rank(
@@ -176,6 +191,26 @@ def _cp_async_mbarrier_arrive(
         None,
         [mbar_i32],
         "cp.async.mbarrier.arrive.shared::cta.b64 [$0];",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _nanosleep(
+    nanoseconds: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """nanosleep.u32 -- yield hint between K2 uniform mbarrier polls."""
+
+    llvm.inline_asm(
+        None,
+        [Int32(nanoseconds).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
         "r",
         has_side_effects=True,
         is_align_stack=False,
@@ -4004,6 +4039,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # its reduce-side funding.  Base form is the delivered 48/128 split;
     # both arms keep the 61,440-register dynamic pool (= 640 x 96).
     REG_K1A = _RUBIN1_REG_K1A
+    SPIN_K2 = _RUBIN1_SPIN_K2
     PRODUCER_REGS = 64 if _RUBIN1_REG_K1A else 48
     REDUCE_REGS = 120 if _RUBIN1_REG_K1A else 128
 
@@ -5958,7 +5994,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # leader's deferred release of K(t) (fires when the S/dP
                 # source reads truly complete).  The dO_r0 loan and its
                 # tail-tile recommit are retired; dO_r0 rides the ring.
-                pipe_kscore.producer_acquire(gather_state)
+                self._k2_producer_acquire(pipe_kscore, gather_state)
                 self._load_score_kv(
                     mKV,
                     mTopkIdxs,
@@ -6003,7 +6039,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         Int32(1),
                         tile_count,
                     ):
-                        pipe_kscore.producer_acquire(gather_state)
+                        self._k2_producer_acquire(pipe_kscore, gather_state)
                         self._load_score_kv(
                             mKV,
                             mTopkIdxs,
@@ -6885,7 +6921,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
                     self.kdq_barrier.arrive_and_wait()
-                    cute.arch.mbarrier_wait(
+                    self._k2_mbar_wait(
                         kdq_ready_mbar,
                         kdq_ready_phase,
                     )
@@ -7208,31 +7244,31 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 for flat_gen in cutlass.range_constexpr(8):
                     slot = self.PANEL_SLOTS[flat_gen]
                     if cutlass.const_expr(slot == 0):
-                        cute.arch.mbarrier_wait(
+                        self._k2_mbar_wait(
                             round_tma_mbars,
                             w19_phase_0,
                         )
                         w19_phase_0 = Int32(1) - w19_phase_0
                     elif cutlass.const_expr(slot == 1):
-                        cute.arch.mbarrier_wait(
+                        self._k2_mbar_wait(
                             round_tma_mbars + 1,
                             w19_phase_1,
                         )
                         w19_phase_1 = Int32(1) - w19_phase_1
                     elif cutlass.const_expr(slot == 2):
-                        cute.arch.mbarrier_wait(
+                        self._k2_mbar_wait(
                             round_tma_mbars + 2,
                             w19_phase_2,
                         )
                         w19_phase_2 = Int32(1) - w19_phase_2
                     elif cutlass.const_expr(slot == 3):
-                        cute.arch.mbarrier_wait(
+                        self._k2_mbar_wait(
                             round_tma_mbars + 3,
                             w19_phase_3,
                         )
                         w19_phase_3 = Int32(1) - w19_phase_3
                     else:
-                        cute.arch.mbarrier_wait(
+                        self._k2_mbar_wait(
                             round_tma_mbars + 4,
                             w19_phase_4,
                         )
@@ -7596,6 +7632,50 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     out_row[dim_idx] = self.element_dtype(scrambled)
 
     @cute.jit
+    def _k2_consumer_wait(self, pipe, state) -> None:
+        """K2 despill: uniform try_wait spin + token-gated consumer_wait.
+
+        The satisfied token makes the pipeline's consumer_wait skip its
+        slow wait entirely (if_generate on token in PipelineAsync), so
+        the spilled-pointer LDL loop becomes dead code.  Off-knob form
+        is byte-identical to the original call.
+        """
+
+        if cutlass.const_expr(self.SPIN_K2):
+            token = pipe.consumer_try_wait(state)
+            while token == 0:
+                _nanosleep(Int32(64))
+                token = pipe.consumer_try_wait(state)
+            pipe.consumer_wait(state, token)
+        else:
+            pipe.consumer_wait(state)
+
+    @cute.jit
+    def _k2_producer_acquire(self, pipe, state) -> None:
+        """K2 despill: producer-side twin of _k2_consumer_wait."""
+
+        if cutlass.const_expr(self.SPIN_K2):
+            token = pipe.producer_try_acquire(state)
+            while token == 0:
+                _nanosleep(Int32(64))
+                token = pipe.producer_try_acquire(state)
+            pipe.producer_acquire(state, token)
+        else:
+            pipe.producer_acquire(state)
+
+    @cute.jit
+    def _k2_mbar_wait(self, mbar, phase: Int32) -> None:
+        """K2 despill: raw-mbarrier twin (W19 ring TMA / W17 kdq waits)."""
+
+        if cutlass.const_expr(self.SPIN_K2):
+            token = cute.arch.mbarrier_try_wait(mbar, phase)
+            while token == 0:
+                _nanosleep(Int32(64))
+                token = cute.arch.mbarrier_try_wait(mbar, phase)
+        else:
+            cute.arch.mbarrier_wait(mbar, phase)
+
+    @cute.jit
     def _drain_dkv_v8(
         self,
         t_dkv_0: cute.Tensor,
@@ -7633,7 +7713,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         packed_issue = issue_seq * Int32(self.D_ROUNDS)
 
         # --- slot 0: head-committed generation.
-        done_pipeline.consumer_wait(wait_state)
+        self._k2_consumer_wait(done_pipeline, wait_state)
         wait_state.advance()
 
         dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
@@ -7741,7 +7821,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
 
         # --- slot 1: tail-committed generation.
-        done_pipeline.consumer_wait(wait_state)
+        self._k2_consumer_wait(done_pipeline, wait_state)
         wait_state.advance()
         cute.copy(tiled_t2r_1, thread_source_1, thread_values_1)
         cute.arch.fence_view_async_tmem_load()
