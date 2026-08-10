@@ -23,6 +23,7 @@ import importlib
 import importlib.util
 import json
 import math
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -31,7 +32,11 @@ import torch
 
 sys.path[:0] = ["python", "test/python", "."]
 
-TOKENS = 512
+# E5B_TOKENS sweeps the wave count: 512 (default, ~7 waves, 1 GB cold
+# staging stream), 74 (exactly one full wave), 8 (16 MB staging, L2-hot
+# across sample loops -- discriminates memory-system tax vs in-kernel
+# protocol cost).
+TOKENS = int(os.environ.get("E5B_TOKENS", "512"))
 S_KV = 4096
 TOPK = 2048
 HEADS = 128

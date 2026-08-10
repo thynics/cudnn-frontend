@@ -3,7 +3,10 @@
 # the managed B200 worker via the same manager/with-lock mechanics as
 # run_v_w3_2_allinone.sh, without the harness legs.
 #
-#   ./benchmark/dsa/run_remote_probe.sh benchmark/dsa/probe_e5a_staging.py [label]
+#   ./benchmark/dsa/run_remote_probe.sh benchmark/dsa/probe_e5a_staging.py [label] [KEY=VALUE ...]
+#
+# Args after the label are exported as environment variables inside the
+# remote worktree before the script runs (e.g. E5B_TOKENS=74).
 #
 # The remote repo is synced to origin/dev/longcheng HEAD by the manager
 # (--sync-repo); the worktree gets the allinone workspace fixes
@@ -11,8 +14,12 @@
 # `from cudnn import DSA` works.  Artifacts land in outputs/<run_id>/.
 set -euo pipefail
 
-script_rel="${1:?usage: run_remote_probe.sh <repo-relative-script> [label]}"
+script_rel="${1:?usage: run_remote_probe.sh <repo-relative-script> [label] [KEY=VALUE ...]}"
 label="${2:-dsa-probe}"
+extra_env=("${@:3}")
+for kv in "${extra_env[@]}"; do
+  [[ "${kv}" == *=* ]] || { echo "bad env assignment: ${kv}" >&2; exit 2; }
+done
 frontend="${COMPUTELAB_B200_FRONTEND:-computelab-sc-01}"
 remote_manager="/home/scratch.longcheng_gpu/dsa-b200-harness-image/b200_manager.sh"
 remote_repo="/home/scratch.longcheng_gpu/cudnn-frontend-thynics"
@@ -25,7 +32,8 @@ payload_local="$(mktemp)"
 cat >"${payload_local}" <<'REMOTE'
 #!/usr/bin/env bash
 set -euo pipefail
-script_rel="$1"; repo="$2"; result="$3"; worktree="$4"
+script_rel="$1"; repo="$2"; result="$3"; worktree="$4"; shift 4
+for kv in "$@"; do export "${kv?}"; done
 mkdir -p "${result}"
 exec > >(tee -a "${result}/remote.log") 2>&1
 finish() {
@@ -70,7 +78,7 @@ ssh -o BatchMode=yes "${frontend}" "chmod 700 '${remote_root}/probe.sh'"
 remote_command="$(printf "%q " \
   "${remote_manager}" with-lock --label "${label}" --sync-repo "${remote_repo}" -- \
   "${remote_root}/probe.sh" "${script_rel}" "${remote_repo}" \
-  "${remote_root}/result" "${remote_root}/worktree")"
+  "${remote_root}/result" "${remote_root}/worktree" "${extra_env[@]}")"
 set +e
 ssh -o BatchMode=yes "${frontend}" "${remote_command}"
 run_rc=$?
