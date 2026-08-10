@@ -135,6 +135,7 @@ worktree="$4"
 run_root="$(dirname "${result}")"
 package_rel="python/cudnn/deepseek_sparse_attention/sparse_attention_backward"
 interface_template="/home/scratch.longcheng_gpu/dsa-b200-harness-image/interface_sm100.py"
+release_python="${DSA_VALIDATE_PYTHON:-/home/scratch.longcheng_gpu/cudnn-frontend/.venv/bin/python}"
 trace_python="${DSA_TRACE_PYTHON:-/home/scratch.longcheng_gpu/dsa_iket_h128_venv_2606/bin/python}"
 stage="bootstrap"
 error_line=""
@@ -202,6 +203,8 @@ stage="locate_runtime"
 [[ -s "${release_source}" ]]
 [[ -s "${trace_source}" ]]
 [[ -s "${interface_template}" ]]
+[[ -x "${release_python}" ]]
+[[ -x "${trace_python}" ]]
 
 compiled_module="$(find "${repo}/python/cudnn" -maxdepth 1 -type f \
   -name '_compiled_module*.so' -print -quit)"
@@ -230,7 +233,7 @@ export DSA_DEV_IMPLEMENTATION="${implementation}"
 unset DSA_DEV_IKET DKG_IKET_INSTRUMENTATION_METHOD IKET_STANDALONE_SITE_PACKAGES
 
 stage="release_correctness_and_perf"
-python3 - "${worktree}" "${result}/correctness.json" "${result}/perf.json" <<'PY_RELEASE'
+"${release_python}" - "${worktree}" "${result}/correctness.json" "${result}/perf.json" <<'PY_RELEASE'
 from __future__ import annotations
 
 import json
