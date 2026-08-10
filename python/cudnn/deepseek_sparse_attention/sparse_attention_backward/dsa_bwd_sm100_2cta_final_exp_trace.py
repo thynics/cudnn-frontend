@@ -6271,14 +6271,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipe_dq_done.producer_acquire(dq_done_prod)
 
                 relay_phase = Int32(0)
-                kchunk_phase = Int32(0)
+                # E2: consumer side byte-identical to base -- ONE kscore
+                # lease wait per tile, then all four chunks' MMAs issue
+                # with no dependency and no barrier in between.  The E1
+                # bisection priced consumer-side chunk gates at +0.27ms
+                # (existence) / +0.14ms (in-loop placement) on the
+                # pacer's serial line; chunk-granular publication stays
+                # on the gather side only (priced free by v_e1a) as the
+                # score_kv lifecycle foundation for later lending.
                 for loop_iter in cutlass.range(tile_count):
                     has_prev = loop_iter > Int32(0)
 
-                    # E1: S consumes K chunk-by-chunk as the gather
-                    # lands each one; the whole-tile kscore lease wait
-                    # moves down to dP (trivially satisfied by then).
-                    s_prod = self._issue_score_v2_streamed(
+                    pipe_kscore.consumer_wait(kscore_cons)
+                    s_prod = self._issue_score_v2(
                         score_tiled_mma,
                         t_score,
                         t_score_pp,
@@ -6286,10 +6291,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         score_k_fragment,
                         pipe_s_done,
                         s_prod,
-                        kchunk_mbars,
-                        kchunk_phase,
+                        loop_iter,
+                        False,
                     )
-                    kchunk_phase = Int32(1) - kchunk_phase
 
                     # dP(t) then early K recycle.  The first dP also
                     # gates on the dO half of the split stationary load.
@@ -6298,7 +6302,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             stationary_ready_mbar + 1,
                             Int32(0),
                         )
-                    pipe_kscore.consumer_wait(kscore_cons)
                     dp_prod = self._issue_score_v2(
                         dp_tiled_mma,
                         t_dp,
