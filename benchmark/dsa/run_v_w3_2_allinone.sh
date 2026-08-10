@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# One-lock B200 correctness gate, fair direct benchmark, and IKET trace capture.
+# Managed-B200 correctness gate, fair direct benchmark, and IKET trace capture.
 # Successful local output contains only perf.json and trace.json. Failures keep
 # session.log plus every compact remote diagnostic/result produced before the
-# failing stage.
+# failing stage. The global service allocation and Docker worker are reused;
+# only its per-request pipeline lock is held for the duration of this run.
 
 usage() {
   cat <<'EOF'
@@ -20,15 +21,18 @@ Options:
 
 Success: OUTPUT_DIR/{perf.json,trace.json}
 Failure: OUTPUT_DIR/session.log plus remote logs/status/partial JSON artifacts
+
+The existing managed B200 allocation/Docker worker is reused when healthy.
+This command never stops that service; it releases only pipeline.lock.
 EOF
 }
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "${script_dir}/../.." && pwd -P)"
-lock_tool="${HOME}/.codex/skills/computelab-b200-lock/scripts/computelab-b200"
 frontend="${COMPUTELAB_B200_FRONTEND:-computelab-sc-01}"
 implementation="final"
 remote_repo="/home/scratch.longcheng_gpu/cudnn-frontend-thynics"
+remote_manager="/home/scratch.longcheng_gpu/dsa-b200-harness-image/b200_manager.sh"
 output_dir=""
 
 while (($#)); do
@@ -69,16 +73,12 @@ done
   exit 2
 }
 
-for executable in bash expect git python3 scp ssh tar; do
+for executable in bash git python3 scp ssh tar; do
   command -v "${executable}" >/dev/null 2>&1 || {
     echo "ERROR: missing executable: ${executable}" >&2
     exit 2
   }
 done
-[[ -x "${lock_tool}" ]] || {
-  echo "ERROR: B200 lock tool is missing: ${lock_tool}" >&2
-  exit 2
-}
 expanded_hostname="$(
   ssh -G "${frontend}" 2>/dev/null |
     awk 'tolower($1) == "hostname" { print $2; exit }'
@@ -103,12 +103,10 @@ mkdir -p "${output_dir}"
 session_log="${output_dir}/session.log"
 temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/dsa-v-w3-2-allinone.XXXXXXXX")"
 remote_payload_local="${temp_dir}/remote.sh"
-expect_driver="${temp_dir}/drive-lock.exp"
 remote_run_root="/home/scratch.longcheng_gpu/.dsa-allinone/${run_id}"
 remote_payload="${remote_run_root}/remote.sh"
 remote_result="${remote_run_root}/result"
 remote_worktree="${remote_run_root}/worktree"
-lock_in_progress=0
 completed=0
 
 exec > >(tee -a "${session_log}") 2>&1
@@ -116,13 +114,6 @@ exec > >(tee -a "${session_log}") 2>&1
 cleanup() {
   local rc=$?
   set +e
-  if ((lock_in_progress)); then
-    local session_id
-    session_id="$(sed -n 's/.*B200_LOCK_SESSION_ID=\([a-f0-9][a-f0-9]*\).*/\1/p' "${session_log}" | tail -n 1)"
-    if [[ -n "${session_id}" ]]; then
-      "${lock_tool}" unlock "${session_id}" >>"${session_log}" 2>&1 || true
-    fi
-  fi
   rm -rf "${temp_dir}"
   if ((completed)); then
     rm -f "${session_log}"
@@ -199,9 +190,6 @@ trap finish EXIT
 [[ "${result}" == /home/scratch.longcheng_gpu/* ]]
 [[ "${worktree}" == /home/scratch.longcheng_gpu/* ]]
 [[ -d "${repo}/.git" || -f "${repo}/.git" ]]
-
-stage="git_pull"
-git -C "${repo}" pull --ff-only
 
 stage="create_worktree"
 git -C "${repo}" worktree add --detach "${worktree}" HEAD
@@ -702,64 +690,46 @@ stage="complete"
 echo "DSA_ALLINONE_PASS perf=${result}/perf.json trace=${result}/trace.json"
 REMOTE_SCRIPT
 
-cat >"${expect_driver}" <<'EXPECT_SCRIPT'
-#!/usr/bin/expect -f
-set timeout -1
-set remote_rc ""
-
-spawn -noecho $env(DSA_LOCK_TOOL) lock
-expect {
-    -re {longcheng@[^\r\n ]+:/home/scratch\.longcheng_gpu\$ } {
-        send -- "$env(DSA_REMOTE_COMMAND)\r"
-    }
-    eof {
-        set wait_result [wait]
-        exit [lindex $wait_result 3]
-    }
-}
-
-expect {
-    -re {__DSA_REMOTE_RC=([0-9]+)} {
-        set remote_rc $expect_out(1,string)
-        exp_continue
-    }
-    eof {
-        set wait_result [wait]
-        if {$remote_rc ne ""} {
-            exit $remote_rc
-        }
-        exit [lindex $wait_result 3]
-    }
-}
-EXPECT_SCRIPT
-
 echo "Staging all-in-one payload: ${frontend}:${remote_payload}"
 ssh -o BatchMode=yes "${frontend}" "mkdir -p '${remote_run_root}'"
 scp -q "${remote_payload_local}" "${frontend}:${remote_payload}"
+ssh -o BatchMode=yes "${frontend}" \
+  "chmod 700 '${remote_payload}' && test -x '${remote_payload}'"
 
-remote_command="$(printf "bash %q %q %q %q %q" \
+manager_label="dsa-allinone"
+remote_command="$(printf "%q " \
+  "${remote_manager}" \
+  with-lock \
+  --label "${manager_label}" \
+  --sync-repo "${remote_repo}" \
+  -- \
   "${remote_payload}" \
   "${implementation}" \
   "${remote_repo}" \
   "${remote_result}" \
   "${remote_worktree}")"
-remote_command="${remote_command}; rc=\$?; echo __DSA_REMOTE_RC=\$rc; exit \$rc"
 
-echo "Acquiring the serialized B200 lock and running ${implementation}..."
-lock_in_progress=1
+echo "Reusing the managed B200 worker and acquiring pipeline.lock..."
 set +e
-DSA_LOCK_TOOL="${lock_tool}" \
-DSA_REMOTE_COMMAND="${remote_command}" \
-/usr/bin/expect "${expect_driver}"
+ssh -o BatchMode=yes "${frontend}" "${remote_command}"
 run_rc=$?
 set -e
-lock_in_progress=0
 
 if ((run_rc != 0)); then
   echo "Remote run failed (rc=${run_rc}); downloading diagnostics..." >&2
   scp -q -r "${frontend}:${remote_result}/." "${output_dir}/" || \
     echo "WARNING: remote diagnostics were unavailable; session.log is complete" >&2
   exit "${run_rc}"
+fi
+
+managed_status="$(
+  ssh -o BatchMode=yes "${frontend}" \
+    "$(printf '%q' "${remote_manager}") status"
+)"
+printf '%s\n' "${managed_status}"
+if ! grep -Fq 'heartbeat=fresh state=ready' <<<"${managed_status}"; then
+  echo "ERROR: managed B200 worker was not retained after pipeline.lock release" >&2
+  exit 70
 fi
 
 echo "Downloading compact success artifacts..."
