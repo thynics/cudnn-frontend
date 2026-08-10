@@ -70,6 +70,22 @@ assert not (_RUBIN1_B200_COMPAT and _RUBIN1_E3PAD), (
 # machine in full; only the storage size and the SMEM cap differ.
 _RUBIN1_COMPAT_STRUCTURE = _RUBIN1_B200_COMPAT or _RUBIN1_E3PAD
 
+# K1a despill probe (e3sass r1 verdict): the dominant local-memory byte
+# bucket is spilled pipeline state reloaded inside the producer warps'
+# wait loops (a single [R1+0x110]-class slot reloads 60M+ times per
+# launch), and those warps run at 48 registers by design.  K1a hands
+# warpgroup 16-19 (MMA issue / load / relay / commit) 64 registers,
+# funded by the reduce warpgroups dropping 128 -> 120, so the dynamic
+# pool stays at the launch allocation (640 x 96 = 61,440):
+#   4x32x48 (gather) + 4x32x64 (W16-19) + 4x32x128 (math)
+#   + 8x32x120 (reduce) = 61,440.
+# Known trade-off: reduce already spills around its red.global quads
+# (the 8.7k-stall REDG-neighbour LDL.LU.64 sites); -8 registers may
+# worsen that bucket.  The paired measurement decides.
+_RUBIN1_REG_K1A = (
+    os.environ.get("DSA_RUBIN1_REG_K1A", "0") == "1"
+)
+
 
 @dsl_user_op
 def _map_smem_to_cluster_rank(
@@ -3984,6 +4000,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     E3PAD = _RUBIN1_E3PAD
     E3PAD_ELEMENTS = 8_192 if _RUBIN1_E3PAD else 0  # bf16 -> 16,384 B
 
+    # K1a despill probe: producer warpgroup (16-19) register budget and
+    # its reduce-side funding.  Base form is the delivered 48/128 split;
+    # both arms keep the 61,440-register dynamic pool (= 640 x 96).
+    REG_K1A = _RUBIN1_REG_K1A
+    PRODUCER_REGS = 64 if _RUBIN1_REG_K1A else 48
+    REDUCE_REGS = 120 if _RUBIN1_REG_K1A else 128
+
     # Warp roles (5 warps per named group where applicable).
     GATHER_WARPS = 4
     MATH_WARP_BEGIN = 4
@@ -5908,16 +5931,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.N_TILE
         )
 
-        if (
-            warp_idx < Int32(self.MATH_WARP_BEGIN)
-            or warp_idx >= Int32(self.MMA_WARP)
-        ):
+        if warp_idx < Int32(self.MATH_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(48)
+        elif warp_idx >= Int32(self.MMA_WARP):
+            # K1a: producer warpgroup gains the spin-state registers.
+            cute.arch.setmaxregister_decrease(self.PRODUCER_REGS)
         else:
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
                 cute.arch.setmaxregister_increase(128)
             else:
-                cute.arch.setmaxregister_increase(128)
+                cute.arch.setmaxregister_increase(self.REDUCE_REGS)
 
         # ==================================================================
         # Role bodies.
