@@ -95,6 +95,20 @@ _RUBIN1_KV2 = (
 assert not (_RUBIN1_KV2 and not _RUBIN1_SLIM51), (
     "DSA_RUBIN1_KV2 requires DSA_RUBIN1_SLIM51=1 (and MIX51)"
 )
+# TAIL: independent per-round dQ epilogue staging (round 1 stages into
+# the second 16,384-element half of the SLIM51 score_kv field), removing
+# the inter-round wait_group.read + barrier serialization in the
+# 14.4 us fixed tail (k16 timeline).
+_RUBIN1_TAIL = (
+    os.environ.get("DSA_RUBIN1_TAIL", "0") == "1"
+)
+assert not (_RUBIN1_TAIL and not _RUBIN1_SLIM51), (
+    "DSA_RUBIN1_TAIL requires DSA_RUBIN1_SLIM51=1 (and MIX51)"
+)
+assert not (_RUBIN1_TAIL and _RUBIN1_KV2), (
+    "DSA_RUBIN1_TAIL and DSA_RUBIN1_KV2 both claim the second "
+    "score_kv half"
+)
 # Structure selector: E3PAD runs the COMPAT (ring-2 / single-face)
 # machine in full; only the storage size and the SMEM cap differ.
 _RUBIN1_COMPAT_STRUCTURE = _RUBIN1_B200_COMPAT or _RUBIN1_E3PAD
@@ -1577,8 +1591,14 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         batch_idx: Int32,
         rank: Int32,
         mtx: Int32,
+        tail_mode: cutlass.Constexpr[int] = 0,
     ):
         """Store one rank-owned dQ round via SMEM staging + one bulk TMA.
+
+        tail_mode (k17): 0 = legacy serialized rounds; 1 = first of two
+        independent-staging rounds (skip the engine-read wait and the
+        trailing broadcast barrier -- nothing overwrites this staging);
+        2 = last round (wait ALL outstanding bulk groups, then barrier).
 
         v12 (P4, ported from the V0 epilogue / the b244255 precedent):
         T2R exactly as the scalar path, but the values land in the dead
@@ -1646,10 +1666,13 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             cute.arch.fence_view_async_shared()
             cute.copy(tma_atom_dq_epi, t_smem, t_gmem)
             cute.arch.cp_async_bulk_commit_group()
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            if cutlass.const_expr(tail_mode != 1):
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
         # Source-side completion broadcast: round 1 may overwrite the
         # staging only after the engine has READ round 0's bytes.
-        self.math_barrier.arrive_and_wait()
+        # tail_mode 1 skips both (independent staging, k17).
+        if cutlass.const_expr(tail_mode != 1):
+            self.math_barrier.arrive_and_wait()
 
     @cute.jit
     def _stage_local_pd(
@@ -4075,9 +4098,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     SLIM51 = _RUBIN1_SLIM51
     KV2 = _RUBIN1_KV2
     KSCORE_STAGES = 2 if _RUBIN1_KV2 else 1
+    TAIL = _RUBIN1_TAIL
     SLIM51 = _RUBIN1_SLIM51
     KV2 = _RUBIN1_KV2
     KSCORE_STAGES = 2 if _RUBIN1_KV2 else 1
+    TAIL = _RUBIN1_TAIL
     SPIN_K2 = _RUBIN1_SPIN_K2
     PRODUCER_REGS = (
         int(_RUBIN1_PRODUCER_REGS) if _RUBIN1_PRODUCER_REGS
@@ -5507,6 +5532,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ),
             dq_epi_layout_staged.outer,
         )[None, None, 0]
+        if cutlass.const_expr(self.TAIL):
+            s_dq_epi_1 = cute.make_tensor(
+                cute.recast_ptr(
+                    storage.score_kv.data_ptr() + 16384,
+                    dq_epi_layout_staged.inner,
+                    self.element_dtype,
+                ),
+                dq_epi_layout_staged.outer,
+            )[None, None, 0]
+        else:
+            s_dq_epi_1 = s_dq_epi
         # kdq (the dQ-A K images) always occupies slots 0/1: gens g0/g1
         # of every tile land there under both mod-2 and mod-5 maps.
         round_kd = (
@@ -6667,12 +6703,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     batch_idx,
                     rank,
                     mtx,
+                    tail_mode=(1 if self.TAIL else 0),
                 )
                 self._store_dq_epi_tma_v12(
                     t_dq[1],
                     dq_tmem_load,
                     rank_dq_coordinates,
-                    s_dq_epi,
+                    s_dq_epi_1,
                     tma_atom_dq_epi,
                     tma_tensor_dq_epi,
                     1,
@@ -6680,6 +6717,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     batch_idx,
                     rank,
                     mtx,
+                    tail_mode=(2 if self.TAIL else 0),
                 )
                 pipe_dq_done.consumer_release(dq_done_state)
                 dq_done_state.advance()
