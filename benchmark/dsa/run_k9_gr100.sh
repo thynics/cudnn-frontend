@@ -86,7 +86,7 @@ PY
 # ------------------------------------------------------------ arm_selection
 # Every k-kit writes its JSON as "summary_k4.json" inside its own out dir
 # (shared lineage); per-kit verdict markers differ but the period map key is
-# uniform.  Candidate arms only -- ck/e3k1 anchors are never profiled here.
+# uniform.  ck (compat+K1a champion) is a first-class candidate; e3k1 is not.
 STAGE=arm_selection
 DSA_DIR="${REPO}/benchmark/dsa" OUT_DIR="${OUT}" K9_ARM="${K9_ARM:-}" \
 python3 - <<'PY' | tee "${OUT}/arm_selection.log"
@@ -97,10 +97,11 @@ from pathlib import Path
 dsa = Path(os.environ["DSA_DIR"])
 out = Path(os.environ["OUT_DIR"])
 ARM_TO_IMPL = {
-    "r2":   ("rubin_2", "0"),
-    "r2m2": ("rubin_2", "1"),
-    "r3":   ("rubin_3", "0"),
-    "r3m2": ("rubin_3", "1"),
+    "ck":   ("rubin_1", "DSA_RUBIN1_B200_COMPAT=1 DSA_RUBIN1_REG_K1A=1"),
+    "r2":   ("rubin_2", ""),
+    "r2m2": ("rubin_2", "DSA_RUBIN2_M2=1"),
+    "r3":   ("rubin_3", ""),
+    "r3m2": ("rubin_3", "DSA_RUBIN2_M2=1"),
 }
 candidates = {}
 for kdir in ("k5_out", "k6_out", "k7_out", "k8_out"):
@@ -128,20 +129,20 @@ else:
     )
     arm = min(candidates, key=candidates.get)
 
-impl, m2 = ARM_TO_IMPL[arm]
+impl, extra = ARM_TO_IMPL[arm]
 print("K9_ARM_SELECTED " + json.dumps({
     "arm": arm,
     "impl": impl,
-    "m2": m2,
+    "extra_env": extra,
     "candidates": candidates,
 }, sort_keys=True))
 (out / "arm_selected.env").write_text(
-    f"ARM={arm}\nIMPL={impl}\nM2={m2}\n"
+    f"ARM={arm}\nIMPL={impl}\nEXTRA=\"{extra}\"\n"
 )
 PY
 # shellcheck disable=SC1091
 source "${OUT}/arm_selected.env"
-echo "K9_ARM_ENV ARM=${ARM} IMPL=${IMPL} M2=${M2}"
+echo "K9_ARM_ENV ARM=${ARM} IMPL=${IMPL} EXTRA=${EXTRA:-}"
 
 # ncu discovery: env override, PATH, CUDA_HOME, common install globs.
 STAGE=ncu_discovery
@@ -215,9 +216,10 @@ echo "K9_METRICS ${METRICS}" | tee "${OUT}/ncu_metrics_used.log"
 
 # --------------------------------------------------------------- profiling
 STAGE=ncu_profile
+# shellcheck disable=SC2086  # EXTRA holds space-separated KEY=VAL pairs
 env -u DSA_RUBIN1_B200_COMPAT -u DSA_RUBIN1_E3PAD \
-    -u DSA_RUBIN1_REG_K1A -u DSA_RUBIN1_SPIN_K2 \
-    "DSA_RUBIN2_M2=${M2}" \
+    -u DSA_RUBIN1_REG_K1A -u DSA_RUBIN1_SPIN_K2 -u DSA_RUBIN2_M2 \
+    ${EXTRA:-} \
     PYTHONPATH="${REPO}/python${PYTHONPATH:+:${PYTHONPATH}}" \
     "${NCU}" --target-processes all -f \
     --export "${OUT}/ncu_${ARM}" \
