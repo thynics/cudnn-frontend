@@ -86,6 +86,15 @@ _RUBIN1_SLIM51 = (
 assert not (_RUBIN1_SLIM51 and not _RUBIN1_MIX51), (
     "DSA_RUBIN1_SLIM51 requires DSA_RUBIN1_MIX51=1"
 )
+# KV2: double-buffer the score_kv K tile (kscore pipeline depth 1 -> 2).
+# K(t+1)'s gather-side cp_async can land while dP(t) still reads K(t),
+# removing the K-load latency from the inter-tile critical path.
+_RUBIN1_KV2 = (
+    os.environ.get("DSA_RUBIN1_KV2", "0") == "1"
+)
+assert not (_RUBIN1_KV2 and not _RUBIN1_SLIM51), (
+    "DSA_RUBIN1_KV2 requires DSA_RUBIN1_SLIM51=1 (and MIX51)"
+)
 # Structure selector: E3PAD runs the COMPAT (ring-2 / single-face)
 # machine in full; only the storage size and the SMEM cap differ.
 _RUBIN1_COMPAT_STRUCTURE = _RUBIN1_B200_COMPAT or _RUBIN1_E3PAD
@@ -4064,7 +4073,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # both arms keep the 61,440-register dynamic pool (= 640 x 96).
     REG_K1A = _RUBIN1_REG_K1A
     SLIM51 = _RUBIN1_SLIM51
+    KV2 = _RUBIN1_KV2
+    KSCORE_STAGES = 2 if _RUBIN1_KV2 else 1
     SLIM51 = _RUBIN1_SLIM51
+    KV2 = _RUBIN1_KV2
+    KSCORE_STAGES = 2 if _RUBIN1_KV2 else 1
     SPIN_K2 = _RUBIN1_SPIN_K2
     PRODUCER_REGS = (
         int(_RUBIN1_PRODUCER_REGS) if _RUBIN1_PRODUCER_REGS
@@ -4249,10 +4262,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # SLIM51: single-face MIX51 layout.  Stage-driven mbar
                 # arrays keep ring-5 sizes; face-driven arrays shrink
                 # to one face (mirroring the COMPAT sizes); the four
-                # dead face-1 tensor fields are deleted.
+                # dead face-1 tensor fields are deleted.  score_kv is
+                # sized for two KV2 stages (second half dead when
+                # KV2=0 -- dead fields are free, k14/e3pad receipts);
+                # kscore_mbars covers depth 2.
                 s_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
                 dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
-                kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                kscore_mbars: cute.struct.MemRange[cutlass.Int64, 4]
                 round_mbars: cute.struct.MemRange[cutlass.Int64, 10]
                 pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
                 dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
@@ -4277,7 +4293,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     1024,
                 ]
                 score_kv: cute.struct.Align[
-                    cute.struct.MemRange[element_dtype, 16384],
+                    cute.struct.MemRange[element_dtype, 32768],
                     1024,
                 ]
                 round_buf_0: cute.struct.Align[
@@ -5467,10 +5483,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             stationary_a_layout_staged.outer,
             swizzle=stationary_a_layout_staged.inner,
         )
-        k_n = storage.score_kv.get_tensor(
-            score_b_layout_staged.outer,
-            swizzle=score_b_layout_staged.inner,
-        )
+        if cutlass.const_expr(self.KV2):
+            # KV2: append a 2-deep pipeline-stage mode (stride = one
+            # 16,384-element K tile; the swizzle pattern repeats far
+            # below that stride, so per-stage swizzling is unchanged).
+            k_n = storage.score_kv.get_tensor(
+                cute.append(
+                    score_b_layout_staged.outer,
+                    cute.make_layout(2, stride=16384),
+                ),
+                swizzle=score_b_layout_staged.inner,
+            )
+        else:
+            k_n = storage.score_kv.get_tensor(
+                score_b_layout_staged.outer,
+                swizzle=score_b_layout_staged.inner,
+            )
         s_dq_epi = cute.make_tensor(
             cute.recast_ptr(
                 storage.score_kv.data_ptr(),
@@ -5916,7 +5944,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             defer_sync=True,
         )
         pipe_kscore = pipeline.PipelineAsyncUmma.create(
-            num_stages=1,
+            num_stages=self.KSCORE_STAGES,
             producer_group=gather_group,
             consumer_group=leader_group,
             barrier_storage=storage.kscore_mbars.data_ptr(),
@@ -6100,7 +6128,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         if warp_idx < Int32(self.GATHER_WARPS):
             gather_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
-                1,
+                self.KSCORE_STAGES,
             )
             gather_kd_rows_0 = self._kd_round_rows_v2(round_kd[0])
             gather_kd_rows_1 = self._kd_round_rows_v2(round_kd[1])
@@ -6111,10 +6139,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # source reads truly complete).  The dO_r0 loan and its
                 # tail-tile recommit are retired; dO_r0 rides the ring.
                 self._k2_producer_acquire(pipe_kscore, gather_state)
+                if cutlass.const_expr(self.KV2):
+                    k_dst = k_n[None, None, None, None, gather_state.index]
+                else:
+                    k_dst = k_n
                 self._load_score_kv(
                     mKV,
                     mTopkIdxs,
-                    k_n,
+                    k_dst,
                     token_idx,
                     batch_idx,
                     tile_count - Int32(1),
@@ -6156,10 +6188,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         tile_count,
                     ):
                         self._k2_producer_acquire(pipe_kscore, gather_state)
+                        if cutlass.const_expr(self.KV2):
+                            k_dst = k_n[None, None, None, None, gather_state.index]
+                        else:
+                            k_dst = k_n
                         self._load_score_kv(
                             mKV,
                             mTopkIdxs,
-                            k_n,
+                            k_dst,
                             token_idx,
                             batch_idx,
                             tile_count - Int32(1) - score_iter,
@@ -6702,7 +6738,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
                 kscore_cons = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer,
-                    1,
+                    self.KSCORE_STAGES,
                 )
                 round_cons = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer,
@@ -6731,12 +6767,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     has_prev = loop_iter > Int32(0)
 
                     pipe_kscore.consumer_wait(kscore_cons)
+                    if cutlass.const_expr(self.KV2):
+                        k_frag_s = score_k_fragment[
+                            None, None, None, None, kscore_cons.index
+                        ]
+                        k_frag_dp = dp_k_fragment[
+                            None, None, None, None, kscore_cons.index
+                        ]
+                    else:
+                        k_frag_s = score_k_fragment
+                        k_frag_dp = dp_k_fragment
                     s_prod = self._issue_score_v2(
                         score_tiled_mma,
                         t_score,
                         t_score_pp,
                         score_q_fragment,
-                        score_k_fragment,
+                        k_frag_s,
                         pipe_s_done,
                         s_prod,
                         loop_iter,
@@ -6755,7 +6801,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         t_dp,
                         t_dp_pp,
                         score_do_fragment,
-                        dp_k_fragment,
+                        k_frag_dp,
                         pipe_dp_done,
                         dp_prod,
                         loop_iter,
