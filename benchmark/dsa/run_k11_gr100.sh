@@ -203,7 +203,7 @@ def slope_us_per_tile(table):
     return m * 1000.0 / waves
 
 period = {arm: slope_us_per_tile(t) for arm, t in arms.items()}
-# Pre-registered bands (rubin_2 pantry vs ck anchor):
+# Pre-registered bands (MIX51 ring5/1face vs ck anchor):
 #   <= -0.05  m51_effective     -> stage-depth lever alive at gens=10; extend
 #   <  +0.05  m51_neutral       -> stage gain ~= cliff fee; lever tax-bound
 #   >= +0.05  m51_regression    -> ring5 needs 2 faces or spill-amp is ring5-borne
