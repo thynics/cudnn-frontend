@@ -8,8 +8,10 @@
 # +1.28 us/tile (E3-240); K1a removed ~46% of the local traffic the
 # cliff punishes, so the fee must be repriced before any capacity
 # design is funded.  Two arms of the same candidate, one job:
-#   m51 anchor (MIX51+K1a, 64/120) vs three register re-tune points
-#   along the K1a axis: p72 (72/112), p80 (80/104), p56 (56/128).
+#   m51 anchor (MIX51+K1a fat struct) vs m51s (SLIM51 slim struct,
+#   28,672 B dead face-1 removed).  Expected neutral: same oversized
+#   carveout, behavior-identical layout -> validates the foundation
+#   for +32KB double-buffer knives.
 #
 # Runner contract:
 #   cd <repo> && bash benchmark/dsa/run_k14_gr100.sh
