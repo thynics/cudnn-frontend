@@ -98,6 +98,7 @@ dsa = Path(os.environ["DSA_DIR"])
 out = Path(os.environ["OUT_DIR"])
 ARM_TO_IMPL = {
     "ck":   ("rubin_1", "DSA_RUBIN1_B200_COMPAT=1 DSA_RUBIN1_REG_K1A=1"),
+    "m51":  ("rubin_1", "DSA_RUBIN1_MIX51=1 DSA_RUBIN1_REG_K1A=1"),
     "r2":   ("rubin_2", ""),
     "r2m2": ("rubin_2", "DSA_RUBIN2_M2=1"),
     "r3":   ("rubin_3", ""),
@@ -218,7 +219,7 @@ echo "K9_METRICS ${METRICS}" | tee "${OUT}/ncu_metrics_used.log"
 STAGE=ncu_profile
 # shellcheck disable=SC2086  # EXTRA holds space-separated KEY=VAL pairs
 env -u DSA_RUBIN1_B200_COMPAT -u DSA_RUBIN1_E3PAD \
-    -u DSA_RUBIN1_REG_K1A -u DSA_RUBIN1_SPIN_K2 -u DSA_RUBIN2_M2 \
+    -u DSA_RUBIN1_REG_K1A -u DSA_RUBIN1_SPIN_K2 -u DSA_RUBIN1_MIX51 -u DSA_RUBIN2_M2 \
     ${EXTRA:-} \
     PYTHONPATH="${REPO}/python${PYTHONPATH:+:${PYTHONPATH}}" \
     "${NCU}" --target-processes all -f \
