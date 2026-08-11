@@ -1,4 +1,5 @@
 import cuda.bindings.driver as cuda
+import os
 import math
 from typing import Tuple, Type, Optional
 
@@ -133,8 +134,17 @@ class FlashAttentionDSABackwardSm100:
         self.non_tma_align_bytes = 128
 
     def _setup_attributes(self):
-        self.load_mma_QdO_stage = 1
-        self.load_mma_K_stage = 1
+        # k19 (GR100): the pipeline is fully stage-parameterized but ships
+        # with depth 1 everywhere while using only ~215 KB of the 335 KB
+        # SMEM.  Env knobs deepen the two gather-load pipelines (the
+        # long_scoreboard wall in the k18 profile); defaults preserve the
+        # shipped configuration bit-for-bit.
+        self.load_mma_QdO_stage = int(
+            os.environ.get("DSA_BL_QDO_STAGE", "1")
+        )
+        self.load_mma_K_stage = int(
+            os.environ.get("DSA_BL_K_STAGE", "1")
+        )
         # self.load_mma_dO_stage = 1
         self.load_compute_LSE_stage = 1
         self.load_compute_sum_OdO_stage = 1
