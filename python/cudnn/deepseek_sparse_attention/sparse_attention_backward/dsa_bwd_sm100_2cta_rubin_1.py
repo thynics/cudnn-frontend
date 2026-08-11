@@ -76,6 +76,16 @@ _RUBIN1_MIX51 = (
 assert not (_RUBIN1_MIX51 and (_RUBIN1_B200_COMPAT or _RUBIN1_E3PAD)), (
     "DSA_RUBIN1_MIX51 is mutually exclusive with COMPAT/E3PAD"
 )
+# SLIM51: drop the dead face-1 PDS buffers (28,672 B) from the MIX51
+# struct.  Face-1 fields are only ever touched under PDS_FACES == 2
+# (const_expr-gated), so the slim struct is behavior-identical; its
+# value is the freed SMEM headroom for follow-up double-buffer knives.
+_RUBIN1_SLIM51 = (
+    os.environ.get("DSA_RUBIN1_SLIM51", "0") == "1"
+)
+assert not (_RUBIN1_SLIM51 and not _RUBIN1_MIX51), (
+    "DSA_RUBIN1_SLIM51 requires DSA_RUBIN1_MIX51=1"
+)
 # Structure selector: E3PAD runs the COMPAT (ring-2 / single-face)
 # machine in full; only the storage size and the SMEM cap differ.
 _RUBIN1_COMPAT_STRUCTURE = _RUBIN1_B200_COMPAT or _RUBIN1_E3PAD
@@ -4053,6 +4063,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # its reduce-side funding.  Base form is the delivered 48/128 split;
     # both arms keep the 61,440-register dynamic pool (= 640 x 96).
     REG_K1A = _RUBIN1_REG_K1A
+    SLIM51 = _RUBIN1_SLIM51
+    SLIM51 = _RUBIN1_SLIM51
     SPIN_K2 = _RUBIN1_SPIN_K2
     PRODUCER_REGS = (
         int(_RUBIN1_PRODUCER_REGS) if _RUBIN1_PRODUCER_REGS
@@ -4230,7 +4242,86 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # the field set itself differs (ring depth, P/dS faces, E3 pad).
         # ds_xchg (dead in the final machine) and khot_seq are retired
         # in all of them.
-        if self.ROUND_STAGES == 5:
+        if self.ROUND_STAGES == 5 and self.SLIM51:
+
+            @cute.struct
+            class SharedStorageV2:
+                # SLIM51: single-face MIX51 layout.  Stage-driven mbar
+                # arrays keep ring-5 sizes; face-driven arrays shrink
+                # to one face (mirroring the COMPAT sizes); the four
+                # dead face-1 tensor fields are deleted.
+                s_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+                dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+                kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                round_mbars: cute.struct.MemRange[cutlass.Int64, 10]
+                pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+                dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                stationary_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                stationary_ready_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+                landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+                round_tma_mbars: cute.struct.MemRange[cutlass.Int64, 5]
+                epi_safe_mbar: cutlass.Int64
+                pds_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
+                kdq_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+                tmem_dealloc_mbar: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+
+                stationary_q: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 32768],
+                    1024,
+                ]
+                stationary_do: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 32768],
+                    1024,
+                ]
+                score_kv: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 16384],
+                    1024,
+                ]
+                round_buf_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 8192],
+                    1024,
+                ]
+                round_buf_1: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 8192],
+                    1024,
+                ]
+                round_buf_2: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 8192],
+                    1024,
+                ]
+                round_buf_3: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 8192],
+                    1024,
+                ]
+                round_buf_4: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 8192],
+                    1024,
+                ]
+                p_blocks_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 4096],
+                    1024,
+                ]
+                p_xchg_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 2048],
+                    1024,
+                ]
+                ds_image_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 4096],
+                    1024,
+                ]
+                ds_blocks_0: cute.struct.Align[
+                    cute.struct.MemRange[element_dtype, 4096],
+                    1024,
+                ]
+                stats: cute.struct.Align[
+                    cute.struct.MemRange[Float32, 128],
+                    1024,
+                ]
+
+        elif self.ROUND_STAGES == 5:
 
             @cute.struct
             class SharedStorageV2:
