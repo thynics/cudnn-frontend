@@ -66,6 +66,16 @@ _RUBIN1_E3PAD = (
 assert not (_RUBIN1_B200_COMPAT and _RUBIN1_E3PAD), (
     "DSA_RUBIN1_B200_COMPAT and DSA_RUBIN1_E3PAD are mutually exclusive"
 )
+# MIX51: ring-5 / single-face oversized arm.  Isolates the round-buffer
+# depth lever (stages 2->5) at constant gens=10/faces=1 against the
+# compat anchor, and splits native's spill amplification between the
+# ring-5 and two-face codegen doses.
+_RUBIN1_MIX51 = (
+    os.environ.get("DSA_RUBIN1_MIX51", "0") == "1"
+)
+assert not (_RUBIN1_MIX51 and (_RUBIN1_B200_COMPAT or _RUBIN1_E3PAD)), (
+    "DSA_RUBIN1_MIX51 is mutually exclusive with COMPAT/E3PAD"
+)
 # Structure selector: E3PAD runs the COMPAT (ring-2 / single-face)
 # machine in full; only the storage size and the SMEM cap differ.
 _RUBIN1_COMPAT_STRUCTURE = _RUBIN1_B200_COMPAT or _RUBIN1_E3PAD
@@ -4109,10 +4119,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # P/dS publication faces (tile parity).  Face f serves tiles with
     # t % PDS_FACES == f; every per-face raw mbarrier therefore flips
     # once per PDS_FACES tiles: phase(t) = (t // PDS_FACES) % 2.
-    PDS_FACES = 1 if _RUBIN1_COMPAT_STRUCTURE else 2
+    PDS_FACES = (
+        1 if (_RUBIN1_COMPAT_STRUCTURE or _RUBIN1_MIX51) else 2
+    )
     # The storage struct variants and per-slot/per-face machinery are
     # built for exactly these two coupled profiles.
-    assert (ROUND_STAGES, PDS_FACES) in ((5, 2), (2, 1))
+    assert (ROUND_STAGES, PDS_FACES) in ((5, 2), (2, 1), (5, 1))
 
     # E3PAD keeps the COMPAT protocol but must clear the storage assert
     # at its padded size, and its launch must request > 232,448 B.
