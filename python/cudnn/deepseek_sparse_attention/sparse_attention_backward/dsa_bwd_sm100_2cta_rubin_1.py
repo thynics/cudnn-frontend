@@ -95,6 +95,10 @@ _RUBIN1_COMPAT_STRUCTURE = _RUBIN1_B200_COMPAT or _RUBIN1_E3PAD
 _RUBIN1_REG_K1A = (
     os.environ.get("DSA_RUBIN1_REG_K1A", "0") == "1"
 )
+# Fine-grained overrides for the K1a register split (k13 re-tune on the
+# MIX51 codegen).  Empty -> K1a/default table below stays authoritative.
+_RUBIN1_PRODUCER_REGS = os.environ.get("DSA_RUBIN1_PRODUCER_REGS", "")
+_RUBIN1_REDUCE_REGS = os.environ.get("DSA_RUBIN1_REDUCE_REGS", "")
 
 # K2 despill probe (e3sassk1 r1 verdict): every mbarrier wait loop
 # reloads its spilled mbar-base slot ([R1+0x108]-class) once per poll
@@ -4050,8 +4054,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # both arms keep the 61,440-register dynamic pool (= 640 x 96).
     REG_K1A = _RUBIN1_REG_K1A
     SPIN_K2 = _RUBIN1_SPIN_K2
-    PRODUCER_REGS = 64 if _RUBIN1_REG_K1A else 48
-    REDUCE_REGS = 120 if _RUBIN1_REG_K1A else 128
+    PRODUCER_REGS = (
+        int(_RUBIN1_PRODUCER_REGS) if _RUBIN1_PRODUCER_REGS
+        else (64 if _RUBIN1_REG_K1A else 48)
+    )
+    REDUCE_REGS = (
+        int(_RUBIN1_REDUCE_REGS) if _RUBIN1_REDUCE_REGS
+        else (120 if _RUBIN1_REG_K1A else 128)
+    )
+    # setmaxregister ISA constraint: multiples of 8 in [24, 256]
+    assert PRODUCER_REGS % 8 == 0 and 24 <= PRODUCER_REGS <= 256
+    assert REDUCE_REGS % 8 == 0 and 24 <= REDUCE_REGS <= 256
 
     # Warp roles (5 warps per named group where applicable).
     GATHER_WARPS = 4
