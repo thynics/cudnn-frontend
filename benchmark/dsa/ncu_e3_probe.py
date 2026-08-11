@@ -118,15 +118,39 @@ def main() -> int:
     p.add_argument("--repeat", type=int, default=8)
     p.add_argument("--impl", default="rubin_1",
                    help="dsa_bwd_sm100_2cta_<impl> module suffix")
+    p.add_argument("--leg", default="candidate",
+                   choices=("candidate", "baseline"),
+                   help="baseline profiles the reference throughput "
+                        "kernel inside the same dsa_bwd NVTX gate")
     args = p.parse_args()
 
     case = sweep.build_case(4096, args.topk, 128, 512)
-    ms, dq, dkv = candidate_leg_nvtx(
-        case, args.topk, args.warmup, args.repeat, impl=args.impl
-    )
+    if args.leg == "baseline":
+        from cudnn import DSA
+        q = case["q"]
+        dq = torch.empty_like(q)
+        dkv = torch.zeros_like(case["kv"])
+
+        def run():
+            dkv.fill_(0)
+            torch.cuda.nvtx.range_push("dsa_bwd")
+            DSA.sparse_attention_backward_wrapper(
+                q, case["kv"], case["out"], case["dout"], case["lse"],
+                case["attn_sink"], case["topk_idxs"],
+                softmax_scale=case["softmax_scale"],
+                topk_length=case["topk_length"], dq=dq, dkv=dkv)
+            torch.cuda.nvtx.range_pop()
+
+        ms = sweep.time_run(run, args.warmup, args.repeat)
+        run()
+        torch.cuda.synchronize()
+    else:
+        ms, dq, dkv = candidate_leg_nvtx(
+            case, args.topk, args.warmup, args.repeat, impl=args.impl
+        )
     assert torch.isfinite(dq).all(), "non-finite dq"
     assert torch.isfinite(dkv).all(), "non-finite dkv"
-    print(f"E3NCU_PROBE impl={args.impl} topk={args.topk} candidate_ms={ms:.4f}")
+    print(f"E3NCU_PROBE impl={args.impl} leg={args.leg} topk={args.topk} candidate_ms={ms:.4f}")
     print("E3NCU_PROBE_OK")
     return 0
 
