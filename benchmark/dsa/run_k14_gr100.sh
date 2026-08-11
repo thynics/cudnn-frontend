@@ -110,9 +110,9 @@ assert K.SLIM51 == (arm == "m51s")
 PY
 }
 STAGE=profile_m51
-profile_check m51 64 120 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_REG_K1A=1 | tee "/profiles.log"
+profile_check m51 64 120 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_REG_K1A=1 | tee "${OUT}/profiles.log"
 STAGE=profile_m51s
-profile_check m51s 64 120 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_SLIM51=1 DSA_RUBIN1_REG_K1A=1 | tee -a "/profiles.log"
+profile_check m51s 64 120 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_SLIM51=1 DSA_RUBIN1_REG_K1A=1 | tee -a "${OUT}/profiles.log"
 
 # ------------------------------------------------------------------ sweeps
 run_arm() {
