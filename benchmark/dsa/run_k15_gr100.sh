@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# K14: post-K1a cliff-tax repricing (one-click, GR100).
+# K15: post-K1a cliff-tax repricing (one-click, GR100).
 #
 # Goal context (超越 baseline campaign): the Rubin-affinity capacity
 # plays (dO full-panel replication + zero-copy dV-A views, deeper
@@ -14,21 +14,21 @@
 #   for +32KB double-buffer knives.
 #
 # Runner contract:
-#   cd <repo> && bash benchmark/dsa/run_k14_gr100.sh
-#   -> success prints  K14_OK / K14_ARTIFACTS <dir>
-#   -> failure prints  K14_FAILED stage=<name> exit=<rc>
-#   Artifacts dir: benchmark/dsa/k14_out (override K14_OUT).
+#   cd <repo> && bash benchmark/dsa/run_k15_gr100.sh
+#   -> success prints  K15_OK / K15_ARTIFACTS <dir>
+#   -> failure prints  K15_FAILED stage=<name> exit=<rc>
+#   Artifacts dir: benchmark/dsa/k15_out (override K15_OUT).
 #
-# Knobs: K14_TOPKS (128,512,2048), K14_WARMUP (20), K14_REPEAT (300),
-# K14_ALLOW_ANY_CC=1.
+# Knobs: K15_TOPKS (128,512,2048), K15_WARMUP (20), K15_REPEAT (300),
+# K15_ALLOW_ANY_CC=1.
 
 set -Eeuo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-OUT="${K14_OUT:-${REPO}/benchmark/dsa/k14_out}"
-WARMUP="${K14_WARMUP:-20}"
-REPEAT="${K14_REPEAT:-300}"
-TOPKS="${K14_TOPKS:-128,512,2048}"
+OUT="${K15_OUT:-${REPO}/benchmark/dsa/k15_out}"
+WARMUP="${K15_WARMUP:-20}"
+REPEAT="${K15_REPEAT:-300}"
+TOPKS="${K15_TOPKS:-128,512,2048}"
 SWEEP="${REPO}/benchmark/dsa/sweep_topk_2cta.py"
 
 mkdir -p -- "${OUT}"
@@ -37,11 +37,11 @@ TEE_PID=$!
 export PYTHONUNBUFFERED=1
 
 STAGE=init
-trap 'rc=$?; echo "K14_FAILED stage=${STAGE} exit=${rc} (artifacts: ${OUT})"' ERR
+trap 'rc=$?; echo "K15_FAILED stage=${STAGE} exit=${rc} (artifacts: ${OUT})"' ERR
 trap 'exec 1>&- 2>&-; wait "${TEE_PID}" 2>/dev/null || true' EXIT
 
-echo "K14_START utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname) out=${OUT}"
-echo "K14_CONFIG warmup=${WARMUP} repeat=${REPEAT} topks=${TOPKS}"
+echo "K15_START utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname) out=${OUT}"
+echo "K15_CONFIG warmup=${WARMUP} repeat=${REPEAT} topks=${TOPKS}"
 
 # ---------------------------------------------------------------- preflight
 STAGE=preflight
@@ -53,7 +53,7 @@ STAGE=preflight
 cat "${OUT}/environment.log"
 
 PYTHONPATH="${REPO}/python${PYTHONPATH:+:${PYTHONPATH}}" \
-K14_ALLOW_ANY_CC="${K14_ALLOW_ANY_CC:-0}" \
+K15_ALLOW_ANY_CC="${K15_ALLOW_ANY_CC:-0}" \
 python3 - <<'PY' | tee "${OUT}/preflight.log"
 import json
 import os
@@ -62,43 +62,43 @@ import torch
 
 cc = torch.cuda.get_device_capability(0)
 props = torch.cuda.get_device_properties(0)
-print("K14_DEVICE " + json.dumps({
+print("K15_DEVICE " + json.dumps({
     "name": torch.cuda.get_device_name(0),
     "compute_capability": list(cc),
     "sm_count": props.multi_processor_count,
     "torch": torch.__version__,
 }, sort_keys=True))
-if os.environ.get("K14_ALLOW_ANY_CC") != "1":
+if os.environ.get("K15_ALLOW_ANY_CC") != "1":
     assert list(cc) == [10, 7], (
         f"expected GR100 (CC 10.7), got {cc}; "
-        "set K14_ALLOW_ANY_CC=1 to override"
+        "set K15_ALLOW_ANY_CC=1 to override"
     )
 
 from cudnn import DSA  # noqa: F401
 from cudnn.deepseek_sparse_attention.utils.compiler import gpu_arch_flag
 flag = gpu_arch_flag()
-print(f"K14_GPU_ARCH_FLAG {flag}")
-if os.environ.get("K14_ALLOW_ANY_CC") != "1":
+print(f"K15_GPU_ARCH_FLAG {flag}")
+if os.environ.get("K15_ALLOW_ANY_CC") != "1":
     assert flag == "sm_107a", f"gpu_arch_flag()={flag}, expected sm_107a"
 PY
 
 # Per-arm profile asserts (env read once at import).
 profile_check() {
     local arm="$1"; local exp_p="$2"; local exp_r="$3"; shift 3
-    env -u DSA_RUBIN1_B200_COMPAT -u DSA_RUBIN1_E3PAD -u DSA_RUBIN1_REG_K1A -u DSA_RUBIN1_SPIN_K2 -u DSA_RUBIN1_MIX51 -u DSA_RUBIN1_PRODUCER_REGS -u DSA_RUBIN1_REDUCE_REGS -u DSA_RUBIN1_SLIM51 "$@" \
+    env -u DSA_RUBIN1_B200_COMPAT -u DSA_RUBIN1_E3PAD -u DSA_RUBIN1_REG_K1A -u DSA_RUBIN1_SPIN_K2 -u DSA_RUBIN1_MIX51 -u DSA_RUBIN1_PRODUCER_REGS -u DSA_RUBIN1_REDUCE_REGS -u DSA_RUBIN1_SLIM51 -u DSA_RUBIN1_KV2 "$@" \
         PYTHONPATH="${REPO}/python${PYTHONPATH:+:${PYTHONPATH}}" \
-        K14_ARM="${arm}" K14_EXP_P="${exp_p}" K14_EXP_R="${exp_r}" \
+        K15_ARM="${arm}" K15_EXP_P="${exp_p}" K15_EXP_R="${exp_r}" \
         python3 - <<'PY'
 import json
 import os
 
-arm = os.environ["K14_ARM"]
-exp_p = int(os.environ["K14_EXP_P"])
-exp_r = int(os.environ["K14_EXP_R"])
+arm = os.environ["K15_ARM"]
+exp_p = int(os.environ["K15_EXP_P"])
+exp_r = int(os.environ["K15_EXP_R"])
 from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2cta_rubin_1 import (
     FlashAttentionDSABackwardSm100TwoCTAV2 as K,
 )
-print("K14_PROFILE " + json.dumps({
+print("K15_PROFILE " + json.dumps({
     "arm": arm, "round_stages": K.ROUND_STAGES, "pds_faces": K.PDS_FACES,
     "max_smem_bytes": K.MAX_SMEM_BYTES,
     "producer_regs": K.PRODUCER_REGS, "reduce_regs": K.REDUCE_REGS,
@@ -106,13 +106,15 @@ print("K14_PROFILE " + json.dumps({
 assert (K.ROUND_STAGES, K.PDS_FACES) == (5, 1) and not K.E3PAD
 assert K.MAX_SMEM_BYTES == 334_848
 assert (K.PRODUCER_REGS, K.REDUCE_REGS) == (exp_p, exp_r)
-assert K.SLIM51 == (arm == "m51s")
+assert K.SLIM51
+assert K.KV2 == (arm == "m51skv2")
+assert K.KSCORE_STAGES == (2 if arm == "m51skv2" else 1)
 PY
 }
-STAGE=profile_m51
-profile_check m51 64 120 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_REG_K1A=1 | tee "${OUT}/profiles.log"
 STAGE=profile_m51s
-profile_check m51s 64 120 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_SLIM51=1 DSA_RUBIN1_REG_K1A=1 | tee -a "${OUT}/profiles.log"
+profile_check m51s 64 120 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_SLIM51=1 DSA_RUBIN1_REG_K1A=1 | tee "${OUT}/profiles.log"
+STAGE=profile_m51skv2
+profile_check m51skv2 64 120 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_SLIM51=1 DSA_RUBIN1_KV2=1 DSA_RUBIN1_REG_K1A=1 | tee -a "${OUT}/profiles.log"
 
 # ------------------------------------------------------------------ sweeps
 run_arm() {
@@ -120,7 +122,7 @@ run_arm() {
     STAGE="sweep_${arm}"
     nvidia-smi --query-gpu=pstate,clocks.current.sm,power.draw --format=csv,noheader,nounits \
         > "${OUT}/clocks_${arm}_before.log" 2>&1 || true
-    env -u DSA_RUBIN1_B200_COMPAT -u DSA_RUBIN1_E3PAD -u DSA_RUBIN1_REG_K1A -u DSA_RUBIN1_SPIN_K2 -u DSA_RUBIN1_MIX51 -u DSA_RUBIN1_PRODUCER_REGS -u DSA_RUBIN1_REDUCE_REGS -u DSA_RUBIN1_SLIM51 "$@" \
+    env -u DSA_RUBIN1_B200_COMPAT -u DSA_RUBIN1_E3PAD -u DSA_RUBIN1_REG_K1A -u DSA_RUBIN1_SPIN_K2 -u DSA_RUBIN1_MIX51 -u DSA_RUBIN1_PRODUCER_REGS -u DSA_RUBIN1_REDUCE_REGS -u DSA_RUBIN1_SLIM51 -u DSA_RUBIN1_KV2 "$@" \
         PYTHONPATH="${REPO}/python${PYTHONPATH:+:${PYTHONPATH}}" \
         python3 "${SWEEP}" \
         --impl "${impl}" \
@@ -131,8 +133,8 @@ run_arm() {
         --json "${OUT}/${arm}_sweep.json" \
         2>&1 | tee "${OUT}/sweep_${arm}.log"
 }
-run_arm m51 rubin_1 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_REG_K1A=1
 run_arm m51s rubin_1 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_SLIM51=1 DSA_RUBIN1_REG_K1A=1
+run_arm m51skv2 rubin_1 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_SLIM51=1 DSA_RUBIN1_KV2=1 DSA_RUBIN1_REG_K1A=1
 
 # ----------------------------------------------------------------- summary
 STAGE=summary
@@ -162,7 +164,7 @@ def load(path):
     return table, errors
 
 arms, errors = {}, {}
-for arm in ("m51", "m51s"):
+for arm in ("m51s", "m51skv2"):
     arms[arm], errors[arm] = load(out / f"{arm}_sweep.json")
 row_errors = [dict(arm=a, **e) for a in errors for e in errors[a]]
 topks = sorted(set.intersection(*[set(arms[a]) for a in arms]))
@@ -176,11 +178,11 @@ try:
 except Exception:
     sm_count = None
     for line in (out / "preflight.log").read_text().splitlines():
-        if line.startswith("K14_DEVICE "):
+        if line.startswith("K15_DEVICE "):
             sm_count = json.loads(line.split(" ", 1)[1])["sm_count"]
             break
     assert sm_count, "sm_count unavailable"
-tokens = arms["m51"][topks[0]]["seqlen"]
+tokens = arms["m51s"][topks[0]]["seqlen"]
 waves = float(tokens) / (sm_count / 2.0)
 
 def slope_us_per_tile(table):
@@ -196,14 +198,14 @@ def slope_us_per_tile(table):
 period = {arm: slope_us_per_tile(t) for arm, t in arms.items()}
 # Pre-registered bands (register re-tune arms vs m51 anchor):
 # Pre-registered: best re-tune arm vs m51 anchor, band +/-0.03
-deltas = {"m51s": period["m51s"] - period["m51"]}
-d = deltas["m51s"]
+deltas = {"m51skv2": period["m51skv2"] - period["m51s"]}
+d = deltas["m51skv2"]
 if d <= -0.05:
-    verdict = "slim_effective"
+    verdict = "kv2_effective"
 elif d < 0.05:
-    verdict = "slim_neutral_foundation_ok"
+    verdict = "kv2_neutral"
 else:
-    verdict = "slim_regression"
+    verdict = "kv2_regression"
 
 summary = {
     "sm_count": sm_count,
@@ -214,7 +216,7 @@ summary = {
         str(t): {
             arm: arms[arm][t]["candidate_ms"] for arm in arms
         } | {
-            "baseline_ck": arms["m51"][t]["baseline_ms"],
+            "baseline_ck": arms["m51s"][t]["baseline_ms"],
             "baseline_drift_max_pct": round(100 * (
                 max(arms[a][t]["baseline_ms"] for a in arms)
                 / min(arms[a][t]["baseline_ms"] for a in arms) - 1
@@ -223,19 +225,19 @@ summary = {
         for t in topks
     },
     "steady_period_us_per_tile": {a: round(p, 4) for a, p in period.items()},
-    "deltas_vs_m51": {a: round(d, 4) for a, d in deltas.items()},
+    "deltas_vs_m51s": {a: round(d, 4) for a, d in deltas.items()},
     "nk_anchor_us_per_tile": 4.4679,
     "verdict": verdict,
 }
 (out / "summary_k4.json").write_text(
     json.dumps(summary, indent=2, sort_keys=True) + "\n"
 )
-print("K14_SUMMARY " + json.dumps({
+print("K15_SUMMARY " + json.dumps({
     "periods": summary["steady_period_us_per_tile"],
-    "deltas_vs_m51": summary["deltas_vs_m51"],
+    "deltas_vs_m51s": summary["deltas_vs_m51s"],
 }, sort_keys=True))
-print("K14_VERDICT " + verdict)
+print("K15_VERDICT " + verdict)
 PY
 
-echo "K14_OK"
-echo "K14_ARTIFACTS ${OUT}"
+echo "K15_OK"
+echo "K15_ARTIFACTS ${OUT}"
