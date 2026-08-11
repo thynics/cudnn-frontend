@@ -117,6 +117,11 @@ STAGE=profile_m51skv2
 profile_check m51skv2 64 120 DSA_RUBIN1_MIX51=1 DSA_RUBIN1_SLIM51=1 DSA_RUBIN1_KV2=1 DSA_RUBIN1_REG_K1A=1 | tee -a "${OUT}/profiles.log"
 
 # ------------------------------------------------------------------ sweeps
+# Per-arm timeout guard (k13 lesson: the p56 register config deadlocked
+# at runtime and burned the full 1:30 job limit; a healthy arm finishes
+# in well under 2 minutes).  timeout kills only the offending arm's
+# sweep; the ERR trap then names the stage.
+ARM_TIMEOUT="${K15_ARM_TIMEOUT:-600}"
 run_arm() {
     local arm="$1"; local impl="$2"; shift 2
     STAGE="sweep_${arm}"
@@ -124,6 +129,7 @@ run_arm() {
         > "${OUT}/clocks_${arm}_before.log" 2>&1 || true
     env -u DSA_RUBIN1_B200_COMPAT -u DSA_RUBIN1_E3PAD -u DSA_RUBIN1_REG_K1A -u DSA_RUBIN1_SPIN_K2 -u DSA_RUBIN1_MIX51 -u DSA_RUBIN1_PRODUCER_REGS -u DSA_RUBIN1_REDUCE_REGS -u DSA_RUBIN1_SLIM51 -u DSA_RUBIN1_KV2 "$@" \
         PYTHONPATH="${REPO}/python${PYTHONPATH:+:${PYTHONPATH}}" \
+        timeout --signal=KILL "${ARM_TIMEOUT}" \
         python3 "${SWEEP}" \
         --impl "${impl}" \
         --class-name FlashAttentionDSABackwardSm100TwoCTAV2 \
