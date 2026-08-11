@@ -47,6 +47,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--repeat", type=int, default=50)
     p.add_argument("--json", type=Path, default=None)
+    p.add_argument("--trace-out", type=Path, default=None,
+                   help="dump per-warp start/finish timeline (k16) to JSON")
+    p.add_argument("--trace-token", type=int, default=8)
+    p.add_argument("--trace-batch", type=int, default=0)
     return p.parse_args()
 
 
@@ -116,6 +120,9 @@ def candidate_leg(case, topk: int, args):
 
     dq = torch.empty_like(q)
     dkv = torch.zeros_like(kv)
+    trace_t = None
+    if args.trace_out is not None:
+        trace_t = torch.zeros(4096, dtype=torch.int64, device=q.device)
     d_sink = torch.zeros_like(case["attn_sink"])
     acc = cutlass.Float32
     ws_lse = torch.zeros(
@@ -146,7 +153,8 @@ def candidate_leg(case, topk: int, args):
         to_cute_tensor(d_sink),
         to_cute_tensor(ws_lse),
         to_cute_tensor(ws_dkv),
-        None, 0, 0,  # trace_buffer / trace_token_idx / trace_batch_idx
+        (to_cute_tensor(trace_t) if trace_t is not None else None),
+        args.trace_token, args.trace_batch,
         case["softmax_scale"],
         stream,
         options=compile_options(),
@@ -159,11 +167,25 @@ def candidate_leg(case, topk: int, args):
         compiled(problem_shape, q, kv, case["out"], case["dout"],
                  case["lse"], case["attn_sink"], case["topk_idxs"],
                  case["topk_length"], dq, dkv, d_sink, ws_lse, ws_dkv,
-                 None, 0, 0, case["softmax_scale"], stream)
+                 trace_t, args.trace_token, args.trace_batch,
+                 case["softmax_scale"], stream)
 
     ms = time_run(run, args.warmup, args.repeat)
     run()
     torch.cuda.synchronize()
+    if trace_t is not None:
+        words = trace_t.cpu().tolist()
+        import json as _json
+        args.trace_out.write_text(_json.dumps({
+            "version": words[0],
+            "start_ns": {f"r{r}w{w}": words[16 + r * 32 + w]
+                         for r in (0, 1) for w in range(20)},
+            "finish_ns": {f"r{r}w{w}": words[80 + r * 32 + w]
+                          for r in (0, 1) for w in range(20)},
+            "trace_token": args.trace_token,
+            "trace_batch": args.trace_batch,
+        }, indent=2))
+        print(f"TRACE_OUT {args.trace_out}")
     return ms, dq, dkv
 
 

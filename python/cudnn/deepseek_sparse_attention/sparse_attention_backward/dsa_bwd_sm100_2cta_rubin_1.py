@@ -1882,10 +1882,10 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     ):
         """Run one complete Top-K traversal in a two-CTA cluster."""
 
-        _ = trace_buffer
-        _ = trace_token_idx
-        _ = trace_batch_idx
-
+        # V2 role-timeline trace (k16): per-warp start/finish stamps on
+        # the vre_1 globaltimer.  Layout: [0]=version 2; words
+        # [16 + rank*32 + warp] = start ns; [80 + rank*32 + warp] =
+        # finish ns (stamped just before the common-tail rendezvous).
         physical_x, _, batch_idx = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -5401,10 +5401,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         _ = problem_shape
         _ = mQ
         _ = mdO
-        _ = trace_buffer
-        _ = trace_token_idx
-        _ = trace_batch_idx
-
+        # V2 role-timeline trace (k16): per-warp start/finish stamps on
+        # the vre_1 globaltimer.  Layout: [0]=version 2; words
+        # [16 + rank*32 + warp] = start ns; [80 + rank*32 + warp] =
+        # finish ns (stamped just before the common-tail rendezvous).
         physical_x, _, batch_idx = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(
@@ -6027,6 +6027,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(epi_safe_mbar, 1)
         cute.arch.fence_view_async_shared()
         self.cta_barrier.arrive_and_wait()
+
+        if cutlass.const_expr(trace_buffer is not None):
+            if token_idx == trace_token_idx:
+                if batch_idx == trace_batch_idx:
+                    if tidx % Int32(32) == Int32(0):
+                        if warp_idx == Int32(0):
+                            trace_buffer[0] = cutlass.Int64(2)
+                        trace_buffer[
+                            Int32(16) + rank * Int32(32) + warp_idx
+                        ] = _read_global_timer()
 
         pipeline.pipeline_init_arrive(
             cluster_shape_mn=cluster_layout_vmnk,
@@ -7442,6 +7452,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # ==================================================================
         # Common tail: full-cluster rendezvous, then TMEM release.
         # ==================================================================
+        if cutlass.const_expr(trace_buffer is not None):
+            if token_idx == trace_token_idx:
+                if batch_idx == trace_batch_idx:
+                    if tidx % Int32(32) == Int32(0):
+                        trace_buffer[
+                            Int32(80) + rank * Int32(32) + warp_idx
+                        ] = _read_global_timer()
         tmem.relinquish_alloc_permit()
         self.cta_barrier.arrive_and_wait()
         cute.arch.cluster_arrive()
