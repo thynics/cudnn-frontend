@@ -5041,22 +5041,26 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         t_dkv: cute.Tensor,
         a_fragment: cute.Tensor,
         b_fragment: cute.Tensor,
-        k_block: cutlass.Constexpr[int],
+        k_half: cutlass.Constexpr[int],
         accumulate: cutlass.Constexpr[bool],
     ) -> None:
-        """Issue one H32 k_block from a complete H64 fragment view."""
+        """Issue one H32 half (a k_block range) of a full H64 fragment."""
 
-        assert cute.size(a_fragment, mode=[2]) == 2
-        assert cute.size(b_fragment, mode=[2]) == 2
+        k_blocks = cute.size(a_fragment, mode=[2])
+        assert k_blocks == cute.size(b_fragment, mode=[2])
+        assert k_blocks % 2 == 0
+        half = k_blocks // 2
         mma = dkv_tiled_mma.with_()
         mma.set(tcgen05.Field.ACCUMULATE, accumulate)
-        cute.gemm(
-            mma,
-            t_dkv,
-            a_fragment[None, None, k_block, 0],
-            b_fragment[None, None, k_block, 0],
-            t_dkv,
-        )
+        for k in cutlass.range_constexpr(half):
+            cute.gemm(
+                mma,
+                t_dkv,
+                a_fragment[None, None, k_half * half + k, 0],
+                b_fragment[None, None, k_half * half + k, 0],
+                t_dkv,
+            )
+            mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
     def _issue_dq_rounds_v2(
