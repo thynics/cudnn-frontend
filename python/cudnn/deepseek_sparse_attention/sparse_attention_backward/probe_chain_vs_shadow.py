@@ -298,14 +298,19 @@ class ChainShadowProbe:
         s_a = storage.score_a.get_tensor(a_layout_staged)
         s_b = storage.score_b.get_tensor(b_layout_staged)
 
+        # Extract every storage-derived value BEFORE any dynamic control
+        # flow: the DSL tree-flattens dynamic-if scopes and cannot
+        # flatten the raw @cute.struct instance (first-run lesson).
+        p_ready_bar = p_ready_bar
+        landing_bar = landing_bar
+        p_block_int = p_block_int
+        p_xchg_int = p_xchg_int
+        inbox_int = inbox_int
+
         # mbar init
         if tidx == Int32(0):
-            cute.arch.mbarrier_init(
-                storage.p_ready_mbar.data_ptr(), MATH_WARPS
-            )
-            cute.arch.mbarrier_init(
-                storage.landing_mbar.data_ptr(), 1
-            )
+            cute.arch.mbarrier_init(p_ready_bar, MATH_WARPS)
+            cute.arch.mbarrier_init(landing_bar, 1)
 
         # pipelines (umma-done, consumer = the leader warp itself)
         leader_group = pipeline.CooperativeGroup(
@@ -459,7 +464,7 @@ class ChainShadowProbe:
                 cute.recast_ptr(
                     cute.make_ptr(
                         ELEM,
-                        storage.p_block.data_ptr().toint(),
+                        p_block_int,
                         cute.AddressSpace.smem,
                         assumed_align=1024,
                     ),
@@ -472,7 +477,7 @@ class ChainShadowProbe:
                 cute.recast_ptr(
                     cute.make_ptr(
                         ELEM,
-                        storage.p_xchg.data_ptr().toint()
+                        p_xchg_int
                         - n_owner * Int32(PDS_BLOCK_BYTES),
                         cute.AddressSpace.smem,
                         assumed_align=16,
@@ -516,7 +521,7 @@ class ChainShadowProbe:
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
-                        storage.p_ready_mbar.data_ptr()
+                        p_ready_bar
                     )
                 t6 = _read_global_timer()
                 if warp_idx == Int32(0):
@@ -545,7 +550,7 @@ class ChainShadowProbe:
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
-                        storage.p_ready_mbar.data_ptr()
+                        p_ready_bar
                     )
                 t13 = _read_global_timer()
                 if warp_idx == Int32(0):
@@ -565,13 +570,13 @@ class ChainShadowProbe:
                 # ARM B ----------------------------------------------
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
-                        storage.landing_mbar.data_ptr(),
+                        landing_bar,
                         PDS_BLOCK_BYTES,
                     )
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
                 cute.arch.mbarrier_wait(
-                    storage.p_ready_mbar.data_ptr(), p_phase
+                    p_ready_bar, p_phase
                 )
                 p_phase = p_phase ^ Int32(1)
                 t7 = _read_global_timer()
@@ -579,22 +584,22 @@ class ChainShadowProbe:
                     _cpasync_bulk_s2cluster(
                         cute.make_ptr(
                             ELEM,
-                            storage.p_xchg.data_ptr().toint(),
+                            p_xchg_int,
                             cute.AddressSpace.smem,
                             assumed_align=16,
                         ),
                         cute.make_ptr(
                             ELEM,
-                            storage.inbox.data_ptr().toint(),
+                            inbox_int,
                             cute.AddressSpace.smem,
                             assumed_align=16,
                         ),
-                        storage.landing_mbar.data_ptr(),
+                        landing_bar,
                         PDS_BLOCK_BYTES,
                         peer_rank,
                     )
                 cute.arch.mbarrier_wait(
-                    storage.landing_mbar.data_ptr(), l_phase
+                    landing_bar, l_phase
                 )
                 l_phase = l_phase ^ Int32(1)
                 t8 = _read_global_timer()
@@ -604,35 +609,35 @@ class ChainShadowProbe:
                 # ARM C ----------------------------------------------
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
-                        storage.landing_mbar.data_ptr(),
+                        landing_bar,
                         PDS_BLOCK_BYTES,
                     )
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
                 cute.arch.mbarrier_wait(
-                    storage.p_ready_mbar.data_ptr(), p_phase
+                    p_ready_bar, p_phase
                 )
                 p_phase = p_phase ^ Int32(1)
                 with cute.arch.elect_one():
                     _cpasync_bulk_s2cluster(
                         cute.make_ptr(
                             ELEM,
-                            storage.p_xchg.data_ptr().toint(),
+                            p_xchg_int,
                             cute.AddressSpace.smem,
                             assumed_align=16,
                         ),
                         cute.make_ptr(
                             ELEM,
-                            storage.inbox.data_ptr().toint(),
+                            inbox_int,
                             cute.AddressSpace.smem,
                             assumed_align=16,
                         ),
-                        storage.landing_mbar.data_ptr(),
+                        landing_bar,
                         PDS_BLOCK_BYTES,
                         peer_rank,
                     )
                 cute.arch.mbarrier_wait(
-                    storage.landing_mbar.data_ptr(), l_phase
+                    landing_bar, l_phase
                 )
                 l_phase = l_phase ^ Int32(1)
                 t14 = _read_global_timer()
