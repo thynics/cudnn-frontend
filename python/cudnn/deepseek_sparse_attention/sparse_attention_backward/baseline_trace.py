@@ -1950,9 +1950,11 @@ class FlashAttentionDSABackwardSm100:
                 "async.shared",
                 space="cta",
             )
-            _iket.range_end(p_store_token, iter_idx)
-            # Notify for P
+            # Boundary convention (campaign ledger §10.0): include the
+            # commit arrive in the publish span -- the fence drain
+            # surfaces there (5.3x-artifact lesson).
             compute_mma_P_pipeline.producer_commit(compute_mma_P_producer_state)
+            _iket.range_end(p_store_token, iter_idx)
             compute_mma_P_producer_state.advance()
 
             mma_compute_S_pipeline.consumer_release(mma_compute_S_consumer_state)
@@ -2006,8 +2008,12 @@ class FlashAttentionDSABackwardSm100:
                 space="cta",
             )
 
-            _iket.range_end(ds_store_token, iter_idx)
+            # Boundary convention (campaign ledger §10.0): the publish
+            # span must include the commit arrive, where the fence
+            # drain surfaces.  The old placement (range_end before
+            # commit) hid ~0.2us/close and produced the 5.3x artifact.
             compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
+            _iket.range_end(ds_store_token, iter_idx)
             compute_mma_dS_producer_state.advance()
 
             tile_index -= 1
