@@ -116,12 +116,9 @@ _LEAN_SPANS = (
     "dVdK_ISSUE(",
     "dQ_ISSUE(",
     "WAIT_RELAY(",
-    "WAIT_ROUND(",
-    "WAIT_KSCORE(",
-    "WAIT_SCORE_SLOT(",
-    "WAIT_DKV_SLOT(",
-    "WAIT_dQ(",
-    "WAIT_dQ_GATE(",
+    # kq6k-lean: leader fine-grained waits dropped -- 16 ring spans/tile
+    # cost ~1.6us/tile of timestamps and drown the signal.  Waits are
+    # recovered as inter-span gaps (zero instrumentation inside).
     # math chain
     "WAIT_S(",
     "T2R_S(",
