@@ -17,6 +17,12 @@ span boundaries, no instrumentation registers on the measured paths):
                                                   publish, xchg_seen, landed
   C  race (in-kernel form): both released by the same cluster barrier.
                        exposure := chain_landed - shadow_done
+  D1 chain + LDTM noise: 4 noise warps hammer t_dp with Ld16x256b reads
+                       (TMEM read-port pressure replica).
+  D2 chain + REDG noise: 4 noise warps hammer red.global.add.f32
+                       (the reducer's LSU/atomic-storm replica).
+                       D2>>B with D1~B convicts the REDG/LSU path for
+                       the steady-state LDL/LDS inflation (20260812).
 
 Replication ledger (все aligned with dsa_bwd_sm100_2cta_final_ser_kq4c):
   - dP replica: score_tiler (128,64,128) CG2, K_CHUNKS=4, K-major/K-major,
@@ -82,11 +88,15 @@ CLUSTER_SHAPE_MNK = (2, 1, 1)
 
 ITERS = 34
 STEADY = (8, 30)
-SLOTS = 16
+SLOTS = 24
+NOISE_WARP_BEGIN = 6  # warps 6-9: 128-thread noise crew (arms D1/D2)
+NOISE_WARP_END = 10
+NOISE_LDTM_ITERS = 96  # ~3us of LDTM traffic per arm
+NOISE_REDG_ITERS = 64  # ~8K scalar red.global.add per CTA per arm
 MATH_WARPS = 4
 LEADER_WARP = 4
 XCHG_WARP = 5
-THREADS_PER_CTA = 256
+THREADS_PER_CTA = 384  # 12 warps: 4 math, leader, xchg, 4 noise, 2 idle
 
 
 @dsl_user_op
@@ -101,6 +111,27 @@ def _read_global_timer(*, loc=None, ip=None) -> cutlass.Int64:
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+    )
+
+
+@dsl_user_op
+def _red_global_add_f32(
+    address: cutlass.Int64,
+    value: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Scalar red.global.add.f32 -- the D2 REDG-noise atom (the kernel's
+    reducer uses F32x4; scalar at higher rate approximates the pressure)."""
+    llvm.inline_asm(
+        None,
+        [address.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
@@ -180,6 +211,7 @@ class ChainShadowProbe:
     def __call__(
         self,
         mResults: cute.Tensor,
+        mNoise: cute.Tensor,
         stream: cuda.CUstream,
     ):
         cg2 = tcgen05.CtaGroup.TWO
@@ -262,6 +294,7 @@ class ChainShadowProbe:
             score_store_domain,
             score_store_layout,
             mResults,
+            mNoise,
         ).launch(
             grid=(2, 1, 1),
             block=[THREADS_PER_CTA, 1, 1],
@@ -282,6 +315,7 @@ class ChainShadowProbe:
         score_store_domain: cute.Shape,
         score_store_layout: cute.ComposedLayout,
         mResults: cute.Tensor,
+        mNoise: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(
@@ -425,6 +459,12 @@ class ChainShadowProbe:
                     results[i, rank, 9] = t9
                     results[i, rank, 10] = t10
                     results[i, rank, 11] = t11
+                # ARM D1 / D2 (leader idle) ---------------------------
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                # post
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
 
@@ -557,6 +597,61 @@ class ChainShadowProbe:
                     with cute.arch.elect_one():
                         results[i, rank, 12] = t12
                         results[i, rank, 13] = t13
+                # ARM D1: chain + LDTM noise --------------------------
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                t16 = _read_global_timer()
+                cute.copy(score_copy, score_source, r_score)
+                cute.arch.fence_view_async_tmem_load()
+                self._p_math(r_score, r_p, scale_c, lse_c)
+                r_p_store3 = thread_copy_r2s.retile(r_p)
+                if owns_n:
+                    cute.copy(
+                        tiled_copy_r2s, r_p_store3, t_rs_local_tile
+                    )
+                else:
+                    cute.copy(
+                        tiled_copy_r2s, r_p_store3, t_rs_xchg_tile
+                    )
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(
+                        p_ready_bar
+                    )
+                t17 = _read_global_timer()
+                if warp_idx == Int32(0):
+                    with cute.arch.elect_one():
+                        results[i, rank, 16] = t16
+                        results[i, rank, 17] = t17
+                # ARM D2: chain + REDG noise --------------------------
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                t19 = _read_global_timer()
+                cute.copy(score_copy, score_source, r_score)
+                cute.arch.fence_view_async_tmem_load()
+                self._p_math(r_score, r_p, scale_c, lse_c)
+                r_p_store4 = thread_copy_r2s.retile(r_p)
+                if owns_n:
+                    cute.copy(
+                        tiled_copy_r2s, r_p_store4, t_rs_local_tile
+                    )
+                else:
+                    cute.copy(
+                        tiled_copy_r2s, r_p_store4, t_rs_xchg_tile
+                    )
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(
+                        p_ready_bar
+                    )
+                t20 = _read_global_timer()
+                if warp_idx == Int32(0):
+                    with cute.arch.elect_one():
+                        results[i, rank, 19] = t19
+                        results[i, rank, 20] = t20
+                # post
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
 
@@ -643,11 +738,137 @@ class ChainShadowProbe:
                 t14 = _read_global_timer()
                 with cute.arch.elect_one():
                     results[i, rank, 14] = t14
+                # ARM D1 ----------------------------------------------
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        landing_bar,
+                        PDS_BLOCK_BYTES,
+                    )
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                cute.arch.mbarrier_wait(
+                    p_ready_bar, p_phase
+                )
+                p_phase = p_phase ^ Int32(1)
+                with cute.arch.elect_one():
+                    _cpasync_bulk_s2cluster(
+                        cute.make_ptr(
+                            ELEM,
+                            p_xchg_int,
+                            cute.AddressSpace.smem,
+                            assumed_align=16,
+                        ),
+                        cute.make_ptr(
+                            ELEM,
+                            inbox_int,
+                            cute.AddressSpace.smem,
+                            assumed_align=16,
+                        ),
+                        landing_bar,
+                        PDS_BLOCK_BYTES,
+                        peer_rank,
+                    )
+                cute.arch.mbarrier_wait(
+                    landing_bar, l_phase
+                )
+                l_phase = l_phase ^ Int32(1)
+                t18 = _read_global_timer()
+                with cute.arch.elect_one():
+                    results[i, rank, 18] = t18
+                # ARM D2 ----------------------------------------------
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        landing_bar,
+                        PDS_BLOCK_BYTES,
+                    )
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                cute.arch.mbarrier_wait(
+                    p_ready_bar, p_phase
+                )
+                p_phase = p_phase ^ Int32(1)
+                with cute.arch.elect_one():
+                    _cpasync_bulk_s2cluster(
+                        cute.make_ptr(
+                            ELEM,
+                            p_xchg_int,
+                            cute.AddressSpace.smem,
+                            assumed_align=16,
+                        ),
+                        cute.make_ptr(
+                            ELEM,
+                            inbox_int,
+                            cute.AddressSpace.smem,
+                            assumed_align=16,
+                        ),
+                        landing_bar,
+                        PDS_BLOCK_BYTES,
+                        peer_rank,
+                    )
+                cute.arch.mbarrier_wait(
+                    landing_bar, l_phase
+                )
+                l_phase = l_phase ^ Int32(1)
+                t21 = _read_global_timer()
+                with cute.arch.elect_one():
+                    results[i, rank, 21] = t21
+                # post
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+
+        elif warp_idx >= Int32(NOISE_WARP_BEGIN) and warp_idx < Int32(NOISE_WARP_END):
+            # noise crew (128 threads): D1 = LDTM reads of t_dp,
+            # D2 = scalar red.global.add storm on mNoise.
+            ntx = tidx - Int32(NOISE_WARP_BEGIN * 32)
+            noise_copy = tcgen05.make_tmem_copy(
+                score_tmem_load, t_dp
+            )
+            noise_thread = noise_copy.get_slice(ntx)
+            noise_source = noise_thread.partition_S(t_dp)
+            noise_coords = noise_thread.partition_D(rank_coords)
+            r_noise = cute.make_rmem_tensor(
+                noise_coords.shape, ACC
+            )
+            for i in cutlass.range(ITERS):
+                # A, B, C: idle
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                # D1: LDTM noise
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                for _ldtm in cutlass.range_constexpr(NOISE_LDTM_ITERS):
+                    cute.copy(noise_copy, noise_source, r_noise)
+                cute.arch.fence_view_async_tmem_load()
+                # D2: REDG noise
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                for _redg in cutlass.range_constexpr(NOISE_REDG_ITERS):
+                    _red_global_add_f32(
+                        cutlass.Int64(
+                            (
+                                mNoise.iterator
+                                + (
+                                    (ntx + Int32(_redg * 128))
+                                    % Int32(4096)
+                                )
+                            ).toint()
+                        ),
+                        Float32(1.0),
+                    )
+                # post
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
 
         else:
             for i in cutlass.range(ITERS):
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
                 cute.arch.cluster_arrive()
@@ -717,15 +938,21 @@ class ChainShadowProbe:
 def main():
     torch.cuda.init()
     results = torch.zeros(ITERS, 2, SLOTS, dtype=torch.int64, device="cuda")
+    noise = torch.zeros(4096, dtype=torch.float32, device="cuda")
     probe = ChainShadowProbe()
     stream = resolve_stream(None)
     compiled = cute.compile(
         probe,
         to_cute_tensor(results, assumed_align=8),
+        to_cute_tensor(noise, assumed_align=16),
         stream,
         options=compile_options(),
     )
-    compiled(to_cute_tensor(results, assumed_align=8), stream)
+    compiled(
+        to_cute_tensor(results, assumed_align=8),
+        to_cute_tensor(noise, assumed_align=16),
+        stream,
+    )
     torch.cuda.synchronize()
     r = results.cpu().numpy()
 
@@ -748,6 +975,14 @@ def main():
     print(f"    shadow done       : {med(lambda i: r[i,0,11]-r[i,0,9]):8.0f}")
     print(f"    chain landed      : {med(lambda i: r[i,0,14]-r[i,0,9]):8.0f}")
     print(f"    EXPOSURE          : {med(lambda i: r[i,0,14]-r[i,0,11]):8.0f}")
+    print("[D1] chain + LDTM noise:")
+    print(f"    wake->publish     : {med(lambda i: r[i,0,17]-r[i,0,16]):8.0f}")
+    print(f"    wake->landed      : {med(lambda i: r[i,0,18]-r[i,0,16]):8.0f}")
+    print("[D2] chain + REDG noise:")
+    print(f"    wake->publish     : {med(lambda i: r[i,0,20]-r[i,0,19]):8.0f}")
+    print(f"    wake->landed      : {med(lambda i: r[i,0,21]-r[i,0,19]):8.0f}")
+    print("    (compare against [B] wake->publish/landed: D2>>B with D1~B")
+    print("     convicts the REDG/LSU path; D1>>B convicts TMEM read port)")
     print()
     print("verdict table (ledger §10.5): chain>shadow isolated AND race")
     print("exposure ~ in-kernel 1.4-1.8us -> theorem holds in hardware;")
