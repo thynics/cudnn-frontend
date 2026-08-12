@@ -94,6 +94,40 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
 
+# Lean-twin protocol (campaign ledger §10.3): only decision-grade spans
+# are instrumented.  Filtering happens at trace time, so skipped spans
+# emit ZERO device code and cost ZERO registers -- this is what keeps
+# the twin's math warps register-equivalent to the release build
+# (kq6a false-regression lesson).  Boundary convention per §10.3:
+# *_PUBLISH = [first store, arrive done]; WAIT_* = pure wait;
+# T2R_* = [copy, tmem fence done]; *_MATH = [after T2R fence, first
+# store); *_ISSUE = [first atom, last atom issued].
+_LEAN_SPANS = (
+    # leader
+    "S_ISSUE(",
+    "dP_ISSUE(",
+    "dVdK_ISSUE(",
+    "dQ_ISSUE(",
+    "WAIT_RELAY(",
+    "WAIT_ROUND(",
+    "WAIT_KSCORE(",
+    "WAIT_SCORE_SLOT(",
+    "WAIT_DKV_SLOT(",
+    "WAIT_dQ(",
+    "WAIT_dQ_GATE(",
+    # math chain
+    "WAIT_S(",
+    "T2R_S(",
+    "P_MATH(",
+    "MATH_PDS_ACQ(",
+    "P_PUBLISH(",
+    "WAIT_dP(",
+    "T2R_dP(",
+    "DS_MATH(",
+    "DS_PUBLISH(",
+)
+
+
 class _IketProxy:
     """Forward to real IKET when loaded; otherwise make annotations no-ops."""
 
@@ -110,12 +144,20 @@ class _IketProxy:
     @classmethod
     def range_start(cls, *args):
         api = cls._api()
-        return None if api is None else api.range_start(*args)
+        if api is None:
+            return None
+        if args and isinstance(args[0], str) and not args[0].startswith(_LEAN_SPANS):
+            return None
+        return api.range_start(*args)
 
     @classmethod
     def range_end(cls, *args):
         api = cls._api()
-        return None if api is None else api.range_end(*args)
+        if api is None:
+            return None
+        if args and args[0] is None:
+            return None
+        return api.range_end(*args)
 
 
 _iket = _IketProxy()

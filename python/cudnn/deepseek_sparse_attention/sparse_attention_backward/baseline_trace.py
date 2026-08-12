@@ -12,6 +12,34 @@ import cutlass.utils as utils
 from cutlass._mlir.dialects import arith, llvm, nvvm, vector
 
 
+# Lean-twin protocol (campaign ledger §10.3): decision-grade spans only.
+# Trace-time filtering -> skipped spans emit zero device code / zero
+# registers.  Boundary convention: P_STORE/DS_STORE include the
+# producer_commit arrive (fixed 20260812); WAIT_* pure waits.
+# Mapping note: SOFTMAX here fuses T2R+math (kq's T2R_S+P_MATH).
+_LEAN_SPANS = (
+    # leader
+    "S_ISSUE(",
+    "dP_ISSUE(",
+    "DVDK_ISSUE(",
+    "DQ_ISSUE(",
+    "WAIT_KV(",
+    "DKV_SLOT(",
+    "WAIT_dS(",
+    "WAIT_P(",
+    "T2R_BAR(",
+    # math chain
+    "WAIT_S(",
+    "SOFTMAX(",
+    "P_ACQ(",
+    "P_STORE(",
+    "WAIT_dP(",
+    "DS_ACQ(",
+    "DS_MATH(",
+    "DS_STORE(",
+)
+
+
 class _IketProxy:
     """Forward to real IKET when loaded; otherwise make annotations no-ops."""
 
@@ -28,12 +56,20 @@ class _IketProxy:
     @classmethod
     def range_start(cls, *args):
         api = cls._api()
-        return None if api is None else api.range_start(*args)
+        if api is None:
+            return None
+        if args and isinstance(args[0], str) and not args[0].startswith(_LEAN_SPANS):
+            return None
+        return api.range_start(*args)
 
     @classmethod
     def range_end(cls, *args):
         api = cls._api()
-        return None if api is None else api.range_end(*args)
+        if api is None:
+            return None
+        if args and args[0] is None:
+            return None
+        return api.range_end(*args)
 
 
 _iket = _IketProxy()
