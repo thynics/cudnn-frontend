@@ -5797,10 +5797,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.setmaxregister_decrease(64)
         else:
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
-                # kq6c: 136/116 relayout (see release docstring).
+                # kq6c: 136/112 relayout; setmaxregister requires multiples of 8.
                 cute.arch.setmaxregister_increase(136)
             else:
-                cute.arch.setmaxregister_increase(116)
+                cute.arch.setmaxregister_increase(112)
 
         # ==================================================================
         # Role bodies.
