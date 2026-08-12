@@ -20,6 +20,8 @@ from .baseline_trace import (
 class FlashAttentionDSABackwardSm100TwoCTAV2(_BaselineTwin):
     """Candidate-interface adapter over the lean baseline IKET twin."""
 
+    N_TILE = 64
+
     @cute.jit
     def __call__(
         self,

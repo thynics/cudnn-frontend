@@ -24,6 +24,11 @@ from .dsa_bwd_sm100_baseline import (
 class FlashAttentionDSABackwardSm100TwoCTAV2(_CanonicalBaseline):
     """Candidate-interface adapter over the canonical baseline."""
 
+    # The candidate dispatcher uses this class attribute before constructing
+    # the kernel. The canonical baseline stores the same tile size per
+    # instance as ``block_tile`` instead of exposing a class-level constant.
+    N_TILE = 64
+
     @cute.jit
     def __call__(
         self,
