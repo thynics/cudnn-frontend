@@ -5754,16 +5754,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dkv_tiled_mma.make_fragment_A(round_slots[3]),
         )
         for round_slot in cutlass.range_constexpr(self.ROUND_STAGES):
+            round_slot_tensor = round_slots[round_slot]
             round_fragment = round_fragments[round_slot]
+            assert (
+                cute.cosize(round_slot_tensor.layout)
+                == self.ROUND_STAGE_ELEMENTS
+            )
+            assert cute.size(round_slot_tensor, mode=[2]) == 2
             assert cute.size(round_fragment, mode=[2]) == 2
             for k_block in cutlass.range_constexpr(2):
-                k_block_slice = round_fragment[
+                k_block_slice = round_slot_tensor[
                     None,
                     None,
                     k_block,
                     0,
                 ]
-                k_block_offset = round_fragment.layout(
+                k_block_offset = round_slot_tensor.layout(
                     (0, 0, k_block, 0)
                 )
                 k_block_cosize = cute.cosize(k_block_slice.layout)
@@ -6976,8 +6982,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     round_stage_bytes,
                                 )
                             round_dst_raw = round_slot_raw[round_slot]
-                            local_src_offset = self.ROUND_STAGE_ELEMENTS * (
-                                4 * grad_round + source_h32
+                            # Each old K64 panel is two adjacent 4096-element
+                            # score-image strips.  Its H32 half occupies 2048
+                            # elements in each strip, not one contiguous 4096-
+                            # element range.
+                            local_src_offset = (
+                                2
+                                * self.ROUND_STAGE_ELEMENTS
+                                * (2 * grad_round + h_half)
+                                + (self.ROUND_STAGE_ELEMENTS // 2) * k_half
                             )
                             if cutlass.const_expr(tensor_kind == 0):
                                 if cutlass.const_expr(self.OWN_HALF_BULK):
@@ -6988,7 +7001,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 + local_src_offset,
                                                 round_dst_raw,
                                                 round_tma_mbars + round_slot,
-                                                round_stage_bytes,
+                                                round_stage_bytes // 2,
+                                                rank,
+                                            )
+                                            _cpasync_bulk_s2cluster(
+                                                stationary_do_raw
+                                                + local_src_offset
+                                                + self.ROUND_STAGE_ELEMENTS,
+                                                round_dst_raw
+                                                + self.ROUND_STAGE_ELEMENTS // 2,
+                                                round_tma_mbars + round_slot,
+                                                round_stage_bytes // 2,
                                                 rank,
                                             )
                                     else:
@@ -7029,7 +7052,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 + local_src_offset,
                                                 round_dst_raw,
                                                 round_tma_mbars + round_slot,
-                                                round_stage_bytes,
+                                                round_stage_bytes // 2,
+                                                rank,
+                                            )
+                                            _cpasync_bulk_s2cluster(
+                                                stationary_q_raw
+                                                + local_src_offset
+                                                + self.ROUND_STAGE_ELEMENTS,
+                                                round_dst_raw
+                                                + self.ROUND_STAGE_ELEMENTS // 2,
+                                                round_tma_mbars + round_slot,
+                                                round_stage_bytes // 2,
                                                 rank,
                                             )
                                     else:
