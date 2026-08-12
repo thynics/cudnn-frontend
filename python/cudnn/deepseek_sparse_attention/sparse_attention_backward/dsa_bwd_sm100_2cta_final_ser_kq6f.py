@@ -317,15 +317,10 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     KV_NUM_GROUPS = KV_LOAD_THREADS // KV_GROUP_SIZE
     TMEM_COLUMNS = 512
     # kq6f: inter-chunk pacing (ns) for the reducer atomic bursts.
-    # Spreads each 8-chunk burst so the REDG in-flight concentration
-    # drops; nanosleep only bounds the delay in [0, 2t], so this is a
-    # hint, not a hard cap.  r2 budget: 2 bursts x 7 sleeps x 120ns
-    # = 1.68us + stagger <=0.28us + T2R/waits, inside the ~3.5us (sim)
-    # tile arrival period with margin.
-    REDUCE_PACE_NS = 120
-    # kq6f-r2 (cross-review fixes): per-warp phase stagger to break the
-    # synchronized wake-wave of 16 same-parameter sleepers.
-    REDUCE_STAGGER_NS = 40
+    # 8 chunks x ~(pace+issue) stretches one burst ~0.3us -> ~1.6us,
+    # cutting in-flight REDG ~5x.  Budget: 2 bursts x 8 x ~190ns +
+    # T2R/waits ~= 4.0us < 5.6us period -- the reducer keeps up.
+    REDUCE_PACE_NS = 150
     MAX_SMEM_BYTES = 232_448
     QUADRANT_ELEMENTS = H_TILE_CTA * N_TILE_CTA
     QUADRANT_BYTES = QUADRANT_ELEMENTS * (BFloat16.width // 8)
@@ -7315,11 +7310,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
         wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
-        # kq6f-r2: desynchronize the reducer warps' pacing phase.
-        _nanosleep_u32(
-            ((rtx // Int32(32)) & Int32(7))
-            * Int32(self.REDUCE_STAGGER_NS)
-        )
         # Baseline slices the fragment-C TMEM tensor down to its atom core
         # before building the tmem copy (dsa_bwd_sm100.py L1903-1907); the
         # full-rank tensor makes the tiler rank exceed the 2-D identity.
@@ -7421,10 +7411,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_0.iterator.llvm_ptr,
                     rdkv_frg_0.load(),
                 )
-            # kq6f-r2: pace between chunks only (last sleep was pure
-            # phase-budget waste, review B.2-2).
-            if i != 7:
-                _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
+            # kq6f: pace the burst (concentration knife).
+            _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7460,9 +7448,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_1.iterator.llvm_ptr,
                     rdkv_frg_1.load(),
                 )
-            # kq6f-r2: pace between chunks only.
-            if i != 7:
-                _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
+            # kq6f: pace the burst (concentration knife).
+            _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
         return wait_state, release_state
 
 
