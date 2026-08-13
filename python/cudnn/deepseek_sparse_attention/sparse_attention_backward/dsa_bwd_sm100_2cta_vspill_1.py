@@ -5463,13 +5463,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.N_TILE
         )
 
-        # Reassign two 8-register slices from the gather warpgroup to the
-        # special-function warpgroup.  SETMAXNREG is warpgroup-uniform, and
-        # 32/128/128/64 preserves the 61,440-register CTA launch pool.
+        # Keep the final kernel's 48/128/128/48 register split.  The S/dP
+        # producer states below advance in lockstep and now share one state,
+        # so the leader's live range is reduced without moving pressure into
+        # the gather or reducer warpgroups.
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
-            cute.arch.setmaxregister_decrease(32)
+            cute.arch.setmaxregister_decrease(48)
         elif warp_idx >= Int32(self.MMA_WARP):
-            cute.arch.setmaxregister_decrease(64)
+            cute.arch.setmaxregister_decrease(48)
         else:
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
                 cute.arch.setmaxregister_increase(128)
@@ -6131,11 +6132,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
             # executes no pipeline operation at all (FA4 rule).
             if is_leader_cta:
-                s_prod = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.SCORE_DONE_STAGES,
-                )
-                dp_prod = pipeline.make_pipeline_state(
+                sdp_prod = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
                     self.SCORE_DONE_STAGES,
                 )
@@ -6171,15 +6168,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     has_prev = loop_iter > Int32(0)
 
                     pipe_kscore.consumer_wait(kscore_cons)
-                    s_prod = self._issue_score_v2(
+                    sdp_prod = self._issue_score_v2(
                         score_tiled_mma,
                         t_score,
                         t_score_pp,
                         score_q_fragment,
                         score_k_fragment,
                         pipe_s_done,
-                        s_prod,
+                        sdp_prod,
                         loop_iter,
+                        False,
                         False,
                     )
 
@@ -6190,15 +6188,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             stationary_ready_mbar + 1,
                             Int32(0),
                         )
-                    dp_prod = self._issue_score_v2(
+                    sdp_prod = self._issue_score_v2(
                         dp_tiled_mma,
                         t_dp,
                         t_dp_pp,
                         score_do_fragment,
                         dp_k_fragment,
                         pipe_dp_done,
-                        dp_prod,
+                        sdp_prod,
                         loop_iter,
+                        True,
                         True,
                     )
                     pipe_kscore.consumer_release(kscore_cons)
@@ -6332,8 +6331,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_pds.consumer_release(pds_cons)
                     pds_cons.advance()
 
-                    pipe_s_done.producer_tail(s_prod)
-                    pipe_dp_done.producer_tail(dp_prod)
+                    dp_tail_prod = sdp_prod.clone()
+                    pipe_s_done.producer_tail(sdp_prod)
+                    pipe_dp_done.producer_tail(dp_tail_prod)
                     pipe_dkv_done.producer_tail(dkv_prod)
                     pipe_dq_done.producer_tail(dq_done_prod)
 
@@ -6714,6 +6714,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         producer_state: pipeline.PipelineState,
         issue_seq: Int32,
         is_dp: cutlass.Constexpr[bool],
+        advance_state: cutlass.Constexpr[bool],
     ) -> pipeline.PipelineState:
         """Issue one score-side CG2 GEMM over four resident D128 chunks.
 
@@ -6740,7 +6741,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             )
         cute.arch.fence_view_async_tmem_store()
         done_pipeline.producer_commit(producer_state)
-        producer_state.advance()
+        if cutlass.const_expr(advance_state):
+            producer_state.advance()
         return producer_state
 
     @cute.jit
