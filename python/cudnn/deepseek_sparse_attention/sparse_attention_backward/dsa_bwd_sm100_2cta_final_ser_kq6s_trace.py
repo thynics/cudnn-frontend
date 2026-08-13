@@ -5824,8 +5824,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # zero, but the DSL computes it at runtime and ptxas keeps it
         # on the stack -- the [R1] STL/LDL spill chain on the math
         # warps.  Specialize it to a constant.
-        pipe_s_done.consumer_mask = Int32(0)
-        pipe_dp_done.consumer_mask = Int32(0)
+        # (frozen dataclass -- bypass with object.__setattr__)
+        object.__setattr__(pipe_s_done, "consumer_mask", Int32(0))
+        object.__setattr__(pipe_dp_done, "consumer_mask", Int32(0))
         pipe_kscore = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
             producer_group=gather_group,
