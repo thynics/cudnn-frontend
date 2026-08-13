@@ -16,6 +16,13 @@ export CUTE_DSL_DUMP_DIR="${out}/dump"
 export CUTE_DSL_CACHE_DIR="${out}/cache"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
+# The managed worker is long-lived; never inherit another baseline experiment.
+export DSA_BL_QDO_STAGE=1
+export DSA_BL_K_STAGE=1
+export DSA_BL_HALFK=0
+export DSA_BL_KSTAGE2=0
+export DSA_BL_OVPAD=0
+unset DSA_DEV_IKET DKG_IKET_INSTRUMENTATION_METHOD IKET_STANDALONE_SITE_PACKAGES
 
 exec "${python_bin}" benchmark/dsa/sweep_topk_2cta.py \
   --impl vkq6v \
