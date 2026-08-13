@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 repo="${DSA_REPO:-/home/scratch.longcheng_gpu/cudnn-frontend-thynics}"
-impl="${DSA_SPILL_IMPL:-vkq6v}"
-out="${DSA_SPILL_OUT:-/home/scratch.longcheng_gpu/dsa-vkq6v-spill/${impl}_release45}"
+impl="${1:-${DSA_SPILL_IMPL:-vkq6v}}"
+out="${2:-${DSA_SPILL_OUT:-/home/scratch.longcheng_gpu/dsa-vkq6v-spill/${impl}_release45}}"
 python_bin="/home/scratch.longcheng_gpu/cudnn-frontend/.venv/bin/python"
 parser="/home/scratch.longcheng_gpu/dsa-vkq6v-spill/tools/sass_spill_to_py_locs.py"
 
