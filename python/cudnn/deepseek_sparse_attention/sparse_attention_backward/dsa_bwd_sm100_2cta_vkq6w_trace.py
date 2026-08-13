@@ -268,10 +268,9 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 # boundaries mirror final_ser_kq6q_trace: waits are pure waits, T2R ends after
 # its TMEM fence, MATH_SOFTMAX ends before stores, split MATH_PD is inclusive
 # through its phase publish, and issue spans contain only tensor-core enqueues.
-# Keep 25 ranges plus the five role marks and V2 provenance mark within
-# the pipeline's 31-name budget.  W19 MAT_WAIT was not role-addressable and
-# was discarded by aggregation; its slot records the distinct P/dS producer
-# backpressure and MMA-consumer waits instead.
+# Keep 26 ranges plus four role marks and the V2 provenance mark within the
+# pipeline's 31-name budget.  The schema allows W18's relay role to remain
+# implicit; use that event slot for the distinct P/dS consumer wait instead.
 _LEAN_SPANS = (
     "LOAD_QDO",
     "LOAD_STATS",
@@ -280,6 +279,7 @@ _LEAN_SPANS = (
     "RK_ACQ(",
     "MAT_QDO(",
     "MAT_ACQ(",
+    "MAT_WAIT(",
     "REDUCE_ATOMIC(",
     "REDUCE_T2R(",
     "DQ_EPI(",
@@ -7353,7 +7353,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipe_round.producer_tail(round_tail)
 
         elif warp_idx == Int32(self.RELAY_WARP):
-            _iket.mark("ROLE_RELAY", rank)
             # vkq6t: one lane owns both relay legs in strict P-first
             # order.  This is the kq6q-proven 20-warp protocol: P opens
             # the dV critical edge first; dS follows with more than a dV
@@ -7462,9 +7461,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     self.ROUND_GENS_PER_TILE
                 ):
                     round_slot = micro_gen % self.ROUND_STAGES
+                    # Same 16*i+q identity as MAT_ACQ.  This span is only
+                    # the raw fill-completion wait; phase flip and pipeline
+                    # commit intentionally remain outside it.
+                    mat_wait_token = _iket.range_start(
+                        "MAT_WAIT(m,q)",
+                        loop_iter * Int32(self.ROUND_GENS_PER_TILE)
+                        + Int32(micro_gen),
+                    )
                     cute.arch.mbarrier_wait(
                         round_tma_mbars + round_slot,
                         w19_phase[round_slot],
+                    )
+                    _iket.range_end(
+                        mat_wait_token,
+                        loop_iter * Int32(self.ROUND_GENS_PER_TILE)
+                        + Int32(micro_gen),
                     )
                     w19_phase[round_slot] = (
                         Int32(1) - w19_phase[round_slot]
