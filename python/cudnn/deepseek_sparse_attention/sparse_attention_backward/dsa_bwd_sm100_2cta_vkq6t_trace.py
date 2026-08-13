@@ -6311,6 +6311,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
             # --- math: stats, per-tile softmax + publication, dQ epilogue.
+            _iket.mark("ROLE_MATH", rank)
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
             if warp_idx == Int32(self.MATH_WARP_BEGIN):
                 if tile_count > Int32(0):
