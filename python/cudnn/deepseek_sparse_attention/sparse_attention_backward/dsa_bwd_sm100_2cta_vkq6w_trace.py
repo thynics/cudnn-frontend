@@ -291,7 +291,7 @@ _LEAN_SPANS = (
     "T2R_S(",
     "MATH_PD(",
     "MATH_SOFTMAX(",
-    "MATH_PDS_ACQ(",
+    "PDS_WAIT(",
     "MATH_STORE(",
     "MATH_BAR1(",
     "ROUTE_P(",
@@ -6654,12 +6654,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # Buffer backpressure: the previous tile's dQ issue
                 # releases pds, and S(t) only issues after that in the
                 # serial leader order, so this acquire is quiet.
-                pds_acq_token = _iket.range_start(
-                    "MATH_PDS_ACQ(i)",
+                pds_wait_token = _iket.range_start(
+                    "PDS_WAIT(i)",
                     loop_iter,
                 )
                 pipe_pds.producer_acquire(pds_state)
-                _iket.range_end(pds_acq_token, loop_iter)
+                _iket.range_end(pds_wait_token, loop_iter)
 
                 # Publish P with stmatrix. Each pair of warps owns one
                 # N32 half, so this branch is warp-uniform.
