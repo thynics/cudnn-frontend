@@ -4218,11 +4218,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     completions.
 
     Steady-state schedule per KV tile (SERIAL, no rotation):
-    S(t) -> dP(t) -> dV r0 -> dV r1 -> dQ (both rounds) -> dK r0 ->
-    dK r1.  The ring carries 20 generations per tile: u0-7 dO (TMA),
-    u8-11 the two 16KB K_dQ panels (gather warps, cp.async;
-    slot pairs a0+a1 / b0+b1), u12-19 Q (TMA).  W17 acquires ALL 20
-    gens in order and hands u8-11 to the gather warps through the
+    S(t) -> dP(t) -> dV r0 -> dV r1 -> dK r0 -> dK r1 -> dQ (both
+    rounds; kq6n order -- dK's ring slots free earlier and the reduce
+    starts earlier, while the unbound score-K gather keeps the next
+    SDP fed).  The ring carries 20 generations per tile: u0-7 dO
+    (TMA), u8-15 Q (TMA), u16-19 the two 16KB K_dQ panels (gather
+    warps, cp.async; slot pairs a0+a1 / b0+b1).  W17 acquires ALL 20
+    gens in order and hands u16-19 to the gather warps through the
     count-1 kdq_ready mbarrier; the gather fills, drains its cp.asyncs,
     rendezvous on the gather barrier and commits once per CTA; W19
     relays the 16 TMA raw completions and skips the four gather gens.
@@ -4284,7 +4286,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     # map tile-invariant.
     ROUND_PANELS_PER_TILE = 8
     ROUND_GENS_PER_TILE = 16  # TMA generations (u0-7 dO, u12-19 Q)
-    KDQ_RING_GENS = 4  # gather-owned K_dQ generations (u8-11)
+    KDQ_RING_GENS = 4  # gather-owned K_dQ generations (u16-19)
     ROUND_STAGES = 4
 
     MMA_DONE_STAGES = 2
@@ -4847,7 +4849,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         round_consumer_state: pipeline.PipelineState,
         round_release_state: pipeline.PipelineState,
     ) -> Tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Issue both dQ rounds off ring generations u8..u11 -- PANEL level.
+        """Issue both dQ rounds off ring generations u16..u19 -- PANEL level.
 
         LAYOUT FACT (ledger 10.21 D2): dq_a_layout_staged is
         S<3,4,3> o (((64,2),16),1,4,1):(((1,4096),64),0,1024,0) -- each
@@ -4860,12 +4862,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         UMMAs (silent dQ corruption).
 
         round_release_state is a lockstep twin of round_consumer_state
-        touched ONLY here: catch-up advances of 8 at entry (the dV
-        gens) and 8 at exit (the dK gens) keep it aligned tile over
-        tile without touching the dV/dK code.
+        touched ONLY here: a catch-up advance of 16 at entry (the dV
+        and dK gens, both issued before dQ in the r4 order) keeps it
+        aligned tile over tile without touching the dV/dK code.
         """
 
-        for _ in cutlass.range_constexpr(8):
+        for _ in cutlass.range_constexpr(16):
             round_release_state.advance()
         for round_index in cutlass.range_constexpr(self.D_ROUNDS):
             round_pipeline.consumer_wait(round_consumer_state)
@@ -4897,8 +4899,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             round_pipeline.consumer_release(round_release_state)
             round_release_state.advance()
         cute.arch.fence_view_async_tmem_store()
-        for _ in cutlass.range_constexpr(8):
-            round_release_state.advance()
         return round_consumer_state, round_release_state
 
     @cute.jit
@@ -5286,7 +5286,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # score_kv is 1024-aligned and the +16 KiB half offset
         # preserves that.
         # kq6s: K_dQ leaves the score_kv loan.  The two 16KB dq panels
-        # ride the ring as generations u8..u11 per tile: panel 0 =
+        # ride the ring as generations u16..u19 per tile: panel 0 =
         # slots a0+a1, panel 1 = slots b0+b1.  ADJACENCY CONTRACT
         # (ledger 10.21 D5): these panels silently span two 8KB struct
         # fields -- round_buf_a1 MUST sit exactly 8192 bytes after
@@ -5816,6 +5816,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
+        # kq6s r4 (ledger 10.20 fix 6): under CLUSTER_SHAPE_MNK=(2,1,1)
+        # the UmmaAsync consumer_mask (= rank // 2 * 2) is identically
+        # zero, but the DSL computes it at runtime and ptxas keeps it
+        # on the stack -- the [R1] STL/LDL spill chain on the math
+        # warps.  Specialize it to a constant.
+        pipe_s_done.consumer_mask = Int32(0)
+        pipe_dp_done.consumer_mask = Int32(0)
         pipe_kscore = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
             producer_group=gather_group,
@@ -5895,7 +5902,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(loan_tma_mbars + 1, 1)
             # kq6s: repurposed as the kdq-slots-free handoff --
             # W17 (the single ring producer_acquire party) arrives once
-            # per tile after acquiring u8..u11 on the gather's behalf.
+            # per tile after acquiring u16..u19 on the gather's behalf.
             cute.arch.mbarrier_init(
                 kdq_ready_mbar,
                 1,
@@ -6052,7 +6059,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # generation per tile (score K only).  The next tile's
                 # score-K gather starts as soon as dP(t) releases the
                 # generation -- the dQ->SDP gap dies here.  K_dQ(t)
-                # rides ring gens u8..u11: W17 (the single acquiring
+                # rides ring gens u16..u19: W17 (the single acquiring
                 # party) hands the four free slots over via
                 # kdq_ready_mbar; the panel fill interleaves rows
                 # across both slot pairs, drains synchronously, then
@@ -6088,9 +6095,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         pipe_kscore.producer_commit(gather_state)
                         gather_state.advance()
 
-                    for _ in cutlass.range_constexpr(8):
+                    for _ in cutlass.range_constexpr(16):
                         gather_ring_com.advance()
-                    # Slots u8..u11 are acquired by W17 (single-party
+                    # Slots u16..u19 are acquired by W17 (single-party
                     # acquire); wait its per-tile handoff.
                     cute.arch.mbarrier_wait(
                         kdq_ready_mbar,
@@ -6124,8 +6131,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 pipe_round.producer_commit(
                                     gather_ring_com
                                 )
-                        gather_ring_com.advance()
-                    for _ in cutlass.range_constexpr(8):
                         gather_ring_com.advance()
                 pipe_kscore.producer_tail(gather_state)
                 # producer_tail observes the final score K generation's
@@ -6240,7 +6245,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
                 // Int32(self.N_TILE_CTA)
             )
-            owns_n = n_owner == rank
             aligned_p_blocks_ptr = cute.make_ptr(
                 self.element_dtype,
                 p_blocks[0].iterator.toint(),
@@ -6469,7 +6473,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 r_p_store = thread_copy_r2s.retile(r_p)
                 assert t_rs_p_local_tile.shape == r_p_store.shape
                 assert t_rs_p_xchg_tile.shape == r_p_store.shape
-                if owns_n:
+                # kq6s r4 (ledger 10.20 fix 7): re-derive the rank
+                # comparison at the branch instead of holding it across
+                # the whole P/dS math -- the hoisted value was the
+                # [R1+4] loop-carried stack spill.
+                if n_owner == cute.arch.make_warp_uniform(
+                    cute.arch.block_idx_in_cluster()
+                ):
                     cute.copy(
                         tiled_copy_r2s,
                         r_p_store,
@@ -6548,7 +6558,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_ds_local_tile.shape == r_ds_store.shape
                 assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
-                if owns_n:
+                # kq6s r4 (ledger 10.20 fix 7): re-derive the rank
+                # comparison at the branch instead of holding it across
+                # the whole P/dS math -- the hoisted value was the
+                # [R1+4] loop-carried stack spill.
+                if n_owner == cute.arch.make_warp_uniform(
+                    cute.arch.block_idx_in_cluster()
+                ):
                     cute.copy(
                         tiled_copy_r2s,
                         r_ds_store,
@@ -6886,18 +6902,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             grad_round = 1
                             tensor_kind = 1  # Q_r1
                         h_half = flat_gen % 2
-                        # kq6s: W17 stays the ONLY producer_acquire
-                        # party -- it acquires the gather-owned K_dQ
-                        # gens u8..u11 too, then hands the free slots
-                        # to the gather warps via kdq_ready_mbar.
-                        if cutlass.const_expr(flat_gen == 4):
-                            for _ in cutlass.range_constexpr(4):
-                                pipe_round.producer_acquire(round_acq)
-                                round_acq.advance()
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive(
-                                    kdq_ready_mbar,
-                                )
                         for k_half in cutlass.range_constexpr(2):
                             micro_gen = 2 * flat_gen + k_half
                             round_slot = micro_gen % self.ROUND_STAGES
@@ -7024,6 +7028,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                             round_tma_mbars + round_slot
                                         ),
                                     )
+                    # kq6s r4: W17 stays the ONLY producer_acquire
+                    # party -- after the 16 TMA generations it acquires
+                    # the gather-owned K_dQ gens u16..u19 (gated by dK
+                    # draining the Q gens) and hands the free slots to
+                    # the gather warps via the count-1 kdq_ready_mbar.
+                    for _ in cutlass.range_constexpr(
+                        self.KDQ_RING_GENS
+                    ):
+                        pipe_round.producer_acquire(round_acq)
+                        round_acq.advance()
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(
+                            kdq_ready_mbar,
+                        )
                 pipe_round.producer_tail(round_acq)
 
         elif warp_idx == Int32(self.RELAY_WARP):
@@ -7139,14 +7157,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 for micro_gen in cutlass.range_constexpr(
                     self.ROUND_GENS_PER_TILE
                 ):
-                    # kq6s: gens u8..u11 (K_dQ) are committed by the
-                    # gather warps; advance past them between the dO
-                    # and Q generations.
-                    if cutlass.const_expr(micro_gen == 8):
-                        for _ in cutlass.range_constexpr(
-                            self.KDQ_RING_GENS
-                        ):
-                            commit_com.advance()
                     round_slot = micro_gen % self.ROUND_STAGES
                     cute.arch.mbarrier_wait(
                         round_tma_mbars + round_slot,
@@ -7157,6 +7167,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
                     with cute.arch.elect_one():
                         pipe_round.producer_commit(commit_com)
+                    commit_com.advance()
+                # kq6s r4: gens u16..u19 (K_dQ) are committed by the
+                # gather warps; advance past them at the tile tail.
+                for _ in cutlass.range_constexpr(self.KDQ_RING_GENS):
                     commit_com.advance()
 
         # ==================================================================
@@ -7276,7 +7290,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dkv_commit_state: pipeline.PipelineState,
         issue_seq: Int32,
     ):
-        """kq same-tile gradient chain: dV r0/r1 -> dQ -> dK r0/r1 (kq6s).
+        """kq same-tile gradient chain: dV r0/r1 -> dK r0/r1 -> dQ (kq6s r4).
 
         dO/Q quadrants stream through 16 self-contained K32 ring
         micro-generations (two per original K64 panel); the K_dQ
@@ -7393,32 +7407,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         round_consumer_state.advance()
 
 
-        # (kq6s) dQ mid-chain (champion order), fed by ring gens
-        # u8..u11 -- the K_dQ panels ride the ring, filled by the
-        # gather warps in dV's back half.  score_kv is no longer
-        # borrowed: the next tile's score-K gather started back at
-        # dP's early kscore release (the dQ->SDP gap dies there).
-        # Gates: pds backpressure + ds_local_ready.
-        pds_pipeline.consumer_wait(pds_consumer_state)
-        _mbarrier_wait_acquire_cluster(
-            ds_local_ready_mbar,
-            relay_phase,
-        )
-        (
-            round_consumer_state,
-            round_release_state,
-        ) = self._issue_dq_rounds_kq(
-            dq_tiled_mma,
-            t_dq_0,
-            t_dq_1,
-            dq_kd_fragment_a,
-            dq_kd_fragment_b,
-            dq_ds_fragment,
-            dq_accumulate,
-            round_pipeline,
-            round_consumer_state,
-            round_release_state,
-        )
 
         # dK r0: ring Q0/Q1 quadrants x dS blocks -> slot 0 (fused
         # dV+dK latent gradient), then hand slot 0 to the reducers.
@@ -7525,6 +7513,34 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
 
+
+        # (kq6s r4) dQ LAST (kq6n order), fed by ring gens u16..u19
+        # -- the K_dQ panels ride the ring, filled by the gather
+        # warps once dK drains the Q generations.  score_kv is not
+        # borrowed: the next tile's score-K gather started back at
+        # dP's early kscore release, so dQ-last no longer starves
+        # the next SDP (the old kq6n 1.5us gap is structurally
+        # dead).  Gates: pds backpressure + ds_local_ready.
+        pds_pipeline.consumer_wait(pds_consumer_state)
+        _mbarrier_wait_acquire_cluster(
+            ds_local_ready_mbar,
+            relay_phase,
+        )
+        (
+            round_consumer_state,
+            round_release_state,
+        ) = self._issue_dq_rounds_kq(
+            dq_tiled_mma,
+            t_dq_0,
+            t_dq_1,
+            dq_kd_fragment_a,
+            dq_kd_fragment_b,
+            dq_ds_fragment,
+            dq_accumulate,
+            round_pipeline,
+            round_consumer_state,
+            round_release_state,
+        )
 
         return (
             round_consumer_state,
