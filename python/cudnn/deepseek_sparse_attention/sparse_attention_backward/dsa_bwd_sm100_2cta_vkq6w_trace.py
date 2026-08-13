@@ -486,6 +486,10 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     # prevents the two CTAs from rebuilding one synchronized REDG spike after
     # every pipeline wait while preserving the established chunk pacing.
     REDUCE_DEPHASE_NS = 40
+    # Optional A/B knob: stagger the four gather warps immediately after a
+    # kscore acquire to break long contiguous LDGSTS/STS issue bursts.  Zero
+    # preserves the release path; benchmark harnesses may specialize it.
+    GATHER_DEPHASE_NS = 0
     MAX_SMEM_BYTES = 232_448
     QUADRANT_ELEMENTS = H_TILE_CTA * N_TILE_CTA
     QUADRANT_BYTES = QUADRANT_ELEMENTS * (BFloat16.width // 8)
@@ -6218,6 +6222,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     Int32(0),
                 )
                 pipe_kscore.producer_acquire(gather_state)
+                if cutlass.const_expr(self.GATHER_DEPHASE_NS > 0):
+                    _nanosleep_u32(
+                        warp_idx * Int32(self.GATHER_DEPHASE_NS)
+                    )
                 self._load_score_kv(
                     mKV,
                     mTopkIdxs,
@@ -6256,6 +6264,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         score_iter,
                     )
                     pipe_kscore.producer_acquire(gather_state)
+                    if cutlass.const_expr(self.GATHER_DEPHASE_NS > 0):
+                        _nanosleep_u32(
+                            warp_idx * Int32(self.GATHER_DEPHASE_NS)
+                        )
                     _iket.range_end(rk_acq_token, score_iter)
                     self._gather_kdq_kq(
                         mKV,
@@ -6285,6 +6297,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             next_iter,
                         )
                         pipe_kscore.producer_acquire(gather_state)
+                        if cutlass.const_expr(self.GATHER_DEPHASE_NS > 0):
+                            _nanosleep_u32(
+                                warp_idx * Int32(self.GATHER_DEPHASE_NS)
+                            )
                         self._load_score_kv(
                             mKV,
                             mTopkIdxs,
