@@ -7489,7 +7489,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # Inline TmemAllocator.free and reload rank from the dedicated SMEM
         # mailbox.  The initialization CTA join makes the early store visible;
         # rank therefore has no SSA live range through any compute role.
-        if warp_idx == Int32(self.MATH_WARP_BEGIN):
+        free_warp_idx = cute.arch.make_warp_uniform(
+            cute.arch.warp_idx()
+        )
+        if free_warp_idx == Int32(self.MATH_WARP_BEGIN):
             free_rank = cute.arch.make_warp_uniform(
                 tmem_rank_mailbox_ptr.load()
             )
