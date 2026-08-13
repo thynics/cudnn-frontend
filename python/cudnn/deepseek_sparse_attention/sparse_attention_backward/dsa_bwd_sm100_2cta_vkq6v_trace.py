@@ -254,8 +254,11 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 # Only decision-grade spans reach the device.  Rejected names return a null
 # token, so their matching range_end also emits no annotation.  The selected
 # boundaries mirror final_ser_kq6q_trace: waits are pure waits, T2R ends after
-# its TMEM fence, math ends before the first store, and issue spans contain
-# only tensor-core enqueue paths.
+# its TMEM fence, MATH_SOFTMAX ends before stores, split MATH_PD is inclusive
+# through its phase publish, and issue spans contain only tensor-core enqueues.
+# CuTe DSL 4.6.1 accepts 29 registered IKET names.  Keep 23 ranges plus
+# the five role marks and V2 provenance mark; the redundant WAIT_P,
+# WAIT_dP, and WAIT_dS_dK envelopes are intentionally filtered out.
 _LEAN_SPANS = (
     "LOAD_QDO",
     "LOAD_STATS",
@@ -270,14 +273,14 @@ _LEAN_SPANS = (
     "dP_ISSUE(",
     "dVdK_ISSUE(",
     "dQ_ISSUE(",
-    "WAIT_P(",
-    "WAIT_dS_dK(",
     "WAIT_S(",
     "T2R_S(",
     "MATH_PD(",
+    "MATH_SOFTMAX(",
     "MATH_PDS_ACQ(",
+    "MATH_STORE(",
+    "MATH_BAR1(",
     "ROUTE_P(",
-    "WAIT_dP(",
     "T2R_dP(",
     "ROUTE_dS(",
 )
@@ -6528,6 +6531,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     "MATH_PD(i,phase)",
                     loop_iter * Int32(2),
                 )
+                p_softmax_token = _iket.range_start(
+                    "MATH_SOFTMAX(i)",
+                    loop_iter * Int32(2),
+                )
                 assert cute.size(r_score) == self.N_TILE_CTA
                 if cutlass.const_expr(self.SOFTMAX_GROUPED_STATS):
                     for h_group in cutlass.range_constexpr(4):
@@ -6581,7 +6588,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         r_score[local_n] = p_value
                         r_p[local_n] = self.element_dtype(p_value)
                 _iket.range_end(
-                    p_math_token,
+                    p_softmax_token,
                     loop_iter * Int32(2),
                 )
 
@@ -6600,6 +6607,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 p_publish_token = _iket.range_start(
                     "ROUTE_P(i)",
                     loop_iter,
+                )
+                p_store_token = _iket.range_start(
+                    "MATH_STORE(i)",
+                    loop_iter * Int32(2),
                 )
                 r_p_store = thread_copy_r2s.retile(r_p)
                 assert t_rs_p_local_tile.shape == r_p_store.shape
@@ -6621,6 +6632,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         t_rs_p_xchg_tile,
                     )
                 cute.arch.fence_view_async_shared()
+                _iket.range_end(
+                    p_store_token,
+                    loop_iter * Int32(2),
+                )
                 # kq2 (e12): warp-level close -- sync the warp so all
                 # its stores/fence retire, then one elected local
                 # arrive; the mbar counts 4 warps instead of 128
@@ -6631,6 +6646,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         p_ready_mbars,
                     )
                 _iket.range_end(p_publish_token, loop_iter)
+                _iket.range_end(
+                    p_math_token,
+                    loop_iter * Int32(2),
+                )
 
                 # ---- dS phase: T2R dP, dS math, publish dS + image.
                 wait_dp_token = _iket.range_start(
@@ -6654,6 +6673,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
                 ds_math_token = _iket.range_start(
                     "MATH_PD(i,phase)",
+                    loop_iter * Int32(2) + Int32(1),
+                )
+                ds_softmax_token = _iket.range_start(
+                    "MATH_SOFTMAX(i)",
                     loop_iter * Int32(2) + Int32(1),
                 )
                 if cutlass.const_expr(self.SOFTMAX_GROUPED_STATS):
@@ -6699,13 +6722,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         )
                         r_ds[local_n] = self.element_dtype(ds_value)
                 _iket.range_end(
-                    ds_math_token,
+                    ds_softmax_token,
                     loop_iter * Int32(2) + Int32(1),
                 )
 
                 ds_publish_token = _iket.range_start(
                     "ROUTE_dS(i)",
                     loop_iter,
+                )
+                ds_store_token = _iket.range_start(
+                    "MATH_STORE(i)",
+                    loop_iter * Int32(2) + Int32(1),
                 )
                 r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_ds_local_tile.shape == r_ds_store.shape
@@ -6736,13 +6763,26 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # predicates (global_n < topk, kv_index >= 0).
 
                 cute.arch.fence_view_async_shared()
+                _iket.range_end(
+                    ds_store_token,
+                    loop_iter * Int32(2) + Int32(1),
+                )
                 # kq2 (e12): warp-level close (see p_ready note).
+                math_bar1_token = _iket.range_start(
+                    "MATH_BAR1(i)",
+                    loop_iter,
+                )
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
                         pds_ready_mbars,
                     )
+                _iket.range_end(math_bar1_token, loop_iter)
                 _iket.range_end(ds_publish_token, loop_iter)
+                _iket.range_end(
+                    ds_math_token,
+                    loop_iter * Int32(2) + Int32(1),
+                )
                 pds_state.advance()
 
             # dQ epilogue: wait for the last dQ generation, then store both
