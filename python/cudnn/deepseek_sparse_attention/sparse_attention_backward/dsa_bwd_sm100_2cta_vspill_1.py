@@ -4588,30 +4588,47 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     ) -> Int32:
         """Fill round-0 dO into the two halves of ``score_kv``.
 
-        All four gather warps call this helper.  Warp 0 launches one local
-        bulk copy and one peer-panel TMA per CTA; the named gather barriers
-        publish launch and completion to the remaining gather threads before
-        their collective kscore producer commit.
+        All four gather warps call this helper.  Warp 0 launches the CTA-local
+        bulk copy while warp 1 independently launches the peer-panel TMA.  An
+        issuer first arms the completion barrier for its own transaction, so
+        the existing named gather barriers can still publish launch and
+        completion to the remaining gather threads before their collective
+        kscore producer commit.
         """
 
         if warp_idx == Int32(0):
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    loan_tma_mbars,
-                    grad_a_stage_bytes,
-                )
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    loan_tma_mbars + 1,
-                    grad_a_stage_bytes,
-                )
             if rank == Int32(0):
                 with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        loan_tma_mbars,
+                        grad_a_stage_bytes,
+                    )
                     _cpasync_bulk_s2cluster(
                         stationary_do_raw,
                         score_kv_raw,
                         loan_tma_mbars,
                         grad_a_stage_bytes,
                         rank,
+                    )
+            else:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        loan_tma_mbars + 1,
+                        grad_a_stage_bytes,
+                    )
+                    _cpasync_bulk_s2cluster(
+                        stationary_do_raw + Int32(8192),
+                        score_kv_raw + Int32(8192),
+                        loan_tma_mbars + 1,
+                        grad_a_stage_bytes,
+                        rank,
+                    )
+        elif warp_idx == Int32(1):
+            if rank == Int32(0):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        loan_tma_mbars + 1,
+                        grad_a_stage_bytes,
                     )
                 cute.copy(
                     tma_atom_dot,
@@ -4620,20 +4637,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tma_bar_ptr=loan_tma_mbars + 1,
                 )
             else:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        loan_tma_mbars,
+                        grad_a_stage_bytes,
+                    )
                 cute.copy(
                     tma_atom_dot,
                     t_dot_gmem[None, 0, 0],
                     t_dot_loan_smem_a[None, 0],
                     tma_bar_ptr=loan_tma_mbars,
                 )
-                with cute.arch.elect_one():
-                    _cpasync_bulk_s2cluster(
-                        stationary_do_raw + Int32(8192),
-                        score_kv_raw + Int32(8192),
-                        loan_tma_mbars + 1,
-                        grad_a_stage_bytes,
-                        rank,
-                    )
 
         # Launch visibility, then completion visibility, across all four
         # gather warps.  Only warp 0 polls the raw completion barriers.
