@@ -482,6 +482,10 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     # cutting in-flight REDG ~5x.  Budget: 2 bursts x 8 x ~190ns +
     # T2R/waits ~= 4.0us < 5.6us period -- the reducer keeps up.
     REDUCE_PACE_NS = 150
+    # Four cohorts of four reducer warps start each burst 40 ns apart.  This
+    # prevents the two CTAs from rebuilding one synchronized REDG spike after
+    # every pipeline wait while preserving the established chunk pacing.
+    REDUCE_DEPHASE_NS = 40
     MAX_SMEM_BYTES = 232_448
     QUADRANT_ELEMENTS = H_TILE_CTA * N_TILE_CTA
     QUADRANT_BYTES = QUADRANT_ELEMENTS * (BFloat16.width // 8)
@@ -8067,6 +8071,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             "REDUCE_ATOMIC(i,r)",
             packed_issue,
         )
+        reduce_cohort = rank * Int32(2) + wg_idx
+        _nanosleep_u32(
+            reduce_cohort * Int32(self.REDUCE_DEPHASE_NS)
+        )
         sub_tile_idx_0 = rank
         sub_tile_idx_1 = Int32(2) + rank
         for i in cutlass.range_constexpr(8):
@@ -8118,6 +8126,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         reduce_atomic_token_1 = _iket.range_start(
             "REDUCE_ATOMIC(i,r)",
             packed_issue + Int32(1),
+        )
+        _nanosleep_u32(
+            reduce_cohort * Int32(self.REDUCE_DEPHASE_NS)
         )
         for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
