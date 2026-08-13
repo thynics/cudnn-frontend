@@ -5918,9 +5918,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
             cute.arch.mbarrier_init(loan_tma_mbars, 1)
             cute.arch.mbarrier_init(loan_tma_mbars + 1, 1)
+            # kq6s: repurposed as the kdq-slots-free handoff --
+            # W17 (the single ring producer_acquire party) arrives once
+            # per tile after acquiring u8..u11 on the gather's behalf.
             cute.arch.mbarrier_init(
                 kdq_ready_mbar,
-                self.GATHER_THREADS,
+                1,
             )
             cute.arch.mbarrier_init(loan_epi_safe_mbar, 1)
             _store_shared_seq_v4(khot_seq, Int32(0))
@@ -6073,10 +6076,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # rides ring gens u16..u19: all four slots are acquired
                 # up front (the panel fill interleaves rows across both
                 # slot pairs), drained synchronously, then committed.
-                gather_ring_acq = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    self.ROUND_STAGES,
-                )
+                kdq_free_phase = Int32(0)
                 gather_ring_com = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
                     self.ROUND_STAGES,
@@ -6108,11 +6108,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         gather_state.advance()
 
                     for _ in cutlass.range_constexpr(8):
-                        gather_ring_acq.advance()
                         gather_ring_com.advance()
-                    for _ in cutlass.range_constexpr(4):
-                        pipe_round.producer_acquire(gather_ring_acq)
-                        gather_ring_acq.advance()
+                    # Slots u8..u11 are acquired by W17 (single-party
+                    # acquire); wait its per-tile handoff.
+                    cute.arch.mbarrier_wait(
+                        kdq_ready_mbar,
+                        kdq_free_phase,
+                    )
+                    kdq_free_phase = Int32(1) - kdq_free_phase
                     self._gather_kdq_kq(
                         mKV,
                         mTopkIdxs,
@@ -6142,7 +6145,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 )
                         gather_ring_com.advance()
                     for _ in cutlass.range_constexpr(8):
-                        gather_ring_acq.advance()
                         gather_ring_com.advance()
                 pipe_kscore.producer_tail(gather_state)
                 # producer_tail observes the final score K generation's
@@ -6901,12 +6903,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             grad_round = 1
                             tensor_kind = 1  # Q_r1
                         h_half = flat_gen % 2
-                        # kq6s: gens u8..u11 are the gather-owned K_dQ
-                        # panels -- skip their acquire before the first
-                        # Q generation.
+                        # kq6s: W17 stays the ONLY producer_acquire
+                        # party -- it acquires the gather-owned K_dQ
+                        # gens u8..u11 too, then hands the free slots
+                        # to the gather warps via kdq_ready_mbar.
                         if cutlass.const_expr(flat_gen == 4):
                             for _ in cutlass.range_constexpr(4):
+                                pipe_round.producer_acquire(round_acq)
                                 round_acq.advance()
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive(
+                                    kdq_ready_mbar,
+                                )
                         for k_half in cutlass.range_constexpr(2):
                             micro_gen = 2 * flat_gen + k_half
                             round_slot = micro_gen % self.ROUND_STAGES
