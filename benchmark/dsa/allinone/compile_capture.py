@@ -49,6 +49,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--topk", type=int, default=2048)
     p.add_argument("--no-topk-length", action="store_true",
                    help="compile the mTopkLength=None specialization")
+    p.add_argument(
+        "--allow-cubin-only",
+        action="store_true",
+        help=(
+            "accept a lineinfo CUBIN without an automatically emitted SASS "
+            "file (needed by CUTLASS DSL 4.5; disassemble it separately)"
+        ),
+    )
     return p.parse_args()
 
 
@@ -167,7 +175,7 @@ def main() -> int:
                 "bytes": f.stat().st_size,
                 "sha256": sha256_file(f),
             })
-    if not any(a["path"].endswith(".sass") for a in artifacts):
+    if not args.allow_cubin_only and not any(a["path"].endswith(".sass") for a in artifacts):
         raise SystemExit("no .sass artifact was kept -- check "
                          "CUTE_DSL_KEEP handling in this DSL version")
 

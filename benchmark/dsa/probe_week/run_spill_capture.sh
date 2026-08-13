@@ -2,15 +2,16 @@
 set -Eeuo pipefail
 
 repo="${DSA_REPO:-/home/scratch.longcheng_gpu/cudnn-frontend-thynics}"
-out="${DSA_SPILL_OUT:-/home/scratch.longcheng_gpu/dsa-vkq6v-spill/baseline45_clean}"
+out="${DSA_SPILL_OUT:-/home/scratch.longcheng_gpu/dsa-vkq6v-spill/q6v_release45}"
 python_bin="/home/scratch.longcheng_gpu/cudnn-frontend/.venv/bin/python"
+parser="/home/scratch.longcheng_gpu/dsa-vkq6v-spill/tools/sass_spill_to_py_locs.py"
 
 mkdir -p -- "${out}/dump" "${out}/cache"
 cd -- "${repo}"
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="${repo}/python:${repo}/test/python:${repo}"
-export CUTE_DSL_KEEP=cubin
+export CUTE_DSL_KEEP=ptx,cubin
 export CUTE_DSL_LINEINFO=True
 export CUTE_DSL_DUMP_DIR="${out}/dump"
 export CUTE_DSL_CACHE_DIR="${out}/cache"
@@ -28,28 +29,37 @@ unset DSA_DEV_IKET DKG_IKET_INSTRUMENTATION_METHOD IKET_STANDALONE_SITE_PACKAGES
 printf 'SPILL_CAPTURE_ENV DSA_BL_KSTAGE2=%s CUTE_DSL_NO_CACHE=%s\n' \
   "${DSA_BL_KSTAGE2}" "${CUTE_DSL_NO_CACHE}"
 
-"${python_bin}" - <<'PY'
-import os
-from cudnn.deepseek_sparse_attention.sparse_attention_backward import dsa_bwd_sm100
-
-kernel = dsa_bwd_sm100.FlashAttentionDSABackwardSm100(512, 512, 64, 2048)
-kernel._setup_attributes()
-print(
-    "SPILL_CAPTURE_IMPORT",
-    dsa_bwd_sm100.__file__,
-    "env=", os.environ.get("DSA_BL_KSTAGE2"),
-    "kstage2=", kernel.load_mma_K_kstage2,
-    "k_stage=", kernel.load_mma_K_stage,
-    flush=True,
-)
-PY
-
-exec "${python_bin}" benchmark/dsa/sweep_topk_2cta.py \
+"${python_bin}" benchmark/dsa/allinone/compile_capture.py \
   --impl vkq6v \
-  --topks 2048 \
-  --seqlen 4096 \
-  --nheads 128 \
-  --head-dim 512 \
-  --warmup 3 \
-  --repeat 10 \
-  --json "${out}/smoke.json"
+  --out "${out}" \
+  --allow-cubin-only
+
+dump_dir="${out}/logs/codegen/compile"
+mapfile -d '' -t cubins < <(
+  find "${dump_dir}" -maxdepth 1 -type f -name '*.cubin' -print0
+)
+if ((${#cubins[@]} == 0)); then
+  echo "ERROR: q6v compile produced no CUBIN" >&2
+  exit 1
+fi
+printf 'SPILL_CAPTURE_CUBINS count=%d\n' "${#cubins[@]}"
+
+for cubin in "${cubins[@]}"; do
+  stem="${cubin%.cubin}"
+  sass="${stem}.lineinfo.sass"
+  /usr/local/cuda/bin/nvdisasm -g -c "${cubin}" >"${sass}"
+  /usr/local/cuda/bin/cuobjdump --dump-resource-usage "${cubin}" \
+    >"${stem}.resource_usage.txt"
+  readelf -S -W "${cubin}" >"${stem}.sections.txt"
+  readelf -Ws -W "${cubin}" >"${stem}.symbols.txt"
+  grep -qE '//## File "[^"]+", line [0-9]+' "${sass}"
+  grep -qE '/\*(0x)?[[:xdigit:]]+\*/' "${sass}"
+  python3 "${parser}" "${sass}" --source-root "${repo}" \
+    -o "${stem}.spill_product.json" \
+    | tee "${stem}.spill_product.log"
+  python3 "${parser}" "${sass}" --source-root "${repo}" \
+    --include-non-python -o "${stem}.spill_full.json" \
+    | tee "${stem}.spill_full.log"
+done
+
+echo "SPILL_CAPTURE_OK ${out}"
