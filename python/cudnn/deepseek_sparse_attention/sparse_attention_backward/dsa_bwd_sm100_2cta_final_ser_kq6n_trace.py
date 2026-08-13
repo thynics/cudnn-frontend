@@ -7114,19 +7114,28 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # math).  Each lane keeps its own landing phase; each mbar
             # still flips exactly once per tile.
             _iket.mark("ROLE_RELAY", rank)
-            # Deliberately no IKET ranges inside the lane-0/lane-1 legs:
-            # a lane-specific annotation is not warp-uniform and can make
-            # the decoded trace incomplete or misleading.  Per-leg P/dS
-            # ready/landing timestamps require the existing manual-clock
-            # trace path; ROLE_RELAY remains a safe uniform anchor here.
+            # kq6n-r2: SINGLE-LANE strict P-first relay.  The kq dual-lane
+            # design put the P and dS legs on divergent branches of one
+            # warp -- "independent" in program order but time-sharing
+            # the warp issue slots (SIMT divergence), so dS activity
+            # could delay the P leg between p_ready wake and the
+            # relay-0 arrive while ready->dV couples at ~68ns.  Here
+            # lane 0 runs BOTH legs with the P leg strictly first each
+            # tile; dS consumers (dK relay-1, dQ ds_local gate, pds
+            # backpressure) sit 1.5us+ downstream and absorb the shift.
             relay_lane = tidx % Int32(32)
             if relay_lane == Int32(0):
-                # ---- P leg: fires off the math P phase's own
-                # p_ready arrival -- as early as the publish chain
-                # allows.
                 p_landing_phase = Int32(0)
                 p_ready_phase = Int32(0)
+                ds_landing_phase = Int32(0)
+                ready_phase = Int32(0)
+                pds_com = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer,
+                    1,
+                )
                 for loop_iter in cutlass.range(tile_count):
+                    # ---- P leg first: fire p_ready -> peer landing ->
+                    # relay 0 with nothing else on the warp.
                     cute.arch.mbarrier_wait(
                         p_ready_mbars,
                         p_ready_phase,
@@ -7162,24 +7171,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         relay_mbars,
                         Int32(0),
                     )
-            elif relay_lane == Int32(1):
-                # ---- dS leg: off the dS phase's pds_ready arrival.
-                ds_landing_phase = Int32(0)
-                ready_phase = Int32(0)
-                pds_com = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    1,
-                )
-                for loop_iter in cutlass.range(tile_count):
+                    # ---- dS leg strictly after relay 0.
                     cute.arch.mbarrier_wait(
                         pds_ready_mbars,
                         ready_phase,
                     )
                     ready_phase = Int32(1) - ready_phase
-                    # kq: certify this CTA's LOCAL dS images to the
-                    # leader (count-2 on rank 0) -- the dQ gate.  The
-                    # local publish close was just observed; the
-                    # remote arrive carries the cluster-scope release.
                     cute.arch.mbarrier_arrive(
                         ds_local_ready_mbar,
                         Int32(0),
@@ -7205,8 +7202,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
-                    # pds commit moves to lane 1 with the dS send; the
-                    # producer group counts arrivals, not identities.
                     pipe_pds.producer_commit(pds_com)
                     pds_com.advance()
                     _mbarrier_wait_acquire_cluster(
