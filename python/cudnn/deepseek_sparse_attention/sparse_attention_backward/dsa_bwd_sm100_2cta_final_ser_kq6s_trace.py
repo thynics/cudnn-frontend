@@ -4232,7 +4232,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     all tiles and stores through a two-round staged TMA epilogue.
     """
 
-    THREADS_PER_CTA = 672
+    THREADS_PER_CTA = 768
 
     # Warp roles (5 warps per named group where applicable).
     GATHER_WARPS = 4
@@ -6026,12 +6026,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # reduce warps (-8), which are off the critical path.  WATCH:
         # reduce LDL must not appear (that would feed the same storm).
         # HARD CONSTRAINT (v9_3.py:12440, setmaxregister deadlock on
-        # B300): the budget is the CTA LAUNCH allocation, 672 x 96 =
-        # 64,512, not the physical file.  128x48 + 160x64 + 128x136 +
-        # 256x112 = 62,464 <= 64,512. Register targets must be multiples
-        # of 8 for nvvm.setmaxregister.  (kq6s: warp 20 = dS relay.)
+        # B300): the budget is the CTA LAUNCH allocation, 768 x 96 =
+        # 73,728.  Per-SP steady budget: warps k, k+4, ... on one SP
+        # sum 48+136+112+112+64+40 = 512 <= 512 exactly.  Targets are
+        # multiples of 8.  (kq6s: warp 20 = dS relay; 21-23 idle to
+        # complete warpgroup 5 for the collective setmaxregister.)
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(48)
+        elif warp_idx >= Int32(self.DS_RELAY_WARP):
+            # Warpgroup 5 (warps 20..23): the dS relay plus three idle
+            # warps.  setmaxregister is warpgroup-collective, so the
+            # group must be complete (768 threads) and act together;
+            # 40 regs lands every SM sub-partition at exactly its
+            # 512-reg budget (472 + 40).
+            cute.arch.setmaxregister_decrease(40)
         elif warp_idx >= Int32(self.MMA_WARP):
             cute.arch.setmaxregister_decrease(64)
         else:

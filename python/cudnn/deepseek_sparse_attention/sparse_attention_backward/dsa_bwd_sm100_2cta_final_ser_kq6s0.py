@@ -4229,7 +4229,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     all tiles and stores through a two-round staged TMA epilogue.
     """
 
-    THREADS_PER_CTA = 672
+    THREADS_PER_CTA = 768
 
     # Warp roles (5 warps per named group where applicable).
     GATHER_WARPS = 4
@@ -6019,6 +6019,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # of 8 for nvvm.setmaxregister.
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(48)
+        elif warp_idx >= Int32(self.DS_RELAY_WARP):
+            # Warpgroup 5 (warps 20..23): the dS relay plus three idle
+            # warps.  setmaxregister is warpgroup-collective, so the
+            # group must be complete (768 threads) and act together;
+            # 40 regs lands every SM sub-partition at exactly its
+            # 512-reg budget (472 + 40).
+            cute.arch.setmaxregister_decrease(40)
         elif warp_idx >= Int32(self.MMA_WARP):
             cute.arch.setmaxregister_decrease(64)
         else:
