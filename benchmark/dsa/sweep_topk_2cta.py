@@ -112,6 +112,12 @@ def candidate_leg(case, topk: int, args):
         "cudnn.deepseek_sparse_attention.sparse_attention_backward."
         f"dsa_bwd_sm100_2cta_{args.impl}")
     impl_cls = getattr(impl_mod, args.class_name)
+    reduce_dephase_ns = getattr(args, "reduce_dephase_ns", None)
+    reduce_pace_ns = getattr(args, "reduce_pace_ns", None)
+    if reduce_dephase_ns is not None:
+        impl_cls.REDUCE_DEPHASE_NS = reduce_dephase_ns
+    if reduce_pace_ns is not None:
+        impl_cls.REDUCE_PACE_NS = reduce_pace_ns
 
     q, kv = case["q"], case["kv"]
     S_q, H, D = q.shape

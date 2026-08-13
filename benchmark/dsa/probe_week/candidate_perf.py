@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
+    parser.add_argument("--reduce-dephase-ns", type=int, default=None)
+    parser.add_argument("--reduce-pace-ns", type=int, default=None)
     parser.add_argument("--trace-out", type=Path, default=None)
     parser.add_argument("--trace-token", type=int, default=8)
     parser.add_argument("--trace-batch", type=int, default=0)
@@ -44,6 +46,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.reduce_dephase_ns is not None and args.reduce_dephase_ns < 0:
+        raise ValueError("reduce dephase must be non-negative")
+    if args.reduce_pace_ns is not None and args.reduce_pace_ns < 0:
+        raise ValueError("reduce pace must be non-negative")
     rows = []
     print(
         f"candidate-only impl={args.impl} class={args.class_name} "
