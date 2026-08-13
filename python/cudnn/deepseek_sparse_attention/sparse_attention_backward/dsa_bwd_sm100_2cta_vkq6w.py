@@ -6203,6 +6203,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         tile_count = (topk + Int32(self.N_TILE - 1)) // Int32(
             self.N_TILE
         )
+        # Every lane reads the same token length.  Keep the loop bound in the
+        # uniform register domain explicitly so role guards, loop IVs, and
+        # pipeline-state parity stay on UISETP/BRA.U after spill elimination.
+        tile_count = cute.arch.make_warp_uniform(tile_count)
 
         # kq6c register relayout 48/64/136/112 (single variable vs
         # kq6a's K1a 48/64/128/120).  Motivation (SASS adjudication
