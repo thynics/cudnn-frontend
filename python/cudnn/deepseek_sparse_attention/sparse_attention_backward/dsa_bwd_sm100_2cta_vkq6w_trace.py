@@ -268,9 +268,9 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 # boundaries mirror final_ser_kq6q_trace: waits are pure waits, T2R ends after
 # its TMEM fence, MATH_SOFTMAX ends before stores, split MATH_PD is inclusive
 # through its phase publish, and issue spans contain only tensor-core enqueues.
-# Keep 26 ranges plus four role marks and the V2 provenance mark within the
-# pipeline's 31-name budget.  The schema allows W18's relay role to remain
-# implicit; use that event slot for the distinct P/dS consumer wait instead.
+# Keep every range required by the current V2-native trace schema.  W18's
+# relay role is implicit, leaving 27 ranges, four role marks, and the V2
+# provenance mark.  This is the schema's 32-name contract on IKET 0.7.12.
 _LEAN_SPANS = (
     "LOAD_QDO",
     "LOAD_STATS",
@@ -293,6 +293,7 @@ _LEAN_SPANS = (
     "MATH_SOFTMAX(",
     "MATH_PDS_ACQ(",
     "PDS_WAIT(",
+    "GRAD_SUP_WAIT(",
     "MATH_STORE(",
     "MATH_BAR1(",
     "ROUTE_P(",
@@ -7659,7 +7660,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         packed_issue = issue_seq * Int32(8)
 
         # dV r0: ring dO0/dO1 quadrants x P blocks -> slot 0.
+        grad_sup_wait_token = _iket.range_start(
+            "GRAD_SUP_WAIT(i)", issue_seq
+        )
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
+        _iket.range_end(grad_sup_wait_token, issue_seq)
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
