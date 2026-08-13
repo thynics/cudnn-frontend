@@ -1851,6 +1851,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         round_index: cutlass.Constexpr[int],
         token_idx: Int32,
         batch_idx: Int32,
+        rank: Int32,
         mtx: Int32,
     ):
         """Store one rank-owned dQ round via SMEM staging + one bulk TMA.
@@ -1902,8 +1903,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             ),
             (None, None, (token_idx, batch_idx)),
         )
-        epi_rank = cute.arch.make_warp_uniform(_cluster_rank_now())
-        global_d_tile = Int32(round_index * 2) + epi_rank
+        global_d_tile = Int32(round_index * 2) + rank
         g_dq_tile = g_dq_tiles[
             None,
             None,
@@ -6686,7 +6686,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 if cute.arch.make_warp_uniform(
                     mtx // Int32(self.H_TILE_CTA)
                 ) == cute.arch.make_warp_uniform(
-                    _cluster_rank_now()
+                    cute.arch.block_idx_in_cluster()
                 ):
                     cute.copy(
                         tiled_copy_r2s,
@@ -6803,7 +6803,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 if cute.arch.make_warp_uniform(
                     mtx // Int32(self.H_TILE_CTA)
                 ) == cute.arch.make_warp_uniform(
-                    _cluster_rank_now()
+                    cute.arch.block_idx_in_cluster()
                 ):
                     cute.copy(
                         tiled_copy_r2s,
@@ -6870,6 +6870,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     0,
                     token_idx,
                     batch_idx,
+                    rank,
                     mtx,
                 )
                 _iket.range_end(dq_epi_0_token, Int32(0))
@@ -6887,6 +6888,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     1,
                     token_idx,
                     batch_idx,
+                    rank,
                     mtx,
                 )
                 _iket.range_end(dq_epi_1_token, Int32(1))
