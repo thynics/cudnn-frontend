@@ -343,6 +343,29 @@ _iket = _IketProxy()
 
 
 @dsl_user_op
+def _tail_warp_idx_now(*, loc=None, ip=None) -> Int32:
+    """Read CTA warp index at the final TMEM free without permitting CSE."""
+
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            (
+                "{\n\t"
+                ".reg .u32 tid;\n\t"
+                "mov.u32 tid, %tid.x;\n\t"
+                "shr.u32 $0, tid, 5;\n\t"
+                "}"
+            ),
+            "=r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _nanosleep_u32(
     ns: Int32,
     *,
@@ -4363,9 +4386,7 @@ def _free_tmem_from_rank_mailbox_v1(
 ) -> None:
     """Two-CTA TMEM free with rank rematerialized behind a JIT boundary."""
 
-    free_warp_idx = cute.arch.make_warp_uniform(
-        cute.arch.warp_idx()
-    )
+    free_warp_idx = cute.arch.make_warp_uniform(_tail_warp_idx_now())
     if free_warp_idx == Int32(allocator_warp_id):
         free_rank = cute.arch.make_warp_uniform(
             rank_mailbox_ptr.load()
