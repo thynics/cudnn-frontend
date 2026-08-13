@@ -2,13 +2,12 @@
 set -Eeuo pipefail
 
 repo="${DSA_REPO:-/home/scratch.longcheng_gpu/cudnn-frontend-thynics}"
-impl="${1:?usage: run_candidate_perf.sh IMPL [TOPKS [WARMUP [REPEAT [DEPHASE_NS [PACE_NS [GATHER_DEPHASE_NS]]]]]]}"
+impl="${1:?usage: run_candidate_perf.sh IMPL [TOPKS [WARMUP [REPEAT [DEPHASE_NS [PACE_NS]]]]]}"
 topks="${2:-2048}"
 warmup="${3:-20}"
 repeat="${4:-100}"
 dephase_ns="${5:-}"
 pace_ns="${6:-}"
-gather_dephase_ns="${7:-}"
 python_bin="/home/scratch.longcheng_gpu/cudnn-frontend/.venv/bin/python"
 
 cd -- "${repo}"
@@ -30,10 +29,6 @@ fi
 if [[ -n "${pace_ns}" ]]; then
   extra_args+=(--reduce-pace-ns "${pace_ns}")
 fi
-if [[ -n "${gather_dephase_ns}" ]]; then
-  extra_args+=(--gather-dephase-ns "${gather_dephase_ns}")
-fi
-
 exec "${python_bin}" benchmark/dsa/probe_week/candidate_perf.py \
   --impl "${impl}" \
   --topks "${topks}" \

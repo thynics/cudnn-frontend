@@ -114,13 +114,10 @@ def candidate_leg(case, topk: int, args):
     impl_cls = getattr(impl_mod, args.class_name)
     reduce_dephase_ns = getattr(args, "reduce_dephase_ns", None)
     reduce_pace_ns = getattr(args, "reduce_pace_ns", None)
-    gather_dephase_ns = getattr(args, "gather_dephase_ns", None)
     if reduce_dephase_ns is not None:
         impl_cls.REDUCE_DEPHASE_NS = reduce_dephase_ns
     if reduce_pace_ns is not None:
         impl_cls.REDUCE_PACE_NS = reduce_pace_ns
-    if gather_dephase_ns is not None:
-        impl_cls.GATHER_DEPHASE_NS = gather_dephase_ns
 
     q, kv = case["q"], case["kv"]
     S_q, H, D = q.shape

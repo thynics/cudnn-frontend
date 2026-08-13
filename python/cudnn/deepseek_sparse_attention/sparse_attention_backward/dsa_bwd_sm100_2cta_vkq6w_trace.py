@@ -78,8 +78,8 @@ Phase-2 REDG quiet-window contract (planned after the liveness gate):
 * P waits for both CTAs' fan-in, publishes/exchanges, waits for peer landing,
   then resumes reducers before dV producer-acquire/issue;
 * quiet_ack means "no further REDG issue", not "all prior atomics retired";
-* resume uses four reducer cohorts with 0/40/80/120 ns dephase while keeping
-  the existing 150 ns inter-chunk pacing, so the pause does not recreate a
+* resume uses four reducer cohorts with 0/80/160/240 ns dephase while keeping
+  100 ns inter-chunk pacing, so the pause does not recreate a
   synchronized atomic spike.
 
 The first implementation will not add a GPU-scope MEMBAR to strengthen ack:
@@ -92,9 +92,9 @@ final_ser_kq6s = final_ser_kq6f(r1) + B-plan true-K32 four-slot ring only
 unchanged.
 
 final_ser_kq6s = final_ser_kq6c + REDG BURST PACING only (single
-variable, concentration knife): a nanosleep.u32(REDUCE_PACE_NS=150)
-between the reducer atomic chunks stretches each 8-chunk burst
-~0.3us -> ~1.6us, cutting the in-flight REDG count from 23-29 to ~5.
+variable, concentration knife): a nanosleep.u32(REDUCE_PACE_NS=100)
+between reducer atomic chunks, plus four 80 ns-spaced cohorts, spreads
+each 8-chunk burst without pushing the reducer behind the producer.
 
 Why pacing instead of relocation (kq6e post-mortem, Smart traces):
 the gate moved burst-1 off the P phase but (a) burst-0 was never
@@ -103,13 +103,15 @@ home slowed dV/ring (+0.27), netting +0.16 per tile.  Geometry says
 there is NO storm-free 2.4us corridor at this period; the damage is
 superlinear in concentration (LDL 11 -> 327ns under 23-29 in-flight),
 so thinning the rain benefits every window at once, no corridor
-needed.  Budget: 2x8x(150+~40)ns + T2R/waits ~= 4.0us < 5.6us period.
+needed.  Budget: 2x8x(100+~40)ns + cohort offsets + T2R/waits stays
+below the 5.6us period.
 
 Pre-registered acceptance: P steady (Smart) 0.74 -> <=0.45 AND
 dV/ROUND waits NOT worse than kq6c; wall -2..4%.  If P recovers but
 grads still degrade -> L2 bandwidth (not queue depth) is binding,
-escalate to REDG volume reduction.  Tune REDUCE_PACE_NS (100/150/250)
-before concluding.
+escalate to REDG volume reduction.  B200 A/B selected 100 ns pacing and
+80 ns cohort spacing; 75/100/125 ns pacing formed the fast plateau while
+120 ns cohort spacing crossed the reducer-lag cliff.
 
 Below: the kq6c build docstring.
 
@@ -477,19 +479,13 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     KV_GROUP_SIZE = 8
     KV_NUM_GROUPS = KV_LOAD_THREADS // KV_GROUP_SIZE
     TMEM_COLUMNS = 512
-    # kq6s: inter-chunk pacing (ns) for the reducer atomic bursts.
-    # 8 chunks x ~(pace+issue) stretches one burst ~0.3us -> ~1.6us,
-    # cutting in-flight REDG ~5x.  Budget: 2 bursts x 8 x ~190ns +
-    # T2R/waits ~= 4.0us < 5.6us period -- the reducer keeps up.
-    REDUCE_PACE_NS = 150
-    # Four cohorts of four reducer warps start each burst 40 ns apart.  This
+    # Inter-chunk pacing (ns) for reducer atomic bursts.  B200 A/B found a
+    # stable 75..125 ns fast plateau; 100 ns keeps margin on both sides.
+    REDUCE_PACE_NS = 100
+    # Four cohorts of four reducer warps start each burst 80 ns apart.  This
     # prevents the two CTAs from rebuilding one synchronized REDG spike after
-    # every pipeline wait while preserving the established chunk pacing.
-    REDUCE_DEPHASE_NS = 40
-    # Optional A/B knob: stagger the four gather warps immediately after a
-    # kscore acquire to break long contiguous LDGSTS/STS issue bursts.  Zero
-    # preserves the release path; benchmark harnesses may specialize it.
-    GATHER_DEPHASE_NS = 0
+    # every pipeline wait without reaching the 120 ns reducer-lag cliff.
+    REDUCE_DEPHASE_NS = 80
     MAX_SMEM_BYTES = 232_448
     QUADRANT_ELEMENTS = H_TILE_CTA * N_TILE_CTA
     QUADRANT_BYTES = QUADRANT_ELEMENTS * (BFloat16.width // 8)
@@ -6222,10 +6218,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     Int32(0),
                 )
                 pipe_kscore.producer_acquire(gather_state)
-                if cutlass.const_expr(self.GATHER_DEPHASE_NS > 0):
-                    _nanosleep_u32(
-                        warp_idx * Int32(self.GATHER_DEPHASE_NS)
-                    )
                 self._load_score_kv(
                     mKV,
                     mTopkIdxs,
@@ -6264,10 +6256,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         score_iter,
                     )
                     pipe_kscore.producer_acquire(gather_state)
-                    if cutlass.const_expr(self.GATHER_DEPHASE_NS > 0):
-                        _nanosleep_u32(
-                            warp_idx * Int32(self.GATHER_DEPHASE_NS)
-                        )
                     _iket.range_end(rk_acq_token, score_iter)
                     self._gather_kdq_kq(
                         mKV,
@@ -6297,10 +6285,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             next_iter,
                         )
                         pipe_kscore.producer_acquire(gather_state)
-                        if cutlass.const_expr(self.GATHER_DEPHASE_NS > 0):
-                            _nanosleep_u32(
-                                warp_idx * Int32(self.GATHER_DEPHASE_NS)
-                            )
                         self._load_score_kv(
                             mKV,
                             mTopkIdxs,
