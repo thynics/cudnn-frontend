@@ -78,7 +78,7 @@ Phase-2 REDG quiet-window contract (planned after the liveness gate):
 * P waits for both CTAs' fan-in, publishes/exchanges, waits for peer landing,
   then resumes reducers before dV producer-acquire/issue;
 * quiet_ack means "no further REDG issue", not "all prior atomics retired";
-* resume uses four reducer cohorts with 0/80/160/240 ns dephase while keeping
+* resume uses four reducer cohorts with 0/90/180/270 ns dephase while keeping
   100 ns inter-chunk pacing, so the pause does not recreate a
   synchronized atomic spike.
 
@@ -93,7 +93,7 @@ unchanged.
 
 final_ser_kq6s = final_ser_kq6c + REDG BURST PACING only (single
 variable, concentration knife): a nanosleep.u32(REDUCE_PACE_NS=100)
-between reducer atomic chunks, plus four 80 ns-spaced cohorts, spreads
+between reducer atomic chunks, plus four 90 ns-spaced cohorts, spreads
 each 8-chunk burst without pushing the reducer behind the producer.
 
 Why pacing instead of relocation (kq6e post-mortem, Smart traces):
@@ -110,8 +110,8 @@ Pre-registered acceptance: P steady (Smart) 0.74 -> <=0.45 AND
 dV/ROUND waits NOT worse than kq6c; wall -2..4%.  If P recovers but
 grads still degrade -> L2 bandwidth (not queue depth) is binding,
 escalate to REDG volume reduction.  B200 A/B selected 100 ns pacing and
-80 ns cohort spacing; 75/100/125 ns pacing formed the fast plateau while
-120 ns cohort spacing crossed the reducer-lag cliff.
+90 ns cohort spacing; 90/100 ns spacing formed the fast plateau while
+120 ns crossed the reducer-lag cliff.
 
 Below: the kq6c build docstring.
 
@@ -483,10 +483,10 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     # Inter-chunk pacing (ns) for reducer atomic bursts.  B200 A/B found a
     # stable 75..125 ns fast plateau; 100 ns keeps margin on both sides.
     REDUCE_PACE_NS = 100
-    # Four cohorts of four reducer warps start each burst 80 ns apart.  This
+    # Four cohorts of four reducer warps start each burst 90 ns apart.  This
     # prevents the two CTAs from rebuilding one synchronized REDG spike after
     # every pipeline wait without reaching the 120 ns reducer-lag cliff.
-    REDUCE_DEPHASE_NS = 80
+    REDUCE_DEPHASE_NS = 90
     MAX_SMEM_BYTES = 232_448
     QUADRANT_ELEMENTS = H_TILE_CTA * N_TILE_CTA
     QUADRANT_BYTES = QUADRANT_ELEMENTS * (BFloat16.width // 8)
