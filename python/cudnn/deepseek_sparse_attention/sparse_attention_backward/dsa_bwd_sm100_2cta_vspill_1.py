@@ -4589,15 +4589,26 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         """Fill round-0 dO into the two halves of ``score_kv``.
 
         All four gather warps call this helper.  Rank 0 uses warp 0 as a
-        deterministic local-then-peer issuer, while rank 1 retains separate
-        warp-0 local and warp-1 peer issuers.  This removes the measured rank-0
-        request burst without adding a rendezvous to either CTA.  The existing
-        gather barriers still publish launch and completion before the
-        collective kscore producer commit.
+        deterministic peer-then-local issuer, while rank 1 retains separate
+        warp-0 local and warp-1 peer issuers.  This keeps the rank-0 requests
+        de-bursted without placing its latency-critical peer transfer behind
+        the local bulk copy.  The existing gather barriers still publish
+        launch and completion before the collective kscore producer commit.
         """
 
         if warp_idx == Int32(0):
             if rank == Int32(0):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        loan_tma_mbars + 1,
+                        grad_a_stage_bytes,
+                    )
+                cute.copy(
+                    tma_atom_dot,
+                    t_dot_gmem[None, 0, 1],
+                    t_dot_loan_smem_b[None, 0],
+                    tma_bar_ptr=loan_tma_mbars + 1,
+                )
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         loan_tma_mbars,
@@ -4610,16 +4621,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         grad_a_stage_bytes,
                         rank,
                     )
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        loan_tma_mbars + 1,
-                        grad_a_stage_bytes,
-                    )
-                cute.copy(
-                    tma_atom_dot,
-                    t_dot_gmem[None, 0, 1],
-                    t_dot_loan_smem_b[None, 0],
-                    tma_bar_ptr=loan_tma_mbars + 1,
-                )
             else:
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
