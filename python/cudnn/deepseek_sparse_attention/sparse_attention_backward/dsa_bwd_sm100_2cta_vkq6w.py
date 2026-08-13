@@ -343,23 +343,6 @@ _iket = _IketProxy()
 
 
 @dsl_user_op
-def _cluster_rank_now(*, loc=None, ip=None) -> Int32:
-    """Read cluster rank at its use site; side effects prevent LICM/CSE."""
-
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [],
-            "mov.u32 $0, %cluster_ctarank;",
-            "=r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def _nanosleep_u32(
     ns: Int32,
     *,
@@ -4559,6 +4542,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             khot_seq: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
+            tmem_rank_mailbox: cutlass.Int32
 
             stationary_q: cute.struct.Align[
                 cute.struct.MemRange[element_dtype, 32768],
@@ -5392,6 +5376,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         tmem_holding_buf_ptr = storage.tmem_holding_buf.ptr
+        tmem_rank_mailbox_ptr = storage.tmem_rank_mailbox.ptr
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar.ptr
         stationary_tma_mbars = storage.stationary_tma_mbars.data_ptr()
         stationary_ready_mbar = storage.stationary_ready_mbar.data_ptr()
@@ -6112,6 +6097,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(loan_tma_mbars + 1, 1)
             cute.arch.mbarrier_init(loan_epi_safe_mbar, 1)
             _store_shared_seq_v4(khot_seq, Int32(0))
+            tmem_rank_mailbox_ptr.store(rank)
         cute.arch.fence_view_async_shared()
         self.cta_barrier.arrive_and_wait()
 
@@ -6133,7 +6119,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         tmem.allocate(self.TMEM_COLUMNS)
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-
         score_c_layout = score_tiled_mma.make_fragment_C(
             score_tiled_mma.partition_shape_C(
                 (self.H_TILE_CLUSTER, self.N_TILE)
@@ -7512,11 +7497,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         self.cta_barrier.arrive_and_wait()
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
-        # Inline TmemAllocator.free so cluster rank is read only after the
-        # final joins.  The stock helper's pure rank intrinsic is otherwise
-        # LICM'd through every role and creates one kernel-wide stack phi.
+        # Inline TmemAllocator.free and reload rank from the dedicated SMEM
+        # mailbox.  The initialization CTA join makes the early store visible;
+        # rank therefore has no SSA live range through any compute role.
         if warp_idx == Int32(self.MATH_WARP_BEGIN):
-            free_rank = cute.arch.make_warp_uniform(_cluster_rank_now())
+            free_rank = cute.arch.make_warp_uniform(
+                tmem_rank_mailbox_ptr.load()
+            )
             cute.arch.mbarrier_arrive(
                 tmem_dealloc_mbar_ptr,
                 free_rank ^ Int32(1),
