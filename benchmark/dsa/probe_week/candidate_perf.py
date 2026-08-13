@@ -5,11 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 
-DSA_BENCH_DIR = Path(__file__).resolve().parents[1]
+OWN_REPO_ROOT = Path(__file__).resolve().parents[3]
+SOURCE_REPO_ROOT = Path(
+    os.environ.get("DSA_SOURCE_REPO", str(OWN_REPO_ROOT))
+).resolve()
+DSA_BENCH_DIR = SOURCE_REPO_ROOT / "benchmark" / "dsa"
+sys.path.insert(0, str(SOURCE_REPO_ROOT / "python"))
 sys.path.insert(0, str(DSA_BENCH_DIR))
 
 import torch
