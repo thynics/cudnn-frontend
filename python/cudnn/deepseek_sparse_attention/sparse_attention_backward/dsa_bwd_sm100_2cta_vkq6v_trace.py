@@ -256,15 +256,18 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 # boundaries mirror final_ser_kq6q_trace: waits are pure waits, T2R ends after
 # its TMEM fence, MATH_SOFTMAX ends before stores, split MATH_PD is inclusive
 # through its phase publish, and issue spans contain only tensor-core enqueues.
-# CuTe DSL 4.6.1 accepts 29 registered IKET names.  Keep 23 ranges plus
-# the five role marks and V2 provenance mark; the redundant WAIT_P,
-# WAIT_dP, and WAIT_dS_dK envelopes are intentionally filtered out.
+# Keep 25 ranges plus the five role marks and V2 provenance mark within
+# the pipeline's 31-name budget.  Redundant WAIT_* envelopes are retired
+# in favor of the credit/completion decomposition RK_ACQ/MAT_ACQ/MAT_WAIT.
 _LEAN_SPANS = (
     "LOAD_QDO",
     "LOAD_STATS",
     "LOAD_K(",
     "ROUTE_K(",
+    "RK_ACQ(",
     "MAT_QDO(",
+    "MAT_ACQ(",
+    "MAT_WAIT(",
     "REDUCE_ATOMIC(",
     "REDUCE_T2R(",
     "DQ_EPI(",
@@ -273,7 +276,6 @@ _LEAN_SPANS = (
     "dP_ISSUE(",
     "dVdK_ISSUE(",
     "dQ_ISSUE(",
-    "WAIT_S(",
     "T2R_S(",
     "MATH_PD(",
     "MATH_SOFTMAX(",
@@ -6192,7 +6194,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         "ROUTE_K(i)",
                         score_iter,
                     )
+                    rk_acq_token = _iket.range_start(
+                        "RK_ACQ(i)",
+                        score_iter,
+                    )
                     pipe_kscore.producer_acquire(gather_state)
+                    _iket.range_end(rk_acq_token, score_iter)
                     self._gather_kdq_kq(
                         mKV,
                         mTopkIdxs,
@@ -6504,12 +6511,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # send + landing) is ~2.6-3.6us, while the dP shadow is
                 # only ~0.35us -- the residue is the serial build's
                 # dominant structural bubble, gated at relay 0.
-                wait_s_token = _iket.range_start(
-                    "WAIT_S(i)",
-                    loop_iter,
-                )
                 pipe_s_done.consumer_wait(s_state)
-                _iket.range_end(wait_s_token, loop_iter)
                 t2r_s_token = _iket.range_start(
                     "T2R_S(i)",
                     loop_iter,
@@ -7131,7 +7133,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             # K32 GMEM coordinate order: k_half 1 is the
                             # original panel's second band at +32 H.
                             source_h32 = 2 * h_half + k_half
+                            # q6v has 16 true K32 generations/tile; keep
+                            # credit payloads one-to-one as 16*i + q.
+                            mat_acq_token = _iket.range_start(
+                                "MAT_ACQ(m,q)",
+                                loop_iter
+                                * Int32(self.ROUND_GENS_PER_TILE)
+                                + Int32(micro_gen),
+                            )
                             pipe_round.producer_acquire(round_acq)
+                            _iket.range_end(
+                                mat_acq_token,
+                                loop_iter
+                                * Int32(self.ROUND_GENS_PER_TILE)
+                                + Int32(micro_gen),
+                            )
                             round_acq.advance()
                             with cute.arch.elect_one():
                                 cute.arch.mbarrier_arrive_and_expect_tx(
@@ -7368,9 +7384,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     self.ROUND_GENS_PER_TILE
                 ):
                     round_slot = micro_gen % self.ROUND_STAGES
+                    # Same 16*i+q identity as MAT_ACQ.  This span is only
+                    # the raw fill-completion wait; phase flip and pipeline
+                    # commit intentionally remain outside it.
+                    mat_wait_token = _iket.range_start(
+                        "MAT_WAIT(m,q)",
+                        loop_iter * Int32(self.ROUND_GENS_PER_TILE)
+                        + Int32(micro_gen),
+                    )
                     cute.arch.mbarrier_wait(
                         round_tma_mbars + round_slot,
                         w19_phase[round_slot],
+                    )
+                    _iket.range_end(
+                        mat_wait_token,
+                        loop_iter * Int32(self.ROUND_GENS_PER_TILE)
+                        + Int32(micro_gen),
                     )
                     w19_phase[round_slot] = (
                         Int32(1) - w19_phase[round_slot]
