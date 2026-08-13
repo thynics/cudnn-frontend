@@ -219,6 +219,8 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 # its TMEM fence, math ends before the first store, and issue spans contain
 # only tensor-core enqueue paths.
 _LEAN_SPANS = (
+    "LOAD_K(",
+    "REDUCE_ATOMIC(",
     "S_ISSUE(",
     "dP_ISSUE(",
     "dVdK_ISSUE(",
@@ -6183,6 +6185,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             gather_kd_rows_1 = self._kd_round_rows_v2(kdq_loan[1])
             if tile_count > Int32(0):
                 # Prologue: K(0).
+                load_k_token = _iket.range_start(
+                    "LOAD_K(i)",
+                    Int32(0),
+                )
                 pipe_kscore.producer_acquire(gather_state)
                 self._load_score_kv(
                     mKV,
@@ -6202,6 +6208,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.arch.fence_view_async_shared()
                 pipe_kscore.producer_commit(gather_state)
                 gather_state.advance()
+                _iket.range_end(load_k_token, Int32(0))
 
                 # vkq6t steady state: score_kv holds ONE kscore
                 # generation per tile (score K only).  The next tile's
@@ -6221,6 +6228,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 ):
                     if score_iter != tile_count - Int32(1):
                         next_iter = score_iter + Int32(1)
+                        load_k_token = _iket.range_start(
+                            "LOAD_K(i)",
+                            next_iter,
+                        )
                         pipe_kscore.producer_acquire(gather_state)
                         self._load_score_kv(
                             mKV,
@@ -6240,6 +6251,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         cute.arch.fence_view_async_shared()
                         pipe_kscore.producer_commit(gather_state)
                         gather_state.advance()
+                        _iket.range_end(load_k_token, next_iter)
 
                     for _ in cutlass.range_constexpr(self.ROUND_DV_GENS):
                         gather_ring_com.advance()
@@ -7944,6 +7956,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         release_state.advance()
 
         assert cute.size(thread_values_0) == self.N_TILE // 2
+        reduce_atomic_token = _iket.range_start(
+            "REDUCE_ATOMIC(i,r)",
+            packed_issue,
+        )
         sub_tile_idx_0 = rank
         sub_tile_idx_1 = Int32(2) + rank
         for i in cutlass.range_constexpr(8):
@@ -7974,6 +7990,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
             # kq6s: pace the burst (concentration knife).
             _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
+        _iket.range_end(reduce_atomic_token, packed_issue)
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7983,6 +8000,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         done_pipeline.consumer_release(release_state)
         release_state.advance()
 
+        reduce_atomic_token_1 = _iket.range_start(
+            "REDUCE_ATOMIC(i,r)",
+            packed_issue + Int32(1),
+        )
         for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
             rdkv_frg_1 = cute.make_rmem_tensor(
@@ -8011,6 +8032,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
             # kq6s: pace the burst (concentration knife).
             _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
+        _iket.range_end(
+            reduce_atomic_token_1,
+            packed_issue + Int32(1),
+        )
         return wait_state, release_state
 
 
