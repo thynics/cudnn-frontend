@@ -332,6 +332,23 @@ _iket = _IketProxy()
 
 
 @dsl_user_op
+def _cluster_rank_now(*, loc=None, ip=None) -> Int32:
+    """Read cluster rank at its use site; side effects prevent LICM/CSE."""
+
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "mov.u32 $0, %cluster_ctarank;",
+            "=r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _nanosleep_u32(
     ns: Int32,
     *,
@@ -1834,7 +1851,6 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
         round_index: cutlass.Constexpr[int],
         token_idx: Int32,
         batch_idx: Int32,
-        rank: Int32,
         mtx: Int32,
     ):
         """Store one rank-owned dQ round via SMEM staging + one bulk TMA.
@@ -1869,9 +1885,8 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
                 head = Int32(
                     cute.get(thread_coordinates[value_index], mode=[1])
                 )
-                local_d = d_in_round - rank * Int32(
-                    self.D_TILE_CTA
-                )
+                # rank_coordinates already select this CTA's D128 half.
+                local_d = d_in_round % Int32(self.D_TILE_CTA)
                 s_dq_epi[
                     head,
                     local_d,
@@ -1887,7 +1902,8 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             ),
             (None, None, (token_idx, batch_idx)),
         )
-        global_d_tile = Int32(round_index * 2) + rank
+        epi_rank = cute.arch.make_warp_uniform(_cluster_rank_now())
+        global_d_tile = Int32(round_index * 2) + epi_rank
         g_dq_tile = g_dq_tiles[
             None,
             None,
@@ -6670,7 +6686,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 if cute.arch.make_warp_uniform(
                     mtx // Int32(self.H_TILE_CTA)
                 ) == cute.arch.make_warp_uniform(
-                    cute.arch.block_idx_in_cluster()
+                    _cluster_rank_now()
                 ):
                     cute.copy(
                         tiled_copy_r2s,
@@ -6787,7 +6803,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 if cute.arch.make_warp_uniform(
                     mtx // Int32(self.H_TILE_CTA)
                 ) == cute.arch.make_warp_uniform(
-                    cute.arch.block_idx_in_cluster()
+                    _cluster_rank_now()
                 ):
                     cute.copy(
                         tiled_copy_r2s,
@@ -6854,7 +6870,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     0,
                     token_idx,
                     batch_idx,
-                    rank,
                     mtx,
                 )
                 _iket.range_end(dq_epi_0_token, Int32(0))
@@ -6872,7 +6887,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     1,
                     token_idx,
                     batch_idx,
-                    rank,
                     mtx,
                 )
                 _iket.range_end(dq_epi_1_token, Int32(1))
@@ -7485,7 +7499,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         self.cta_barrier.arrive_and_wait()
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
-        tmem.free(tmem_ptr)
+        # Inline TmemAllocator.free so cluster rank is read only after the
+        # final joins.  The stock helper's pure rank intrinsic is otherwise
+        # LICM'd through every role and creates one kernel-wide stack phi.
+        if warp_idx == Int32(self.MATH_WARP_BEGIN):
+            free_rank = cute.arch.make_warp_uniform(_cluster_rank_now())
+            cute.arch.mbarrier_arrive(
+                tmem_dealloc_mbar_ptr,
+                free_rank ^ Int32(1),
+            )
+            cute.arch.mbarrier_wait(
+                tmem_dealloc_mbar_ptr,
+                Int32(0),
+            )
+            cute.arch.dealloc_tmem(
+                tmem_ptr,
+                self.TMEM_COLUMNS,
+                is_two_cta=True,
+            )
 
     @cute.jit
     def _issue_score_v2(
