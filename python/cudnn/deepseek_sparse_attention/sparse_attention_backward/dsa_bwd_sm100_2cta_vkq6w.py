@@ -1903,8 +1903,9 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
                 head = Int32(
                     cute.get(thread_coordinates[value_index], mode=[1])
                 )
-                # rank_coordinates already select this CTA's D128 half.
-                local_d = d_in_round % Int32(self.D_TILE_CTA)
+                local_d = d_in_round - rank * Int32(
+                    self.D_TILE_CTA
+                )
                 s_dq_epi[
                     head,
                     local_d,
