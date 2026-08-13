@@ -20,6 +20,32 @@ torch2cute_dtype_map = {
 }
 
 
+def _resolve_backward_implementation(
+    implementation: str,
+    q: torch.Tensor,
+    head_dim_v: int,
+    topk_max: int,
+):
+    if implementation == "sm100":
+        return FlashAttentionDSABackwardSm100
+    if implementation == "sm100_2_cta":
+        major, minor = torch.cuda.get_device_capability(q.device)
+        if (major, minor) != (10, 0):
+            raise RuntimeError(f"implementation='sm100_2_cta' requires SM100, found SM{major}{minor}")
+        if q.dtype != torch.bfloat16:
+            raise ValueError("implementation='sm100_2_cta' requires bfloat16 inputs")
+        if q.shape[1] != 128:
+            raise ValueError(f"implementation='sm100_2_cta' requires 128 Q heads, got {q.shape[1]}")
+        if q.shape[2] != 512 or head_dim_v != 512:
+            raise ValueError("implementation='sm100_2_cta' requires head_dim=head_dim_v=512, " f"got head_dim={q.shape[2]}, head_dim_v={head_dim_v}")
+        if topk_max <= 0 or topk_max % 64 != 0:
+            raise ValueError("implementation='sm100_2_cta' requires a positive topk width divisible by 64, " f"got {topk_max}")
+        from .dsa_bwd_sm100_2_cta import FlashAttentionDSABackwardSm100TwoCTA
+
+        return FlashAttentionDSABackwardSm100TwoCTA
+    raise ValueError(f"Unsupported SM100 DSA backward implementation {implementation!r}; " "expected 'sm100' or 'sm100_2_cta'")
+
+
 def flash_attn_bwd_sm100(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -33,6 +59,8 @@ def flash_attn_bwd_sm100(
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
     current_stream=None,
+    *,
+    implementation: str = "sm100",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
@@ -51,6 +79,8 @@ def flash_attn_bwd_sm100(
         topk_length: (total_S_q,) int32, per-query valid count, optional
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
+        implementation: ``"sm100"`` by default; ``"sm100_2_cta"`` opts in
+            to the two-CTA implementation
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -94,6 +124,8 @@ def flash_attn_bwd_sm100(
     block_tile = 64
     num_head_blocks = (num_head + block_tile - 1) // block_tile
     batch_size = 1
+    max_topk = topk_idxs.shape[1]
+    impl_cls = _resolve_backward_implementation(implementation, q, head_dim_v, max_topk)
 
     current_stream = resolve_stream(current_stream)
 
@@ -136,7 +168,7 @@ def flash_attn_bwd_sm100(
 
         # Allocate workspace tensors
         acc_dtype = cutlass.Float32
-        ws_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
+        ws_lse_odo_shape = impl_cls._get_workspace_size_LSE_OdO(
             total_S_q,
             head_dim,
             num_head,
@@ -149,7 +181,7 @@ def flash_attn_bwd_sm100(
             device=device,
         )
 
-        ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
+        ws_dkv_shape = impl_cls._get_workspace_size_dKV(
             total_S_kv,
             head_dim,
             batch_size,
@@ -166,8 +198,7 @@ def flash_attn_bwd_sm100(
     dtype = torch2cute_dtype_map[q.dtype]
 
     has_topk_length = topk_length is not None
-    max_topk = topk_idxs.shape[1]
-    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
+    compile_key = (implementation, dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
@@ -184,7 +215,7 @@ def flash_attn_bwd_sm100(
         workspace_LSE_OdO_tensor = to_cute_tensor(workspace_LSE_OdO)
         workspace_dKV_tensor = to_cute_tensor(workspace_dKV)
 
-        kernel_obj = FlashAttentionDSABackwardSm100(
+        kernel_obj = impl_cls(
             element_dtype=dtype,
             head_dim=head_dim,
             head_dim_v=head_dim_v,

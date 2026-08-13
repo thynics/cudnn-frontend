@@ -19,6 +19,8 @@ from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
 
+_SUPPORTED_IMPLEMENTATIONS = ("sm100", "sm100_2_cta")
+
 
 class SparseAttentionBackward(APIBase):
     def __init__(
@@ -35,6 +37,8 @@ class SparseAttentionBackward(APIBase):
         sample_topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         block_tile: int = 64,
+        *,
+        implementation: str = "sm100",
     ):
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -47,12 +51,12 @@ class SparseAttentionBackward(APIBase):
         self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
         self.block_tile = int(block_tile)
         self.softmax_scale = softmax_scale
+        self.implementation = implementation
 
     def check_support(self) -> bool:
-        major, _ = torch.cuda.get_device_capability()
-        self._runtime_error_if(
-            major < 9,
-            f"SparseAttentionBackward requires SM90+, found SM{major}",
+        self._value_error_if(
+            self.implementation not in _SUPPORTED_IMPLEMENTATIONS,
+            f"implementation must be one of {_SUPPORTED_IMPLEMENTATIONS}, got {self.implementation!r}",
         )
         self._value_error_if(
             self.q_desc.ndim != 3,
@@ -102,6 +106,11 @@ class SparseAttentionBackward(APIBase):
             any(desc.device != ref_device for desc in descriptors),
             f"All inputs must share Q's device {ref_device}, got {[desc.device for desc in descriptors]}",
         )
+        major, minor = torch.cuda.get_device_capability(ref_device)
+        self._runtime_error_if(
+            major < 9,
+            f"SparseAttentionBackward requires SM90+, found SM{major}",
+        )
 
         # Cross-tensor shape contract: every companion tensor is indexed with
         # coordinates derived from Q, so a mismatched shape silently reads or
@@ -146,6 +155,33 @@ class SparseAttentionBackward(APIBase):
                 f"topk_length must have shape {(total_s_q,)}, got {self.topk_length_desc.shape}",
             )
 
+        if self.implementation == "sm100_2_cta":
+            self._runtime_error_if(
+                (major, minor) != (10, 0),
+                f"implementation='sm100_2_cta' requires SM100, found SM{major}{minor}",
+            )
+            self._value_error_if(
+                self.q_desc.dtype != torch.bfloat16,
+                "implementation='sm100_2_cta' requires bfloat16 inputs",
+            )
+            self._value_error_if(
+                num_heads != 128,
+                f"implementation='sm100_2_cta' requires 128 Q heads, got {num_heads}",
+            )
+            self._value_error_if(
+                head_dim != 512,
+                f"implementation='sm100_2_cta' requires head_dim=512, got {head_dim}",
+            )
+            self._value_error_if(
+                self.block_tile != 64,
+                f"implementation='sm100_2_cta' requires block_tile=64, got {self.block_tile}",
+            )
+            topk_max = self.topk_idxs_desc.shape[1]
+            self._value_error_if(
+                topk_max <= 0 or topk_max % 64 != 0,
+                "implementation='sm100_2_cta' requires a positive topk width divisible by 64, " f"got {topk_max}",
+            )
+
         self._is_supported = True
         return True
 
@@ -170,9 +206,11 @@ class SparseAttentionBackward(APIBase):
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        major, _ = torch.cuda.get_device_capability()
+        major, _ = torch.cuda.get_device_capability(q.device)
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
         if major == 9:
+            if self.implementation == "sm100_2_cta":
+                raise RuntimeError("implementation='sm100_2_cta' requires SM100")
             from . import _interface_sm90 as _iface_sm90
 
             return _iface_sm90.flash_attn_bwd_sm90(
@@ -203,6 +241,7 @@ class SparseAttentionBackward(APIBase):
             dq=dq,
             dkv=dkv,
             current_stream=current_stream,
+            implementation=self.implementation,
         )
 
 
@@ -223,13 +262,18 @@ def sparse_attention_backward_wrapper(
     dkv: Optional[torch.Tensor] = None,
     block_tile: int = 64,
     stream: Optional[cuda.CUstream] = None,
+    *,
+    implementation: str = "sm100",
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
-    Dispatches to SM90 or SM100 based on the active CUDA device. The returned
-    ``d_sink`` is computed from ``attn_sink`` and ``dout``.
+    Dispatches to SM90 or SM100 based on the active CUDA device. On SM100,
+    ``implementation="sm100_2_cta"`` explicitly opts in to the two-CTA
+    implementation; the default always uses the original SM100 implementation.
+    The returned ``d_sink`` is computed from ``attn_sink`` and ``dout``.
     """
     key = (
+        q.device,
         q.dtype,
         q.shape,
         kv.shape,
@@ -241,6 +285,7 @@ def sparse_attention_backward_wrapper(
         topk_length is not None,
         int(block_tile),
         softmax_scale,
+        implementation,
     )
     obj = _cache_of_SparseAttentionBackwardObjects.get(key)
     if obj is None:
@@ -255,6 +300,7 @@ def sparse_attention_backward_wrapper(
             sample_topk_length=topk_length,
             softmax_scale=softmax_scale,
             block_tile=block_tile,
+            implementation=implementation,
         )
         assert obj.check_support()
         obj.compile()
