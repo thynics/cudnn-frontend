@@ -28,6 +28,22 @@ unset DSA_DEV_IKET DKG_IKET_INSTRUMENTATION_METHOD IKET_STANDALONE_SITE_PACKAGES
 printf 'SPILL_CAPTURE_ENV DSA_BL_KSTAGE2=%s CUTE_DSL_NO_CACHE=%s\n' \
   "${DSA_BL_KSTAGE2}" "${CUTE_DSL_NO_CACHE}"
 
+"${python_bin}" - <<'PY'
+import os
+from cudnn.deepseek_sparse_attention.sparse_attention_backward import dsa_bwd_sm100
+
+kernel = dsa_bwd_sm100.FlashAttentionDSABackwardSm100(512, 512, 64, 2048)
+kernel._setup_attributes()
+print(
+    "SPILL_CAPTURE_IMPORT",
+    dsa_bwd_sm100.__file__,
+    "env=", os.environ.get("DSA_BL_KSTAGE2"),
+    "kstage2=", kernel.load_mma_K_kstage2,
+    "k_stage=", kernel.load_mma_K_stage,
+    flush=True,
+)
+PY
+
 exec "${python_bin}" benchmark/dsa/sweep_topk_2cta.py \
   --impl vkq6v \
   --topks 2048 \
