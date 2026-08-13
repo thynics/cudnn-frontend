@@ -1,9 +1,8 @@
-"""Trace-safe structural twin of vkq6t.
+"""Lean-IKET structural twin of vkq6t.
 
-The release and trace control flow are byte-structurally identical in the
-first liveness gate.  Lean IKET ranges are intentionally deferred until the
-640-thread/20-generation protocol passes correctness; this prevents the old
-768-thread trace twin from reintroducing the deadlock during validation.
+The trace twin preserves the release kernel's 640-thread/20-generation
+protocol and adds only the decision-grade kq6q span set plus role/provenance
+marks.  The uninstrumented release remains the authority for performance.
 
 vkq6t is the liveness-first, performance-preserving rebuild of kq6s.
 It keeps the useful kq6s mechanism -- score_kv carries score-K only and
@@ -212,6 +211,62 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05, warp
 from cutlass.cute.typing import BFloat16, Float32, Int32
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
+
+
+# Only decision-grade spans reach the device.  Rejected names return a null
+# token, so their matching range_end also emits no annotation.  The selected
+# boundaries mirror final_ser_kq6q_trace: waits are pure waits, T2R ends after
+# its TMEM fence, math ends before the first store, and issue spans contain
+# only tensor-core enqueue paths.
+_LEAN_SPANS = (
+    "S_ISSUE(",
+    "dP_ISSUE(",
+    "dVdK_ISSUE(",
+    "dQ_ISSUE(",
+    "WAIT_RELAY(",
+    "WAIT_S(",
+    "T2R_S(",
+    "P_MATH(",
+    "MATH_PDS_ACQ(",
+    "P_PUBLISH(",
+    "WAIT_dP(",
+    "T2R_dP(",
+    "DS_MATH(",
+    "DS_PUBLISH(",
+)
+
+
+class _IketProxy:
+    """Forward selected annotations to IKET and no-op without the API."""
+
+    @staticmethod
+    def _api():
+        experimental = getattr(cute, "experimental", None)
+        return getattr(experimental, "iket", None)
+
+    @classmethod
+    def mark(cls, *args):
+        api = cls._api()
+        return None if api is None else api.mark(*args)
+
+    @classmethod
+    def range_start(cls, *args):
+        api = cls._api()
+        if api is None:
+            return None
+        if args and isinstance(args[0], str) and not args[0].startswith(_LEAN_SPANS):
+            return None
+        return api.range_start(*args)
+
+    @classmethod
+    def range_end(cls, *args):
+        api = cls._api()
+        if api is None or (args and args[0] is None):
+            return None
+        return api.range_end(*args)
+
+
+_iket = _IketProxy()
 
 
 @dsl_user_op
@@ -4948,6 +5003,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         accumulate: cutlass.Boolean,
         round_pipeline,
         round_consumer_state: pipeline.PipelineState,
+        issue_seq: Int32,
     ) -> pipeline.PipelineState:
         """Issue both dQ rounds off ring generations u8..u11 (vkq6t).
 
@@ -4963,10 +5019,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         assert cute.size(kd_fragment_a, mode=[2]) == 4
         assert cute.size(kd_fragment_b, mode=[2]) == 4
         for round_index in cutlass.range_constexpr(self.D_ROUNDS):
+            packed_issue = (
+                issue_seq * Int32(self.D_ROUNDS)
+                + Int32(round_index)
+            )
             mma = dq_tiled_mma.with_()
             mma.set(tcgen05.Field.ACCUMULATE, accumulate)
             for half in cutlass.range_constexpr(2):
                 round_pipeline.consumer_wait(round_consumer_state)
+                # One logical dQ round is split by the four-slot K_dQ ring
+                # into two non-overlapping enqueue intervals.  Reuse the
+                # round payload for both halves; do not include the intervening
+                # ring wait in an issue span.
+                dq_issue_token = _iket.range_start(
+                    "dQ_ISSUE(i,r)",
+                    packed_issue,
+                )
                 for k_sub in cutlass.range_constexpr(2):
                     k_block = half * 2 + k_sub
                     if cutlass.const_expr(round_index == 0):
@@ -4986,6 +5054,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             t_dq_1,
                         )
                     mma.set(tcgen05.Field.ACCUMULATE, True)
+                _iket.range_end(dq_issue_token, packed_issue)
                 round_pipeline.consumer_release(round_consumer_state)
                 round_consumer_state.advance()
         cute.arch.fence_view_async_tmem_store()
@@ -5103,6 +5172,33 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 t_dkv,
             )
             mma.set(tcgen05.Field.ACCUMULATE, True)
+
+    @cute.jit
+    def _issue_dkv_pass_v2_traced(
+        self,
+        dkv_tiled_mma: cute.TiledMma,
+        t_dkv: cute.Tensor,
+        a_fragment: cute.Tensor,
+        b_fragment: cute.Tensor,
+        b_k_half: cutlass.Constexpr[int],
+        accumulate: cutlass.Constexpr[bool],
+        packed_issue: Int32,
+    ) -> None:
+        """Trace-only exact envelope around one K32 dV/dK enqueue pass."""
+
+        issue_token = _iket.range_start(
+            "dVdK_ISSUE(i,r,p)",
+            packed_issue,
+        )
+        self._issue_dkv_pass_v2(
+            dkv_tiled_mma,
+            t_dkv,
+            a_fragment,
+            b_fragment,
+            b_k_half,
+            accumulate,
+        )
+        _iket.range_end(issue_token, packed_issue)
 
     @cute.jit
     def _issue_dq_rounds_v2(
@@ -6078,6 +6174,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # Role bodies.
         # ==================================================================
         if warp_idx < Int32(self.GATHER_WARPS):
+            _iket.mark("ROLE_KV_LOAD", rank)
             gather_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 1,
@@ -6449,7 +6546,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # send + landing) is ~2.6-3.6us, while the dP shadow is
                 # only ~0.35us -- the residue is the serial build's
                 # dominant structural bubble, gated at relay 0.
+                wait_s_token = _iket.range_start(
+                    "WAIT_S(i)",
+                    loop_iter,
+                )
                 pipe_s_done.consumer_wait(s_state)
+                _iket.range_end(wait_s_token, loop_iter)
+                t2r_s_token = _iket.range_start(
+                    "T2R_S(i)",
+                    loop_iter,
+                )
                 if s_state.index == Int32(0):
                     cute.copy(score_copy, score_source, r_score)
                 else:
@@ -6461,7 +6567,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.arch.fence_view_async_tmem_load()
                 pipe_s_done.consumer_release(s_state)
                 s_state.advance()
+                _iket.range_end(t2r_s_token, loop_iter)
 
+                p_math_token = _iket.range_start(
+                    "P_MATH(i)",
+                    loop_iter,
+                )
                 assert cute.size(r_score) == self.N_TILE_CTA
                 if cutlass.const_expr(self.SOFTMAX_GROUPED_STATS):
                     for h_group in cutlass.range_constexpr(4):
@@ -6514,14 +6625,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         )
                         r_score[local_n] = p_value
                         r_p[local_n] = self.element_dtype(p_value)
+                _iket.range_end(p_math_token, loop_iter)
 
                 # Buffer backpressure: the previous tile's dQ issue
                 # releases pds, and S(t) only issues after that in the
                 # serial leader order, so this acquire is quiet.
+                pds_acq_token = _iket.range_start(
+                    "MATH_PDS_ACQ(i)",
+                    loop_iter,
+                )
                 pipe_pds.producer_acquire(pds_state)
+                _iket.range_end(pds_acq_token, loop_iter)
 
                 # Publish P with stmatrix. Each pair of warps owns one
                 # N32 half, so this branch is warp-uniform.
+                p_publish_token = _iket.range_start(
+                    "P_PUBLISH(i)",
+                    loop_iter,
+                )
                 r_p_store = thread_copy_r2s.retile(r_p)
                 assert t_rs_p_local_tile.shape == r_p_store.shape
                 assert t_rs_p_xchg_tile.shape == r_p_store.shape
@@ -6547,9 +6668,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.arch.mbarrier_arrive(
                         p_ready_mbars,
                     )
+                _iket.range_end(p_publish_token, loop_iter)
 
                 # ---- dS phase: T2R dP, dS math, publish dS + image.
+                wait_dp_token = _iket.range_start(
+                    "WAIT_dP(i)",
+                    loop_iter,
+                )
                 pipe_dp_done.consumer_wait(dp_state)
+                _iket.range_end(wait_dp_token, loop_iter)
+                t2r_dp_token = _iket.range_start(
+                    "T2R_dP(i)",
+                    loop_iter,
+                )
                 if dp_state.index == Int32(0):
                     cute.copy(dp_copy, dp_source, r_dp)
                 else:
@@ -6557,7 +6688,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 cute.arch.fence_view_async_tmem_load()
                 pipe_dp_done.consumer_release(dp_state)
                 dp_state.advance()
+                _iket.range_end(t2r_dp_token, loop_iter)
 
+                ds_math_token = _iket.range_start(
+                    "DS_MATH(i)",
+                    loop_iter,
+                )
                 if cutlass.const_expr(self.SOFTMAX_GROUPED_STATS):
                     for h_group in cutlass.range_constexpr(4):
                         # kq6a: register-resident stat (hoisted).
@@ -6600,7 +6736,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             * scale_softmax
                         )
                         r_ds[local_n] = self.element_dtype(ds_value)
+                _iket.range_end(ds_math_token, loop_iter)
 
+                ds_publish_token = _iket.range_start(
+                    "DS_PUBLISH(i)",
+                    loop_iter,
+                )
                 r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_ds_local_tile.shape == r_ds_store.shape
                 assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
@@ -6632,6 +6773,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.arch.mbarrier_arrive(
                         pds_ready_mbars,
                     )
+                _iket.range_end(ds_publish_token, loop_iter)
                 pds_state.advance()
 
             # dQ epilogue: wait for the last dQ generation, then store both
@@ -6693,6 +6835,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # and released off the head commit, slot 1 off the tail commit,
             # then both atomic bursts run back-to-back.  Split wait/release
             # states let each release trail its own fence.
+            _iket.mark("ROLE_REDUCE", rank)
             rtx = tidx - Int32(self.REDUCE_THREAD_BEGIN)
             dkv_wait = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
@@ -6724,7 +6867,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: serial same-tile schedule.  The follower
             # CTA's MMA warp executes no pipeline operation (FA4 rule).
+            _iket.mark(self.IKET_V2_NATIVE_PROVENANCE, rank)
             if is_leader_cta:
+                _iket.mark("ROLE_MMA", rank)
                 s_prod = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
                     self.SCORE_DONE_STAGES,
@@ -6865,6 +7010,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_dq_done.producer_tail(dq_done_prod)
 
         elif warp_idx == Int32(self.LOAD_WARP):
+            _iket.mark("ROLE_KV_LOAD", rank)
             lane_idx = tidx % Int32(32)
             round_acq = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
@@ -7079,6 +7225,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipe_round.producer_tail(round_acq)
 
         elif warp_idx == Int32(self.RELAY_WARP):
+            _iket.mark("ROLE_RELAY", rank)
             # vkq6t: one lane owns both relay legs in strict P-first
             # order.  This is the kq6q-proven 20-warp protocol: P opens
             # the dV critical edge first; dS follows with more than a dV
@@ -7240,20 +7387,46 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         """
 
         done_pipeline.producer_acquire(producer_state)
-        if producer_state.index == Int32(0):
-            self._issue_score_chunks_v7(
-                tiled_mma,
-                accumulator_0,
-                a_fragment,
-                b_fragment,
+        if cutlass.const_expr(is_dp):
+            mma_issue_token = _iket.range_start(
+                "dP_ISSUE(i)",
+                issue_seq,
             )
+            if producer_state.index == Int32(0):
+                self._issue_score_chunks_v7(
+                    tiled_mma,
+                    accumulator_0,
+                    a_fragment,
+                    b_fragment,
+                )
+            else:
+                self._issue_score_chunks_v7(
+                    tiled_mma,
+                    accumulator_1,
+                    a_fragment,
+                    b_fragment,
+                )
+            _iket.range_end(mma_issue_token, issue_seq)
         else:
-            self._issue_score_chunks_v7(
-                tiled_mma,
-                accumulator_1,
-                a_fragment,
-                b_fragment,
+            mma_issue_token = _iket.range_start(
+                "S_ISSUE(i)",
+                issue_seq,
             )
+            if producer_state.index == Int32(0):
+                self._issue_score_chunks_v7(
+                    tiled_mma,
+                    accumulator_0,
+                    a_fragment,
+                    b_fragment,
+                )
+            else:
+                self._issue_score_chunks_v7(
+                    tiled_mma,
+                    accumulator_1,
+                    a_fragment,
+                    b_fragment,
+                )
+            _iket.range_end(mma_issue_token, issue_seq)
         cute.arch.fence_view_async_tmem_store()
         done_pipeline.producer_commit(producer_state)
         producer_state.advance()
@@ -7344,51 +7517,67 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dK r0), mirroring the reduce side's split wait/release states.
         """
 
+        # Payload g=0..3 denotes dV and g=4..7 denotes dK; each K64
+        # logical panel contains two separately measured K32 enqueue passes.
+        packed_issue = issue_seq * Int32(8)
+
         # dV r0: ring dO0/dO1 quadrants x P blocks -> slot 0.
+        relay_wait_token = _iket.range_start(
+            "WAIT_RELAY(i,p)",
+            issue_seq * Int32(2),
+        )
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
+        _iket.range_end(
+            relay_wait_token,
+            issue_seq * Int32(2),
+        )
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_0,
             round_fragment_0,
             p_fragment_0,
             0,
             False,
+            packed_issue,
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_0,
             round_fragment_1,
             p_fragment_0,
             1,
             True,
+            packed_issue,
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_0,
             round_fragment_2,
             p_fragment_1,
             0,
             True,
+            packed_issue + Int32(1),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_0,
             round_fragment_3,
             p_fragment_1,
             1,
             True,
+            packed_issue + Int32(1),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
@@ -7397,46 +7586,50 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_1,
             round_fragment_0,
             p_fragment_0,
             0,
             False,
+            packed_issue + Int32(2),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_1,
             round_fragment_1,
             p_fragment_0,
             1,
             True,
+            packed_issue + Int32(2),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_1,
             round_fragment_2,
             p_fragment_1,
             0,
             True,
+            packed_issue + Int32(3),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_1,
             round_fragment_3,
             p_fragment_1,
             1,
             True,
+            packed_issue + Int32(3),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
@@ -7463,57 +7656,70 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dq_accumulate,
             round_pipeline,
             round_consumer_state,
+            issue_seq,
         )
 
         # dK r0: ring Q0/Q1 quadrants x dS blocks -> slot 0 (fused
         # dV+dK latent gradient), then hand slot 0 to the reducers.
         # relay 1: dS exchanged.  dQ's execution window above is the
         # DSM cover (champion order restored in kq6s).
+        relay_wait_token = _iket.range_start(
+            "WAIT_RELAY(i,p)",
+            issue_seq * Int32(2) + Int32(1),
+        )
         _mbarrier_wait_acquire_cluster(
             relay_mbars + 1,
             relay_phase,
         )
+        _iket.range_end(
+            relay_wait_token,
+            issue_seq * Int32(2) + Int32(1),
+        )
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_0,
             round_fragment_0,
             ds_fragment_0,
             0,
             True,
+            packed_issue + Int32(4),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_0,
             round_fragment_1,
             ds_fragment_0,
             1,
             True,
+            packed_issue + Int32(4),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_0,
             round_fragment_2,
             ds_fragment_1,
             0,
             True,
+            packed_issue + Int32(5),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_0,
             round_fragment_3,
             ds_fragment_1,
             1,
             True,
+            packed_issue + Int32(5),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
@@ -7523,46 +7729,50 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         # dK r1: ring Q2/Q3 quadrants x dS blocks -> slot 1.
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_1,
             round_fragment_0,
             ds_fragment_0,
             0,
             True,
+            packed_issue + Int32(6),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_1,
             round_fragment_1,
             ds_fragment_0,
             1,
             True,
+            packed_issue + Int32(6),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_1,
             round_fragment_2,
             ds_fragment_1,
             0,
             True,
+            packed_issue + Int32(7),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass_v2(
+        self._issue_dkv_pass_v2_traced(
             dkv_tiled_mma,
             t_dkv_1,
             round_fragment_3,
             ds_fragment_1,
             1,
             True,
+            packed_issue + Int32(7),
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()

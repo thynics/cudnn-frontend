@@ -209,6 +209,23 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
 
+class _IketProxy:
+    """Forward to IKET when present; release sentinels remain no-ops."""
+
+    @staticmethod
+    def _api():
+        experimental = getattr(cute, "experimental", None)
+        return getattr(experimental, "iket", None)
+
+    @classmethod
+    def mark(cls, *args):
+        api = cls._api()
+        return None if api is None else api.mark(*args)
+
+
+_iket = _IketProxy()
+
+
 @dsl_user_op
 def _nanosleep_u32(
     ns: Int32,
@@ -4322,6 +4339,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     OWN_HALF_BULK = True
 
     IKET_V2_NATIVE_PROVENANCE = "V2_NATIVE_PROVENANCE"
+
+    def _provenance_sentinel(self, rank):
+        """Keep the native-source identity without release device events."""
+        if False:
+            _iket.mark(self.IKET_V2_NATIVE_PROVENANCE, rank)
 
     def __init__(
         self,
