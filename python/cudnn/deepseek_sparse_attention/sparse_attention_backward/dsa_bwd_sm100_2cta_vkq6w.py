@@ -280,8 +280,9 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 # its TMEM fence, MATH_SOFTMAX ends before stores, split MATH_PD is inclusive
 # through its phase publish, and issue spans contain only tensor-core enqueues.
 # Keep 25 ranges plus the five role marks and V2 provenance mark within
-# the pipeline's 31-name budget.  Redundant WAIT_* envelopes are retired
-# in favor of the credit/completion decomposition RK_ACQ/MAT_ACQ/MAT_WAIT.
+# the pipeline's 31-name budget.  W19 MAT_WAIT was not role-addressable and
+# was discarded by aggregation; its slot records the distinct P/dS producer
+# backpressure and MMA-consumer waits instead.
 _LEAN_SPANS = (
     "LOAD_QDO",
     "LOAD_STATS",
@@ -290,7 +291,6 @@ _LEAN_SPANS = (
     "RK_ACQ(",
     "MAT_QDO(",
     "MAT_ACQ(",
-    "MAT_WAIT(",
     "REDUCE_ATOMIC(",
     "REDUCE_T2R(",
     "DQ_EPI(",
@@ -302,6 +302,7 @@ _LEAN_SPANS = (
     "T2R_S(",
     "MATH_PD(",
     "MATH_SOFTMAX(",
+    "MATH_PDS_ACQ(",
     "PDS_WAIT(",
     "MATH_STORE(",
     "MATH_BAR1(",
@@ -6665,12 +6666,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # Buffer backpressure: the previous tile's dQ issue
                 # releases pds, and S(t) only issues after that in the
                 # serial leader order, so this acquire is quiet.
-                pds_wait_token = _iket.range_start(
-                    "PDS_WAIT(i)",
+                pds_acq_token = _iket.range_start(
+                    "MATH_PDS_ACQ(i)",
                     loop_iter,
                 )
                 pipe_pds.producer_acquire(pds_state)
-                _iket.range_end(pds_wait_token, loop_iter)
+                _iket.range_end(pds_acq_token, loop_iter)
 
                 # Publish P with stmatrix. Each pair of warps owns one
                 # N32 half, so this branch is warp-uniform.
@@ -7472,22 +7473,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     self.ROUND_GENS_PER_TILE
                 ):
                     round_slot = micro_gen % self.ROUND_STAGES
-                    # Same 16*i+q identity as MAT_ACQ.  This span is only
-                    # the raw fill-completion wait; phase flip and pipeline
-                    # commit intentionally remain outside it.
-                    mat_wait_token = _iket.range_start(
-                        "MAT_WAIT(m,q)",
-                        loop_iter * Int32(self.ROUND_GENS_PER_TILE)
-                        + Int32(micro_gen),
-                    )
                     cute.arch.mbarrier_wait(
                         round_tma_mbars + round_slot,
                         w19_phase[round_slot],
-                    )
-                    _iket.range_end(
-                        mat_wait_token,
-                        loop_iter * Int32(self.ROUND_GENS_PER_TILE)
-                        + Int32(micro_gen),
                     )
                     w19_phase[round_slot] = (
                         Int32(1) - w19_phase[round_slot]
@@ -7778,7 +7766,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # K_dQ panels.  The gather filled it after dP released score K;
         # dQ's release lets the gather start the next score-K load under
         # dK.  Gates: pds backpressure + ds_local_ready.
+        pds_wait_token = _iket.range_start("PDS_WAIT(i)", issue_seq)
         pds_pipeline.consumer_wait(pds_consumer_state)
+        _iket.range_end(pds_wait_token, issue_seq)
         _mbarrier_wait_acquire_cluster(
             ds_local_ready_mbar,
             relay_phase,
