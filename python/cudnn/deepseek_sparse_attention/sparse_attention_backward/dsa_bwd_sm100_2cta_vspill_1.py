@@ -5463,13 +5463,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.N_TILE
         )
 
-        # Reassign one 8-register slice from the gather warpgroup to the
+        # Reassign two 8-register slices from the gather warpgroup to the
         # special-function warpgroup.  SETMAXNREG is warpgroup-uniform, and
-        # 40/128/128/56 preserves the 61,440-register CTA launch pool.
+        # 32/128/128/64 preserves the 61,440-register CTA launch pool.
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
-            cute.arch.setmaxregister_decrease(40)
+            cute.arch.setmaxregister_decrease(32)
         elif warp_idx >= Int32(self.MMA_WARP):
-            cute.arch.setmaxregister_decrease(56)
+            cute.arch.setmaxregister_decrease(64)
         else:
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
                 cute.arch.setmaxregister_increase(128)
