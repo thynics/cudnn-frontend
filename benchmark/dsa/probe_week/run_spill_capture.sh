@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 repo="${DSA_REPO:-/home/scratch.longcheng_gpu/cudnn-frontend-thynics}"
-out="${DSA_SPILL_OUT:-/home/scratch.longcheng_gpu/dsa-vkq6v-spill/q6v_release45}"
+impl="${DSA_SPILL_IMPL:-vkq6v}"
+out="${DSA_SPILL_OUT:-/home/scratch.longcheng_gpu/dsa-vkq6v-spill/${impl}_release45}"
 python_bin="/home/scratch.longcheng_gpu/cudnn-frontend/.venv/bin/python"
 parser="/home/scratch.longcheng_gpu/dsa-vkq6v-spill/tools/sass_spill_to_py_locs.py"
 
@@ -30,7 +31,7 @@ printf 'SPILL_CAPTURE_ENV DSA_BL_KSTAGE2=%s CUTE_DSL_NO_CACHE=%s\n' \
   "${DSA_BL_KSTAGE2}" "${CUTE_DSL_NO_CACHE}"
 
 "${python_bin}" benchmark/dsa/allinone/compile_capture.py \
-  --impl vkq6v \
+  --impl "${impl}" \
   --out "${out}" \
   --allow-cubin-only
 
@@ -39,7 +40,7 @@ mapfile -d '' -t cubins < <(
   find "${dump_dir}" -maxdepth 1 -type f -name '*.cubin' -print0
 )
 if ((${#cubins[@]} == 0)); then
-  echo "ERROR: q6v compile produced no CUBIN" >&2
+  echo "ERROR: ${impl} compile produced no CUBIN" >&2
   exit 1
 fi
 printf 'SPILL_CAPTURE_CUBINS count=%d\n' "${#cubins[@]}"
