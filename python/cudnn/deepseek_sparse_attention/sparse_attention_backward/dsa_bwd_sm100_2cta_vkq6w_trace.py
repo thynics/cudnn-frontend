@@ -332,29 +332,6 @@ _iket = _IketProxy()
 
 
 @dsl_user_op
-def _tail_warp_idx_now(*, loc=None, ip=None) -> Int32:
-    """Read CTA warp index at the final TMEM free without permitting CSE."""
-
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [],
-            (
-                "{\n\t"
-                ".reg .u32 tid;\n\t"
-                "mov.u32 tid, %tid.x;\n\t"
-                "shr.u32 $0, tid, 5;\n\t"
-                "}"
-            ),
-            "=r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def _nanosleep_u32(
     ns: Int32,
     *,
@@ -7514,8 +7491,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # The full-cluster rendezvous above is stronger than the allocator's
         # generic peer-mbarrier handshake: both allocator warps are already at
         # the same point.  Deallocate directly, with no cluster-rank operand.
-        free_warp_idx = cute.arch.make_warp_uniform(_tail_warp_idx_now())
-        if free_warp_idx == Int32(self.MATH_WARP_BEGIN):
+        if warp_idx == Int32(self.MATH_WARP_BEGIN):
             cute.arch.dealloc_tmem(
                 tmem_ptr,
                 self.TMEM_COLUMNS,
