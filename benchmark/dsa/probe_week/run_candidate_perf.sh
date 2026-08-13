@@ -20,7 +20,7 @@ export DSA_BL_KSTAGE2=0
 export DSA_BL_OVPAD=0
 unset DSA_DEV_IKET DKG_IKET_INSTRUMENTATION_METHOD IKET_STANDALONE_SITE_PACKAGES
 
-exec "${python_bin}" benchmark/dsa/sweep_topk_2cta.py \
+exec "${python_bin}" benchmark/dsa/probe_week/candidate_perf.py \
   --impl "${impl}" \
   --topks "${topks}" \
   --warmup "${warmup}" \
