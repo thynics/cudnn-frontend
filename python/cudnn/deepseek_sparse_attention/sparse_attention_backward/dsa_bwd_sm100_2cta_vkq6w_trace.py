@@ -6169,9 +6169,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         tile_count = (topk + Int32(self.N_TILE - 1)) // Int32(
             self.N_TILE
         )
-        # Every lane reads the same token length.  Canonicalize it once for
-        # compact ceil-div code; each role rematerializes the value near use
-        # because warp-uniform is a compiler hint, not a propagated type.
+        # Every lane reads the same token length.  Keep the loop bound in the
+        # uniform register domain explicitly so role guards, loop IVs, and
+        # pipeline-state parity stay on UISETP/BRA.U after spill elimination.
         tile_count = cute.arch.make_warp_uniform(tile_count)
 
         # kq6c register relayout 48/64/136/112 (single variable vs
@@ -6201,14 +6201,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # ==================================================================
         if warp_idx < Int32(self.GATHER_WARPS):
             _iket.mark("ROLE_KV_LOAD", rank)
-            gather_tiles = cute.arch.make_warp_uniform(tile_count)
             gather_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 1,
             )
             gather_kd_rows_0 = self._kd_round_rows_v2(kdq_loan[0])
             gather_kd_rows_1 = self._kd_round_rows_v2(kdq_loan[1])
-            if gather_tiles > Int32(0):
+            if tile_count > Int32(0):
                 # Prologue: K(0).
                 load_k_token = _iket.range_start(
                     "LOAD_K(i)",
@@ -6221,7 +6220,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     k_n,
                     token_idx,
                     batch_idx,
-                    gather_tiles - Int32(1),
+                    tile_count - Int32(1),
                     topk,
                     rank,
                     tidx,
@@ -6242,7 +6241,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # K_dQ never enters the round ring.
                 for score_iter in cutlass.range(
                     Int32(0),
-                    gather_tiles,
+                    tile_count,
                 ):
                     route_k_token = _iket.range_start(
                         "ROUTE_K(i)",
@@ -6261,7 +6260,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         gather_kd_rows_1,
                         token_idx,
                         batch_idx,
-                        gather_tiles - Int32(1) - score_iter,
+                        tile_count - Int32(1) - score_iter,
                         topk,
                         rank,
                         tidx,
@@ -6275,7 +6274,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     gather_state.advance()
                     _iket.range_end(route_k_token, score_iter)
 
-                    if score_iter != gather_tiles - Int32(1):
+                    if score_iter != tile_count - Int32(1):
                         next_iter = score_iter + Int32(1)
                         load_k_token = _iket.range_start(
                             "LOAD_K(i)",
@@ -6288,7 +6287,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             k_n,
                             token_idx,
                             batch_idx,
-                            gather_tiles - Int32(1) - next_iter,
+                            tile_count - Int32(1) - next_iter,
                             topk,
                             rank,
                             tidx,
@@ -6321,14 +6320,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
             # --- math: stats, per-tile softmax + publication, dQ epilogue.
             _iket.mark("ROLE_MATH", rank)
-            math_tiles = cute.arch.make_warp_uniform(tile_count)
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
             if warp_idx == Int32(self.MATH_WARP_BEGIN):
                 load_stats_token = _iket.range_start(
                     "LOAD_STATS",
                     Int32(0),
                 )
-                if math_tiles > Int32(0):
+                if tile_count > Int32(0):
                     cute.copy(
                         stats_copy_atom,
                         t_g_scaled_lse[None, 0],
@@ -6558,7 +6556,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     for h_group in range(4)
                 ]
 
-            for loop_iter in cutlass.range(math_tiles):
+            for loop_iter in cutlass.range(tile_count):
                 # ---- P phase: T2R S, exp2, publish P, arrive p_ready.
                 # The relay sends the P block off p_ready.  NOTE
                 # (post-review re-baseline): the full P chain (T2R S +
@@ -6839,7 +6837,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
             # dQ epilogue: wait for the last dQ generation, then store both
             # rank-owned [D128, H128] slices (disjoint across CTAs/rounds).
-            if math_tiles > Int32(0):
+            if tile_count > Int32(0):
                 pipe_dq_done.consumer_wait(dq_done_state)
                 _mbarrier_wait_acquire_cluster(
                     loan_epi_safe_mbar,
@@ -6907,7 +6905,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # then both atomic bursts run back-to-back.  Split wait/release
             # states let each release trail its own fence.
             _iket.mark("ROLE_REDUCE", rank)
-            reduce_tiles = cute.arch.make_warp_uniform(tile_count)
             rtx = tidx - Int32(self.REDUCE_THREAD_BEGIN)
             dkv_wait = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
@@ -6917,8 +6914,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Consumer,
                 self.MMA_DONE_STAGES,
             )
-            for loop_iter in cutlass.range(reduce_tiles):
-                tile_index = reduce_tiles - Int32(1) - loop_iter
+            for loop_iter in cutlass.range(tile_count):
+                tile_index = tile_count - Int32(1) - loop_iter
                 dkv_wait, dkv_rel = self._drain_dkv_v8(
                     t_dkv[0],
                     t_dkv[1],
@@ -6939,7 +6936,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         elif warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: serial same-tile schedule.  The follower
             # CTA's MMA warp executes no pipeline operation (FA4 rule).
-            mma_tiles = cute.arch.make_warp_uniform(tile_count)
             _iket.mark(self.IKET_V2_NATIVE_PROVENANCE, rank)
             if is_leader_cta:
                 _iket.mark("ROLE_MMA", rank)
@@ -6980,7 +6976,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Producer,
                     1,
                 )
-                if mma_tiles > Int32(0):
+                if tile_count > Int32(0):
                     _mbarrier_wait_acquire_cluster(
                         stationary_ready_mbar,
                         Int32(0),
@@ -6988,7 +6984,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipe_dq_done.producer_acquire(dq_done_prod)
 
                 relay_phase = Int32(0)
-                for loop_iter in cutlass.range(mma_tiles):
+                for loop_iter in cutlass.range(tile_count):
                     pipe_kscore.consumer_wait(kscore_cons)
                     s_prod = self._issue_score_v2(
                         score_tiled_mma,
@@ -7069,10 +7065,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pds_cons.advance()
                     relay_phase = Int32(1) - relay_phase
 
-                if mma_tiles > Int32(0):
+                if tile_count > Int32(0):
                     tail_token = _iket.range_start(
                         "TAIL",
-                        mma_tiles - Int32(1),
+                        tile_count - Int32(1),
                     )
                     # dQ generation is complete; in the serial order the
                     # final dQ is the last issued GEMM, so this commit
@@ -7087,14 +7083,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_dq_done.producer_tail(dq_done_prod)
                     _iket.range_end(
                         tail_token,
-                        mma_tiles - Int32(1),
+                        tile_count - Int32(1),
                     )
 
         elif warp_idx == Int32(self.LOAD_WARP):
             _iket.mark("ROLE_KV_LOAD", rank)
-            load_tiles = cute.arch.make_warp_uniform(tile_count)
             lane_idx = tidx % Int32(32)
-            if load_tiles > Int32(0):
+            if tile_count > Int32(0):
                 load_qdo_token = _iket.range_start(
                     "LOAD_QDO",
                     Int32(0),
@@ -7142,9 +7137,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         Int32(0),
                     )
 
-                for loop_iter in cutlass.range(load_tiles):
+                for loop_iter in cutlass.range(tile_count):
                     tile_index = (
-                        load_tiles - Int32(1) - loop_iter
+                        tile_count - Int32(1) - loop_iter
                     )
                     # G0..G7 retain their old panel order; each K64 panel is
                     # published as two self-contained K32 stages.  Raw slots
@@ -7346,7 +7341,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # always slot 0, producer phase 1 for a four-stage ring.
                 round_tail = pipeline.PipelineState(
                     self.ROUND_STAGES,
-                    load_tiles * Int32(self.ROUND_GENS_PER_TILE),
+                    tile_count * Int32(self.ROUND_GENS_PER_TILE),
                     Int32(0),
                     Int32(1),
                 )
@@ -7354,7 +7349,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         elif warp_idx == Int32(self.RELAY_WARP):
             _iket.mark("ROLE_RELAY", rank)
-            relay_tiles = cute.arch.make_warp_uniform(tile_count)
             # vkq6t: one lane owns both relay legs in strict P-first
             # order.  This is the kq6q-proven 20-warp protocol: P opens
             # the dV critical edge first; dS follows with more than a dV
@@ -7363,7 +7357,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # sixth warpgroup that deadlocked the kq6s split-relay build.
             relay_lane = tidx % Int32(32)
             if relay_lane == Int32(0):
-                for loop_iter in cutlass.range(relay_tiles):
+                for loop_iter in cutlass.range(tile_count):
                     # P leg is always first for this tile.
                     cute.arch.mbarrier_wait(
                         p_ready_mbars,
@@ -7443,23 +7437,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         relay_mbars + 1,
                         Int32(0),
                     )
-                if relay_tiles > Int32(0):
+                if tile_count > Int32(0):
                     pds_tail = pipeline.PipelineState(
                         1,
-                        relay_tiles,
+                        tile_count,
                         Int32(0),
-                        Int32(1) ^ (relay_tiles & Int32(1)),
+                        Int32(1) ^ (tile_count & Int32(1)),
                     )
                     pipe_pds.producer_tail(pds_tail)
 
         elif warp_idx == Int32(self.COMMIT_WARP):
-            commit_tiles = cute.arch.make_warp_uniform(tile_count)
             commit_com = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.ROUND_STAGES,
             )
             w19_phase = [Int32(0), Int32(0), Int32(0), Int32(0)]
-            for loop_iter in cutlass.range(commit_tiles):
+            for loop_iter in cutlass.range(tile_count):
                 for micro_gen in cutlass.range_constexpr(
                     self.ROUND_GENS_PER_TILE
                 ):
