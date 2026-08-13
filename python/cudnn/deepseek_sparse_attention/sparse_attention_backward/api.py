@@ -19,7 +19,8 @@ from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
 
-_SUPPORTED_IMPLEMENTATIONS = ("sm100", "sm100_2_cta")
+_TWO_CTA_IMPLEMENTATIONS = ("sm100_2_cta_A", "sm100_2_cta_B")
+_SUPPORTED_IMPLEMENTATIONS = ("sm100", *_TWO_CTA_IMPLEMENTATIONS)
 
 
 class SparseAttentionBackward(APIBase):
@@ -155,31 +156,31 @@ class SparseAttentionBackward(APIBase):
                 f"topk_length must have shape {(total_s_q,)}, got {self.topk_length_desc.shape}",
             )
 
-        if self.implementation == "sm100_2_cta":
+        if self.implementation in _TWO_CTA_IMPLEMENTATIONS:
             self._runtime_error_if(
                 (major, minor) != (10, 0),
-                f"implementation='sm100_2_cta' requires SM100, found SM{major}{minor}",
+                f"implementation={self.implementation!r} requires SM100, found SM{major}{minor}",
             )
             self._value_error_if(
                 self.q_desc.dtype != torch.bfloat16,
-                "implementation='sm100_2_cta' requires bfloat16 inputs",
+                f"implementation={self.implementation!r} requires bfloat16 inputs",
             )
             self._value_error_if(
                 num_heads != 128,
-                f"implementation='sm100_2_cta' requires 128 Q heads, got {num_heads}",
+                f"implementation={self.implementation!r} requires 128 Q heads, got {num_heads}",
             )
             self._value_error_if(
                 head_dim != 512,
-                f"implementation='sm100_2_cta' requires head_dim=512, got {head_dim}",
+                f"implementation={self.implementation!r} requires head_dim=512, got {head_dim}",
             )
             self._value_error_if(
                 self.block_tile != 64,
-                f"implementation='sm100_2_cta' requires block_tile=64, got {self.block_tile}",
+                f"implementation={self.implementation!r} requires block_tile=64, got {self.block_tile}",
             )
             topk_max = self.topk_idxs_desc.shape[1]
             self._value_error_if(
                 topk_max <= 0 or topk_max % 64 != 0,
-                "implementation='sm100_2_cta' requires a positive topk width divisible by 64, " f"got {topk_max}",
+                f"implementation={self.implementation!r} requires a positive topk width divisible by 64, " f"got {topk_max}",
             )
 
         self._is_supported = True
@@ -209,8 +210,8 @@ class SparseAttentionBackward(APIBase):
         major, _ = torch.cuda.get_device_capability(q.device)
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
         if major == 9:
-            if self.implementation == "sm100_2_cta":
-                raise RuntimeError("implementation='sm100_2_cta' requires SM100")
+            if self.implementation in _TWO_CTA_IMPLEMENTATIONS:
+                raise RuntimeError(f"implementation={self.implementation!r} requires SM100")
             from . import _interface_sm90 as _iface_sm90
 
             return _iface_sm90.flash_attn_bwd_sm90(
@@ -268,8 +269,9 @@ def sparse_attention_backward_wrapper(
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
     Dispatches to SM90 or SM100 based on the active CUDA device. On SM100,
-    ``implementation="sm100_2_cta"`` explicitly opts in to the two-CTA
-    implementation; the default always uses the original SM100 implementation.
+    ``implementation="sm100_2_cta_A"`` or ``"sm100_2_cta_B"`` explicitly
+    selects a two-CTA variant; the default always uses the original SM100
+    implementation.
     The returned ``d_sink`` is computed from ``attn_sink`` and ``dout``.
     """
     key = (

@@ -19,6 +19,8 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
+_TWO_CTA_IMPLEMENTATIONS = ("sm100_2_cta_A", "sm100_2_cta_B")
+
 
 def _resolve_backward_implementation(
     implementation: str,
@@ -28,22 +30,27 @@ def _resolve_backward_implementation(
 ):
     if implementation == "sm100":
         return FlashAttentionDSABackwardSm100
-    if implementation == "sm100_2_cta":
+    if implementation in _TWO_CTA_IMPLEMENTATIONS:
         major, minor = torch.cuda.get_device_capability(q.device)
         if (major, minor) != (10, 0):
-            raise RuntimeError(f"implementation='sm100_2_cta' requires SM100, found SM{major}{minor}")
+            raise RuntimeError(f"implementation={implementation!r} requires SM100, found SM{major}{minor}")
         if q.dtype != torch.bfloat16:
-            raise ValueError("implementation='sm100_2_cta' requires bfloat16 inputs")
+            raise ValueError(f"implementation={implementation!r} requires bfloat16 inputs")
         if q.shape[1] != 128:
-            raise ValueError(f"implementation='sm100_2_cta' requires 128 Q heads, got {q.shape[1]}")
+            raise ValueError(f"implementation={implementation!r} requires 128 Q heads, got {q.shape[1]}")
         if q.shape[2] != 512 or head_dim_v != 512:
-            raise ValueError("implementation='sm100_2_cta' requires head_dim=head_dim_v=512, " f"got head_dim={q.shape[2]}, head_dim_v={head_dim_v}")
+            raise ValueError(f"implementation={implementation!r} requires head_dim=head_dim_v=512, " f"got head_dim={q.shape[2]}, head_dim_v={head_dim_v}")
         if topk_max <= 0 or topk_max % 64 != 0:
-            raise ValueError("implementation='sm100_2_cta' requires a positive topk width divisible by 64, " f"got {topk_max}")
-        from .dsa_bwd_sm100_2_cta import FlashAttentionDSABackwardSm100TwoCTA
+            raise ValueError(f"implementation={implementation!r} requires a positive topk width divisible by 64, " f"got {topk_max}")
+        if implementation == "sm100_2_cta_A":
+            from .dsa_bwd_sm100_2_cta_A import FlashAttentionDSABackwardSm100TwoCTAVariantA
 
-        return FlashAttentionDSABackwardSm100TwoCTA
-    raise ValueError(f"Unsupported SM100 DSA backward implementation {implementation!r}; " "expected 'sm100' or 'sm100_2_cta'")
+            return FlashAttentionDSABackwardSm100TwoCTAVariantA
+
+        from .dsa_bwd_sm100_2_cta_B import FlashAttentionDSABackwardSm100TwoCTAVariantB
+
+        return FlashAttentionDSABackwardSm100TwoCTAVariantB
+    raise ValueError(f"Unsupported SM100 DSA backward implementation {implementation!r}; " "expected 'sm100', 'sm100_2_cta_A', or 'sm100_2_cta_B'")
 
 
 def flash_attn_bwd_sm100(
@@ -79,8 +86,8 @@ def flash_attn_bwd_sm100(
         topk_length: (total_S_q,) int32, per-query valid count, optional
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
-        implementation: ``"sm100"`` by default; ``"sm100_2_cta"`` opts in
-            to the two-CTA implementation
+        implementation: ``"sm100"`` by default; ``"sm100_2_cta_A"`` and
+            ``"sm100_2_cta_B"`` explicitly select a two-CTA variant
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients

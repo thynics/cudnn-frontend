@@ -107,15 +107,28 @@ def _reference_forward_fp32(q, kv, attn_sink, topk_idxs, topk_length, softmax_sc
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("implementation", ["sm100_2_cta_A", "sm100_2_cta_B"])
 @pytest.mark.parametrize(
     "case",
     ["dense", "length_boundaries", "sentinel_holes", "all_empty", "production_topk_2048"],
 )
-def test_DSA_sparse_attention_backward_sm100_2_cta(case):
+def test_DSA_sparse_attention_backward_sm100_2_cta(case, implementation):
     try:
         from cudnn import DSA
         from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2_cta import FlashAttentionDSABackwardSm100TwoCTA
+
+        if implementation == "sm100_2_cta_A":
+            from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2_cta_A import (
+                FlashAttentionDSABackwardSm100TwoCTAVariantA,
+            )
+
+            expected_implementation = FlashAttentionDSABackwardSm100TwoCTAVariantA
+        else:
+            from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2_cta_B import (
+                FlashAttentionDSABackwardSm100TwoCTAVariantB,
+            )
+
+            expected_implementation = FlashAttentionDSABackwardSm100TwoCTAVariantB
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -143,8 +156,8 @@ def test_DSA_sparse_attention_backward_sm100_2_cta(case):
     attn_sink = torch.linspace(-1.5, 1.5, _NUM_HEADS, dtype=torch.float32, device=device)
     topk_idxs, topk_length = _make_topk_inputs(case, seqlen_q, seqlen_kv, topk, generator)
 
-    selected_implementation = _interface_sm100._resolve_backward_implementation("sm100_2_cta", q, _HEAD_DIM, topk)
-    assert selected_implementation is FlashAttentionDSABackwardSm100TwoCTA
+    selected_implementation = _interface_sm100._resolve_backward_implementation(implementation, q, _HEAD_DIM, topk)
+    assert selected_implementation is expected_implementation
 
     q_ref = q.float().detach().requires_grad_(True)
     kv_ref = kv.float().detach().requires_grad_(True)
@@ -182,13 +195,13 @@ def test_DSA_sparse_attention_backward_sm100_2_cta(case):
         topk_idxs,
         softmax_scale=softmax_scale,
         topk_length=topk_length,
-        implementation="sm100_2_cta",
+        implementation=implementation,
     )
     torch.cuda.synchronize()
 
     assert any(
-        key[0] == "sm100_2_cta" and key[6] == topk and key[7] == (topk_length is not None) for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
-    ), "the public wrapper did not compile the requested sm100_2_cta implementation"
+        key[0] == implementation and key[6] == topk and key[7] == (topk_length is not None) for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
+    ), f"the public wrapper did not compile the requested {implementation} implementation"
 
     dq = result["dq"].float()
     dkv = result["dkv"].float()

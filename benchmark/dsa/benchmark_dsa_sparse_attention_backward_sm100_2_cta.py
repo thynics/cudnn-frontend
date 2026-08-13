@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fair direct-kernel A/B benchmark for SM100 DSA backward two-CTA.
+"""Fair direct-kernel baseline/candidate benchmark for SM100 DSA backward two-CTA.
 
 The established ``FlashAttentionDSABackwardSm100`` implementation is the
-baseline and ``FlashAttentionDSABackwardSm100TwoCTA`` is the candidate.  Both
-are compiled directly with ``cute.compile`` against the same tensor objects,
-output buffers, and workspaces.  Compilation, allocation, and output/workspace
-reset are outside CUDA-event timing.
+baseline. ``--candidate`` explicitly selects two-CTA variant A or B. Both are
+compiled directly with ``cute.compile`` against the same tensor objects, output
+buffers, and workspaces. Compilation, allocation, and output/workspace reset
+are outside CUDA-event timing.
 
 Before timing, the script runs both implementations at the requested benchmark
 shape and requires all three public outputs (dQ, dKV, and dSink) to agree.  The
@@ -17,8 +17,9 @@ every two pairs.
 
 Example:
     python benchmark/dsa/benchmark_dsa_sparse_attention_backward_sm100_2_cta.py \
+        --candidate sm100_2_cta_A \
         --seqlen 4096 --topk 2048 --warmup-pairs 4 --paired-samples 20 \
-        --json /tmp/dsa_bwd_sm100_2_cta.json
+        --json /tmp/dsa_bwd_sm100_2_cta_A.json
 """
 
 from __future__ import annotations
@@ -37,13 +38,18 @@ import cutlass
 import cutlass.cute as cute
 
 from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
-from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2_cta import FlashAttentionDSABackwardSm100TwoCTA
+from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2_cta_A import FlashAttentionDSABackwardSm100TwoCTAVariantA
+from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2_cta_B import FlashAttentionDSABackwardSm100TwoCTAVariantB
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 BASELINE = "sm100"
-CANDIDATE = "sm100_2_cta"
+CANDIDATE = "candidate"
+CANDIDATE_CLASSES = {
+    "sm100_2_cta_A": FlashAttentionDSABackwardSm100TwoCTAVariantA,
+    "sm100_2_cta_B": FlashAttentionDSABackwardSm100TwoCTAVariantB,
+}
 HEADS = 128
 HEAD_DIM = 512
 HEAD_DIM_V = 512
@@ -138,7 +144,7 @@ def reference_forward(
 
 
 @torch.no_grad()
-def make_case(seqlen: int, topk: int) -> BenchmarkCase:
+def make_case(seqlen: int, topk: int, candidate_cls: type) -> BenchmarkCase:
     device = torch.device("cuda")
     torch.manual_seed(20260813)
 
@@ -155,7 +161,7 @@ def make_case(seqlen: int, topk: int) -> BenchmarkCase:
     out, lse = reference_forward(q, kv, attn_sink, topk_idxs, softmax_scale)
 
     workspace_shapes = []
-    for kernel_cls in (FlashAttentionDSABackwardSm100, FlashAttentionDSABackwardSm100TwoCTA):
+    for kernel_cls in (FlashAttentionDSABackwardSm100, candidate_cls):
         workspace_shapes.append(
             (
                 kernel_cls._get_workspace_size_LSE_OdO(seqlen, HEAD_DIM, HEADS, 1, cutlass.Float32),
@@ -352,6 +358,12 @@ def backward_flops(seqlen: int, topk: int) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--candidate",
+        choices=tuple(CANDIDATE_CLASSES),
+        required=True,
+        help="explicit two-CTA implementation to compare with the sm100 baseline",
+    )
     parser.add_argument("--seqlen", type=int, default=4096, help="query and KV sequence length (default: 4096)")
     parser.add_argument("--topk", type=int, default=2048, help="sparse keys per query; positive and 64-aligned (default: 2048)")
     parser.add_argument(
@@ -389,16 +401,17 @@ def main() -> None:
         raise RuntimeError(f"this fixed SM100 benchmark requires compute capability 10.0, found {capability[0]}.{capability[1]}")
 
     device_name = torch.cuda.get_device_name()
-    print(f"DSA BWD direct A/B on {device_name}: BF16 H={HEADS} D={HEAD_DIM} S={args.seqlen} topk={args.topk}")
-    print("baseline=sm100, candidate=sm100_2_cta; shared inputs/outputs/workspaces; timing order=ABBA")
+    print(f"DSA BWD baseline/candidate on {device_name}: BF16 H={HEADS} D={HEAD_DIM} S={args.seqlen} topk={args.topk}")
+    print(f"baseline=sm100, candidate={args.candidate}; shared inputs/outputs/workspaces; timing order=ABBA")
 
     stream = resolve_stream()
-    case = make_case(args.seqlen, args.topk)
+    candidate_cls = CANDIDATE_CLASSES[args.candidate]
+    case = make_case(args.seqlen, args.topk, candidate_cls)
     compile_args = case.compile_args(stream)
     runtime_args = case.runtime_args(stream)
 
     compiled_baseline, baseline_compile_s = compile_kernel(FlashAttentionDSABackwardSm100, case, compile_args)
-    compiled_candidate, candidate_compile_s = compile_kernel(FlashAttentionDSABackwardSm100TwoCTA, case, compile_args)
+    compiled_candidate, candidate_compile_s = compile_kernel(candidate_cls, case, compile_args)
     compiled = {BASELINE: compiled_baseline, CANDIDATE: compiled_candidate}
     print(f"compile (excluded): baseline={baseline_compile_s:.2f}s candidate={candidate_compile_s:.2f}s")
 
@@ -448,6 +461,7 @@ def main() -> None:
             "seqlen_q": args.seqlen,
             "seqlen_kv": args.seqlen,
             "topk": args.topk,
+            "candidate": args.candidate,
             "warmup_pairs": args.warmup_pairs,
             "paired_samples": args.paired_samples,
             "timing_order": "ABBA",
@@ -456,7 +470,7 @@ def main() -> None:
         },
         "implementations": {
             "baseline": FlashAttentionDSABackwardSm100.__name__,
-            "candidate": FlashAttentionDSABackwardSm100TwoCTA.__name__,
+            "candidate": candidate_cls.__name__,
         },
         "compile_seconds": {"baseline": baseline_compile_s, "candidate": candidate_compile_s},
         "correctness": gate,
