@@ -6663,12 +6663,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
 
                 # ---- dS phase: T2R dP, dS math, publish dS + image.
-                wait_dp_token = _iket.range_start(
-                    "WAIT_dP(i)",
-                    loop_iter,
-                )
                 pipe_dp_done.consumer_wait(dp_state)
-                _iket.range_end(wait_dp_token, loop_iter)
                 t2r_dp_token = _iket.range_start(
                     "T2R_dP(i)",
                     loop_iter,
@@ -7561,15 +7556,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         packed_issue = issue_seq * Int32(8)
 
         # dV r0: ring dO0/dO1 quadrants x P blocks -> slot 0.
-        relay_wait_token = _iket.range_start(
-            "WAIT_P(i)",
-            issue_seq,
-        )
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
-        _iket.range_end(
-            relay_wait_token,
-            issue_seq,
-        )
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
@@ -7699,17 +7686,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # dV+dK latent gradient), then hand slot 0 to the reducers.
         # relay 1: dS exchanged.  dQ's execution window above is the
         # DSM cover (champion order retained).
-        relay_wait_token = _iket.range_start(
-            "WAIT_dS_dK(i)",
-            issue_seq,
-        )
         _mbarrier_wait_acquire_cluster(
             relay_mbars + 1,
             relay_phase,
-        )
-        _iket.range_end(
-            relay_wait_token,
-            issue_seq,
         )
         round_pipeline.consumer_wait(round_consumer_state)
         self._issue_dkv_pass_v2_traced(
