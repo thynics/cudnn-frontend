@@ -342,44 +342,6 @@ class _IketProxy:
 _iket = _IketProxy()
 
 
-class _ClusterJoinedTmemAllocator(utils.TmemAllocator):
-    """TMEM allocator whose two-CTA free follows a full cluster join."""
-
-    @dsl_user_op
-    @cute.jit
-    def free(
-        self,
-        tmem_ptr: cute.Pointer,
-        num_columns: int = 0,
-        *,
-        loc=None,
-        ip=None,
-    ) -> None:
-        """Deallocate without the generic rank-dependent peer handshake."""
-
-        assert num_columns <= self._num_allocated_columns
-        if cutlass.const_expr(num_columns != 0):
-            assert self.check_valid_num_columns(num_columns)
-        num_deallocate_columns = (
-            self._num_allocated_columns if num_columns == 0 else num_columns
-        )
-        self._num_allocated_columns -= num_deallocate_columns
-        warp_idx = cute.arch.make_warp_uniform(
-            cute.arch.warp_idx(loc=loc, ip=ip),
-            loc=loc,
-            ip=ip,
-        )
-        if warp_idx == self._allocator_warp_id:
-            cute.arch.dealloc_tmem(
-                tmem_ptr,
-                num_deallocate_columns,
-                is_two_cta=self._is_two_cta,
-                arch=self._arch,
-                loc=loc,
-                ip=ip,
-            )
-
-
 @dsl_user_op
 def _nanosleep_u32(
     ns: Int32,
@@ -2457,7 +2419,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             cute.make_layout((8,)),
         ).get_slice(0)
 
-        tmem = _ClusterJoinedTmemAllocator(
+        tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=0,
@@ -7537,9 +7499,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         self.cta_barrier.arrive_and_wait()
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
-        # Both CTAs have joined, so the specialized allocator can issue the
-        # group2 deallocation without carrying cluster rank through the body.
-        tmem.free(tmem_ptr)
+        # The full-cluster rendezvous above is stronger than the allocator's
+        # generic peer-mbarrier handshake: both allocator warps are already at
+        # the same point.  Deallocate directly, with no cluster-rank operand.
+        if warp_idx == Int32(self.MATH_WARP_BEGIN):
+            cute.arch.dealloc_tmem(
+                tmem_ptr,
+                self.TMEM_COLUMNS,
+                is_two_cta=True,
+            )
 
     @cute.jit
     def _issue_score_v2(
