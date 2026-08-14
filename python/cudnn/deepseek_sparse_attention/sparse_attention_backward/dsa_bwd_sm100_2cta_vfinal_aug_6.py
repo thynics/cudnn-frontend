@@ -32,7 +32,9 @@ REDUCE_PACE_EVERY = 4
 # Spread knob: after each pacing barrier every reducer warp naps this many
 # ns, stretching the two 8-op bursts across the period (baseline gets the
 # same spread from its MMA-cadence gating). 0 disables.
-REDUCE_PACE_SLEEP_NS = 200
+# PINNED 0: the measured-best configuration is N=4 with no nap (8.94 ms);
+# the 200ns spread variant was never benchmarked.
+REDUCE_PACE_SLEEP_NS = 0
 
 
 @dsl_user_op
