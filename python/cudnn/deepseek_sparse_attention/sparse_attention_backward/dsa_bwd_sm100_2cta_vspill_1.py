@@ -7314,38 +7314,39 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         assert cute.size(thread_values_0) == self.N_TILE // 2
         sub_tile_idx_0 = rank
         sub_tile_idx_1 = Int32(2) + rank
-        writer_cohort = wg_idx ^ rank
-        for writer_phase in cutlass.range(2, unroll=1):
-            if writer_cohort == writer_phase:
-                for i in cutlass.range_constexpr(8):
-                    coord_base = i * 2 - i % 2
-                    rdkv_frg_0 = cute.make_rmem_tensor(
-                        (4,),
-                        self.acc_dtype,
-                    )
-                    rdkv_frg_0[0] = thread_values_0[coord_base]
-                    rdkv_frg_0[1] = thread_values_0[coord_base + 2]
-                    rdkv_frg_0[2] = thread_values_0[coord_base + 16]
-                    rdkv_frg_0[3] = thread_values_0[coord_base + 18]
+        for i in cutlass.range_constexpr(8):
+            coord_base = i * 2 - i % 2
+            rdkv_frg_0 = cute.make_rmem_tensor(
+                (4,),
+                self.acc_dtype,
+            )
+            rdkv_frg_0[0] = thread_values_0[coord_base]
+            rdkv_frg_0[1] = thread_values_0[coord_base + 2]
+            rdkv_frg_0[2] = thread_values_0[coord_base + 16]
+            rdkv_frg_0[3] = thread_values_0[coord_base + 18]
 
-                    kv_index = r_topk[i]
-                    if kv_index >= Int32(0):
-                        dkv_row = mdKV_acc[
-                            None,
-                            kv_index,
-                            (0, batch_idx),
-                        ]
-                        tile_row = cute.flat_divide(dkv_row, (128,))
-                        tile_row_0 = tile_row[None, sub_tile_idx_0]
-                        tile_row_0 = cute.flat_divide(tile_row_0, (4,))
-                        target_frg_0 = tile_row_0[None, dp_idx // 4]
-                        cute.arch.atomic_add(
-                            target_frg_0.iterator.llvm_ptr,
-                            rdkv_frg_0.load(),
-                        )
-            self.reduce_pace_barrier.arrive_and_wait()
-            if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-                _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+            kv_index = r_topk[i]
+            if kv_index >= Int32(0):
+                dkv_row = mdKV_acc[
+                    None,
+                    kv_index,
+                    (0, batch_idx),
+                ]
+                tile_row = cute.flat_divide(dkv_row, (128,))
+                tile_row_0 = tile_row[None, sub_tile_idx_0]
+                tile_row_0 = cute.flat_divide(tile_row_0, (4,))
+                target_frg_0 = tile_row_0[None, dp_idx // 4]
+                cute.arch.atomic_add(
+                    target_frg_0.iterator.llvm_ptr,
+                    rdkv_frg_0.load(),
+                )
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
+                self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7355,37 +7356,39 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         done_pipeline.consumer_release(release_state)
         release_state.advance()
 
-        for writer_phase in cutlass.range(2, unroll=1):
-            if writer_cohort == writer_phase:
-                for i in cutlass.range_constexpr(8):
-                    coord_base = i * 2 - i % 2
-                    rdkv_frg_1 = cute.make_rmem_tensor(
-                        (4,),
-                        self.acc_dtype,
-                    )
-                    rdkv_frg_1[0] = thread_values_1[coord_base]
-                    rdkv_frg_1[1] = thread_values_1[coord_base + 2]
-                    rdkv_frg_1[2] = thread_values_1[coord_base + 16]
-                    rdkv_frg_1[3] = thread_values_1[coord_base + 18]
+        for i in cutlass.range_constexpr(8):
+            coord_base = i * 2 - i % 2
+            rdkv_frg_1 = cute.make_rmem_tensor(
+                (4,),
+                self.acc_dtype,
+            )
+            rdkv_frg_1[0] = thread_values_1[coord_base]
+            rdkv_frg_1[1] = thread_values_1[coord_base + 2]
+            rdkv_frg_1[2] = thread_values_1[coord_base + 16]
+            rdkv_frg_1[3] = thread_values_1[coord_base + 18]
 
-                    kv_index = r_topk[i]
-                    if kv_index >= Int32(0):
-                        dkv_row = mdKV_acc[
-                            None,
-                            kv_index,
-                            (0, batch_idx),
-                        ]
-                        tile_row = cute.flat_divide(dkv_row, (128,))
-                        tile_row_1 = tile_row[None, sub_tile_idx_1]
-                        tile_row_1 = cute.flat_divide(tile_row_1, (4,))
-                        target_frg_1 = tile_row_1[None, dp_idx // 4]
-                        cute.arch.atomic_add(
-                            target_frg_1.iterator.llvm_ptr,
-                            rdkv_frg_1.load(),
-                        )
-            self.reduce_pace_barrier.arrive_and_wait()
-            if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-                _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+            kv_index = r_topk[i]
+            if kv_index >= Int32(0):
+                dkv_row = mdKV_acc[
+                    None,
+                    kv_index,
+                    (0, batch_idx),
+                ]
+                tile_row = cute.flat_divide(dkv_row, (128,))
+                tile_row_1 = tile_row[None, sub_tile_idx_1]
+                tile_row_1 = cute.flat_divide(tile_row_1, (4,))
+                target_frg_1 = tile_row_1[None, dp_idx // 4]
+                cute.arch.atomic_add(
+                    target_frg_1.iterator.llvm_ptr,
+                    rdkv_frg_1.load(),
+                )
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
+                self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
         return wait_state, release_state
 
 
