@@ -73,7 +73,7 @@
 | A6 | 2026-08-14 | Four static rank/warp REDG orders could spread concurrent row-index waves without delays. | Not run: 0/2/4/6 mechanism clones 16→64 static REDG sites. | Historical final-gate ratio 1.009475 | N/A | REJECTED | `76f5df1` includes dual-warp-loan+rotation vs f987, so rotation-only timing is unavailable; final gate was 0.948% slower/STACK24. Existing structural cost rejected a duplicate current port. |
 | A7 | 2026-08-14 | Slot-0's terminal 256-thread barrier re-locksteps reducers into a sharp slot-1 burst; removing only that gate should let wait/T2R latency dephase them naturally. | Retained the N=4 mid-slot gates and final slot-1 gate; removed only slot-0 terminal pace gate. | M0 9.087824 ms; A7 9.086576 ms / 605.020 TFLOPS | +0.029% | REJECTED | Same-B200 ABBA-balanced 48-pair run, commit `def3acf`; ratio 0.999709. Artifact `.dsa-allinone/a7-def3acf/perf-m0-vs-a7-r1-result/perf.json`. Below the predeclared 2% acceptance threshold; no second run or trace. |
 | A8 | 2026-08-14 | The two CTA/two-WG reducers issue the same top-k row wave together; complementary 3/5 orders may lower same-address REDG queue collisions without adding dynamic work or barriers. | `cohort = wg_idx ^ rank`; cohort 0 issued groups 0:3 then 3:8, cohort 1 issued 3:8 then 0:3, rendezvousing at the existing mid and terminal barriers. Compile-time ranges preserved static register indexing. | M0 8.972000 ms; A8 9.014064 ms / 609.887 TFLOPS | -0.434% | REJECTED | Same-B200 ABBA-balanced 48-pair run, commit `5b2c835`; ratio 1.004336. REG96/STACK16 unchanged, static vector-atomic sites 16→32. Artifact `.dsa-allinone/a8-5b2c835/perf-m0-vs-a8-r1/perf.json`. |
-| A9 | 2026-08-14 | If cross-query clusters serialize on the same `(KV row, D quad)`, hashing tokens over two independent FP32 workspace planes should relieve that serialization without changing REDG count, writer width, or upstream work. | Allocate two 8-MiB dKV planes, route `token_idx % 2`, and sum both planes in the canonical BF16 finalize kernel. | PENDING | PENDING | RUNNING | Predeclared gate: compile/correctness must pass; accept only if end-to-end paired speedup is at least 2%, then confirm in a second run. P=2 is the production lower bound and directly distinguishes address collision from atomic-input/LSU pressure. |
+| A9 | 2026-08-14 | If cross-query clusters serialize on the same `(KV row, D quad)`, hashing tokens over two independent FP32 workspace planes should relieve that serialization without changing REDG count, writer width, or upstream work. | Allocated two 8-MiB dKV planes, routed `token_idx % 2`, and summed both planes in the canonical BF16 finalize kernel. | M0 8.922320 ms; A9 8.925792 ms / 615.918 TFLOPS | -0.051% | REJECTED | Same-B200 ABBA-balanced 24-pair diagnostic; ratio 1.000508. Exact candidate workspace was `[1,2,4096,2048]` bytes versus one reference plane. Correct end-to-end P2 is neutral, so cross-query same-address serialization is not a useful production lever. Artifact `.dsa-allinone/a9-3e625dd/run-r0/perf-result/perf.json`; source restored to M0. |
 
 ## Next steps
 
@@ -124,6 +124,11 @@
   8.972000/9.014064 ms over 48 ABBA-balanced pairs (-0.434%, ratio 1.004336). Address-wave
   permutation without reducing active writers is not a useful lever — revision `5b2c835`, source
   restored — regime current N=4 reducer schedule.
+- Two-plane query-hashed dKV workspace — preserved 2-CTA, REDG count, writer width, and upstream
+  work, then correctly summed both FP32 planes in conversion, but measured 8.922320/8.925792 ms
+  over 24 ABBA-balanced pairs (-0.051%, ratio 1.000508). Cross-query same-address serialization
+  does not explain the candidate gap at an end-to-end production boundary — revision `3e625dd`,
+  artifact `.dsa-allinone/a9-3e625dd/run-r0/perf-result/perf.json` — regime current M0.
 
 ## Session log
 
@@ -145,3 +150,7 @@
 - 2026-08-14 A8 closeout: two complementary 3/5 REDG group orders kept dynamic work and barrier
   count unchanged and compiled at REG96/STACK16, but were 0.434% slower (8.972000/9.014064 ms,
   48 ABBA-balanced pairs). Pure address permutation is rejected; no second run or trace.
+- 2026-08-14 A9 closeout: a correct two-plane query hash changed only the global accumulation
+  collision domain plus final sum and measured -0.051% end-to-end. Rejected below the 2% gate;
+  no second run, correctness sweep, NCU, or SMART trace was warranted. The next discriminator is
+  real 16→8 reducer-writer gating with unchanged dynamic REDG and fragment topology.

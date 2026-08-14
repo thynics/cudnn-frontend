@@ -4043,24 +4043,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     PDS_BLOCK_ELEMENTS = 2_048
     PDS_BLOCK_BYTES = 4_096
 
-    # Split independent query clusters across two FP32 accumulation planes.
-    # The final conversion adds the planes before casting back to BF16.  This
-    # preserves the math while removing same-address atomic serialization
-    # between even and odd query tokens.
-    WORKSPACE_PLANES = 2
-
-    @staticmethod
-    def _get_workspace_size_dKV(
-        k: int,
-        d: int,
-        b: int,
-        acc_dtype,
-    ):
-        d = (d + 7) // 8 * 8
-        k = (k + 7) // 8 * 8
-        workspace_bytes = d * acc_dtype.width // 8
-        return (b, 2, k, workspace_bytes)
-
     TMEM_S_OFFSET = 0
     TMEM_S1_OFFSET = 32
     TMEM_DP_OFFSET = 64
@@ -4929,6 +4911,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     ):
         """v2 rotated-schedule two-CTA backward (design: 优化设计文档_v2.md)."""
 
+        _ = problem_shape
         _ = mQ
         _ = mdO
         _ = trace_buffer
@@ -4947,16 +4930,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         peer_rank = Int32(1) - rank
         token_idx = physical_x // self.CLUSTER_SHAPE_MNK[0]
         is_leader_cta = rank == Int32(0)
-        workspace_plane_stride = (
-            cute.round_up(problem_shape[1], 8)
-            * Int32(self.D_HEAD)
-        )
-        workspace_plane = token_idx % Int32(self.WORKSPACE_PLANES)
-        plane_mdKV_acc = cute.make_tensor(
-            mdKV_acc.iterator
-            + workspace_plane * workspace_plane_stride,
-            mdKV_acc.layout,
-        )
 
         if warp_idx == Int32(self.LOAD_WARP):
             cpasync.prefetch_descriptor(tma_atom_q)
@@ -6264,7 +6237,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 dkv_wait, dkv_rel = self._drain_dkv_v8(
                     t_dkv[0],
                     t_dkv[1],
-                    plane_mdKV_acc,
+                    mdKV_acc,
                     mTopkIdxs,
                     tile_index,
                     topk,
@@ -7207,28 +7180,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         seq_block_idx, _, batch_idx = cute.arch.block_idx()
         seq_id = self.block_seq * seq_block_idx + tidy
         if seq_id < seqlen:
-            plane_stride = (
-                cute.round_up(seqlen, 8)
-                * Int32(self.D_HEAD)
-            )
-            plane_1 = cute.make_tensor(
-                mdKV_acc.iterator + plane_stride,
-                mdKV_acc.layout,
-            )
-            acc_row_0 = mdKV_acc[None, seq_id, (0, batch_idx)]
-            acc_row_1 = plane_1[None, seq_id, (0, batch_idx)]
+            acc_row = mdKV_acc[None, seq_id, (0, batch_idx)]
             out_row = mdKV[None, seq_id, (0, batch_idx)]
-            tile_acc_row_0 = cute.flat_divide(acc_row_0, (64,))
-            tile_acc_row_0 = cute.flat_divide(tile_acc_row_0, (32,))
-            tile_acc_row_1 = cute.flat_divide(acc_row_1, (64,))
-            tile_acc_row_1 = cute.flat_divide(tile_acc_row_1, (32,))
+            tile_acc_row = cute.flat_divide(acc_row, (64,))
+            tile_acc_row = cute.flat_divide(tile_acc_row, (32,))
             num_128_tiles = self.head_dim_main // 64
             for i in cutlass.range(num_128_tiles, unroll_full=True):
                 for j in cutlass.range(2, unroll_full=True):
-                    scrambled = (
-                        tile_acc_row_0[tidx, j, i]
-                        + tile_acc_row_1[tidx, j, i]
-                    )
+                    scrambled = tile_acc_row[tidx, j, i]
                     dim_idx = (
                         tidx // 4
                         + tidx % 4 * 8
