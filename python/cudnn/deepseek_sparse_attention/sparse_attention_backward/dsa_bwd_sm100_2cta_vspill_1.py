@@ -35,8 +35,6 @@ REDUCE_PACE_EVERY = 4
 # PINNED 0: the measured-best configuration is N=4 with no nap (8.94 ms);
 # the 200ns spread variant was never benchmarked.
 REDUCE_PACE_SLEEP_NS = 0
-# A19 attribution only: mask one physical-panel-swapped CTA rank.
-REDG_DISABLED_RANK = 1
 
 
 @dsl_user_op
@@ -7189,10 +7187,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             num_128_tiles = self.head_dim_main // 64
             for i in cutlass.range(num_128_tiles, unroll_full=True):
                 for j in cutlass.range(2, unroll_full=True):
-                    # A19: compensate the physical rank-panel swap while
-                    # preserving the canonical logical dimension order.
-                    physical_i = i ^ Int32(2)
-                    scrambled = tile_acc_row[tidx, j, physical_i]
+                    scrambled = tile_acc_row[tidx, j, i]
                     dim_idx = (
                         tidx // 4
                         + tidx % 4 * 8
@@ -7317,9 +7312,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         release_state.advance()
 
         assert cute.size(thread_values_0) == self.N_TILE // 2
-        physical_rank = rank ^ Int32(1)
-        sub_tile_idx_0 = physical_rank
-        sub_tile_idx_1 = Int32(2) + physical_rank
+        sub_tile_idx_0 = rank
+        sub_tile_idx_1 = Int32(2) + rank
         for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
             rdkv_frg_0 = cute.make_rmem_tensor(
@@ -7342,11 +7336,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 tile_row_0 = tile_row[None, sub_tile_idx_0]
                 tile_row_0 = cute.flat_divide(tile_row_0, (4,))
                 target_frg_0 = tile_row_0[None, dp_idx // 4]
-                if rank != Int32(REDG_DISABLED_RANK):
-                    cute.arch.atomic_add(
-                        target_frg_0.iterator.llvm_ptr,
-                        rdkv_frg_0.load(),
-                    )
+                cute.arch.atomic_add(
+                    target_frg_0.iterator.llvm_ptr,
+                    rdkv_frg_0.load(),
+                )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
@@ -7385,11 +7378,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 tile_row_1 = tile_row[None, sub_tile_idx_1]
                 tile_row_1 = cute.flat_divide(tile_row_1, (4,))
                 target_frg_1 = tile_row_1[None, dp_idx // 4]
-                if rank != Int32(REDG_DISABLED_RANK):
-                    cute.arch.atomic_add(
-                        target_frg_1.iterator.llvm_ptr,
-                        rdkv_frg_1.load(),
-                    )
+                cute.arch.atomic_add(
+                    target_frg_1.iterator.llvm_ptr,
+                    rdkv_frg_1.load(),
+                )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
