@@ -18,7 +18,12 @@ import cutlass
 # vfinal_aug_1 experiment: neutralize the dKV reducer payload while keeping
 # every synchronization edge (consumer_wait / fence / consumer_release and
 # pipeline-state advances) exactly in place.  Set False to restore candidate.
-REDUCER_NOP = True
+REDUCER_NOP = False
+# Narrow probe: keep ALL reducer work (T2R, index preload, register
+# gathers, address math, dkv_done timing) and suppress ONLY the
+# red.global atomic_add via a runtime-false branch (topk < 0) that the
+# compiler cannot fold, so nothing upstream is dead-code-eliminated.
+ATOMIC_GMEM_NOP = True
 
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -7178,10 +7183,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_row_0 = tile_row[None, sub_tile_idx_0]
                     tile_row_0 = cute.flat_divide(tile_row_0, (4,))
                     target_frg_0 = tile_row_0[None, dp_idx // 4]
-                    cute.arch.atomic_add(
-                        target_frg_0.iterator.llvm_ptr,
-                        rdkv_frg_0.load(),
-                    )
+                    if cutlass.const_expr(ATOMIC_GMEM_NOP):
+                        if topk < Int32(0):
+                            cute.arch.atomic_add(
+                                target_frg_0.iterator.llvm_ptr,
+                                rdkv_frg_0.load(),
+                            )
+                    else:
+                        cute.arch.atomic_add(
+                            target_frg_0.iterator.llvm_ptr,
+                            rdkv_frg_0.load(),
+                        )
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7215,10 +7227,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_row_1 = tile_row[None, sub_tile_idx_1]
                     tile_row_1 = cute.flat_divide(tile_row_1, (4,))
                     target_frg_1 = tile_row_1[None, dp_idx // 4]
-                    cute.arch.atomic_add(
-                        target_frg_1.iterator.llvm_ptr,
-                        rdkv_frg_1.load(),
-                    )
+                    if cutlass.const_expr(ATOMIC_GMEM_NOP):
+                        if topk < Int32(0):
+                            cute.arch.atomic_add(
+                                target_frg_1.iterator.llvm_ptr,
+                                rdkv_frg_1.load(),
+                            )
+                    else:
+                        cute.arch.atomic_add(
+                            target_frg_1.iterator.llvm_ptr,
+                            rdkv_frg_1.load(),
+                        )
         return wait_state, release_state
 
 
