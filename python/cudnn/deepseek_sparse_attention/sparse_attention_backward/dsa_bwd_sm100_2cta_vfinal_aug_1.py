@@ -23,7 +23,14 @@ REDUCER_NOP = False
 # gathers, address math, dkv_done timing) and suppress ONLY the
 # red.global atomic_add via a runtime-false branch (topk < 0) that the
 # compiler cannot fold, so nothing upstream is dead-code-eliminated.
-ATOMIC_GMEM_NOP = True
+ATOMIC_GMEM_NOP = False
+# Baseline-mimic probe: replace the red.global RMW atomic with a plain
+# vector store to the same mdKV_acc address (one STG.E.128 per former
+# REDG.E.ADD.F32x4 -- issue-count parity, no L2 read-modify-write).
+# Within one launch every (row, D-panel) is written exactly once, so
+# this launch's values are exact; cross-launch accumulation semantics
+# are intentionally dropped for this perf probe.
+ATOMIC_TO_STG = True
 
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -7183,7 +7190,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_row_0 = tile_row[None, sub_tile_idx_0]
                     tile_row_0 = cute.flat_divide(tile_row_0, (4,))
                     target_frg_0 = tile_row_0[None, dp_idx // 4]
-                    if cutlass.const_expr(ATOMIC_GMEM_NOP):
+                    if cutlass.const_expr(ATOMIC_TO_STG):
+                        target_frg_0.store(rdkv_frg_0.load())
+                    elif cutlass.const_expr(ATOMIC_GMEM_NOP):
                         if topk < Int32(0):
                             cute.arch.atomic_add(
                                 target_frg_0.iterator.llvm_ptr,
@@ -7227,7 +7236,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_row_1 = tile_row[None, sub_tile_idx_1]
                     tile_row_1 = cute.flat_divide(tile_row_1, (4,))
                     target_frg_1 = tile_row_1[None, dp_idx // 4]
-                    if cutlass.const_expr(ATOMIC_GMEM_NOP):
+                    if cutlass.const_expr(ATOMIC_TO_STG):
+                        target_frg_1.store(rdkv_frg_1.load())
+                    elif cutlass.const_expr(ATOMIC_GMEM_NOP):
                         if topk < Int32(0):
                             cute.arch.atomic_add(
                                 target_frg_1.iterator.llvm_ptr,
