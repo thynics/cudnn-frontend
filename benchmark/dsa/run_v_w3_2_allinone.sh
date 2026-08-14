@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Managed-B200 correctness gate, fair direct benchmark, and IKET trace capture.
-# Successful local output contains only perf.json and trace.json. Failures keep
-# session.log plus every compact remote diagnostic/result produced before the
-# failing stage. The global service allocation and Docker worker are reused;
-# only its per-request pipeline lock is held for the duration of this run.
+# Canonical B200 correctness gate, fair direct benchmark, and optional IKET
+# trace capture.  GPU ownership is exclusively through the shared v2 gpu-pool;
+# its foreground enter process is the lease guardian for the entire workload.
 
 usage() {
   cat <<'EOF'
@@ -14,25 +12,29 @@ Usage:
 
 Options:
   --impl TOKEN          Candidate token (default: final)
+  --mode perf|all       Correctness + release perf, optionally IKET (default: all)
   --remote-repo PATH    ComputeLab checkout (default:
                         /home/scratch.longcheng_gpu/cudnn-frontend-thynics)
   --output-dir PATH     New local result directory
   -h, --help            Show this help
 
-Success: OUTPUT_DIR/{perf.json,trace.json}
+Success (perf): OUTPUT_DIR/{correctness.json,perf.json}
+Success (all):  OUTPUT_DIR/{correctness.json,perf.json,trace.json}
 Failure: OUTPUT_DIR/session.log plus remote logs/status/partial JSON artifacts
 
-The existing managed B200 allocation/Docker worker is reused when healthy.
-This command never stops that service; it releases only pipeline.lock.
+The v2 pool reuses a hot compatible B200 allocation when available.  The
+attached shell exits after the workload, cleanly releasing this request while
+leaving healthy pool capacity available to later callers.
 EOF
 }
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "${script_dir}/../.." && pwd -P)"
-frontend="${COMPUTELAB_B200_FRONTEND:-computelab-sc-01}"
+frontend="${COMPUTELAB_B200_FRONTEND:-longcheng@computelab-sc-01}"
 implementation="final"
+mode="all"
 remote_repo="/home/scratch.longcheng_gpu/cudnn-frontend-thynics"
-remote_manager="/home/scratch.longcheng_gpu/dsa-b200-harness-image/b200_manager.sh"
+gpu_pool="${DSA_GPU_POOL:-/home/scratch.longcheng_gpu/.gpu_manager/v2/bin/gpu-pool}"
 output_dir=""
 
 while (($#)); do
@@ -40,6 +42,11 @@ while (($#)); do
     --impl)
       [[ $# -ge 2 ]] || { echo "ERROR: --impl needs a value" >&2; exit 2; }
       implementation="$2"
+      shift 2
+      ;;
+    --mode)
+      [[ $# -ge 2 ]] || { echo "ERROR: --mode needs a value" >&2; exit 2; }
+      mode="${2,,}"
       shift 2
       ;;
     --remote-repo)
@@ -68,12 +75,20 @@ done
   echo "ERROR: --impl must match [a-z][a-zA-Z0-9_]{0,31}" >&2
   exit 2
 }
+[[ "${mode}" == "perf" || "${mode}" == "all" ]] || {
+  echo "ERROR: --mode must be perf or all" >&2
+  exit 2
+}
 [[ "${remote_repo}" == /home/scratch.longcheng_gpu/* ]] || {
   echo "ERROR: --remote-repo must be under /home/scratch.longcheng_gpu" >&2
   exit 2
 }
+[[ "${gpu_pool}" == /home/scratch.longcheng_gpu/.gpu_manager/v2/bin/gpu-pool ]] || {
+  echo "ERROR: DSA_GPU_POOL must resolve to the authoritative v2 entrypoint" >&2
+  exit 2
+}
 
-for executable in bash git python3 scp ssh tar; do
+for executable in awk bash git mktemp python3 scp sed sha256sum ssh tail tar tee; do
   command -v "${executable}" >/dev/null 2>&1 || {
     echo "ERROR: missing executable: ${executable}" >&2
     exit 2
@@ -87,6 +102,50 @@ expanded_hostname="$(
   echo "ERROR: ${frontend} expands to unsupported host ${expanded_hostname:-<empty>}" >&2
   exit 2
 }
+
+package_rel="python/cudnn/deepseek_sparse_attention/sparse_attention_backward"
+release_rel="${package_rel}/dsa_bwd_sm100_2cta_${implementation}.py"
+trace_rel="${package_rel}/dsa_bwd_sm100_2cta_${implementation}_trace.py"
+required_sources=("${release_rel}")
+if [[ "${mode}" == "all" ]]; then
+  required_sources+=("${trace_rel}")
+fi
+for source_rel in "${required_sources[@]}"; do
+  [[ -s "${repo_root}/${source_rel}" ]] || {
+    echo "ERROR: missing implementation source: ${source_rel}" >&2
+    exit 2
+  }
+  git -C "${repo_root}" ls-files --error-unmatch -- "${source_rel}" \
+    >/dev/null 2>&1 || {
+      echo "ERROR: implementation source must be tracked: ${source_rel}" >&2
+      exit 2
+    }
+done
+if ! git -C "${repo_root}" diff --quiet HEAD -- "${required_sources[@]}"; then
+  echo "ERROR: implementation source has uncommitted changes" >&2
+  exit 2
+fi
+local_revision="$(git -C "${repo_root}" rev-parse HEAD)"
+upstream_revision="$(git -C "${repo_root}" rev-parse '@{upstream}' 2>/dev/null || true)"
+upstream_ref="$(git -C "${repo_root}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+if [[ -z "${upstream_revision}" || "${local_revision}" != "${upstream_revision}" ]]; then
+  echo "ERROR: repository HEAD must be pushed before B200 execution" >&2
+  echo "local=${local_revision} upstream=${upstream_revision:-missing}" >&2
+  exit 2
+fi
+[[ "${upstream_ref}" =~ ^([A-Za-z0-9_.-]+)/([A-Za-z0-9_./-]+)$ ]] || {
+  echo "ERROR: unsupported upstream ref: ${upstream_ref:-missing}" >&2
+  exit 2
+}
+upstream_remote="${BASH_REMATCH[1]}"
+upstream_branch="${BASH_REMATCH[2]}"
+release_sha256="$(sha256sum "${repo_root}/${release_rel}" | awk '{print $1}')"
+trace_sha256="$(printf '0%.0s' {1..64})"
+if [[ "${mode}" == "all" ]]; then
+  trace_sha256="$(sha256sum "${repo_root}/${trace_rel}" | awk '{print $1}')"
+fi
+echo "DSA_INPUT impl=${implementation} mode=${mode} revision=${local_revision}"
+echo "DSA_SOURCE release_sha256=${release_sha256} trace_sha256=${trace_sha256}"
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)_${implementation}_$$"
 if [[ -z "${output_dir}" ]]; then
@@ -107,13 +166,27 @@ remote_run_root="/home/scratch.longcheng_gpu/.dsa-allinone/${run_id}"
 remote_payload="${remote_run_root}/remote.sh"
 remote_result="${remote_run_root}/result"
 remote_worktree="${remote_run_root}/worktree"
+pool_project="cudnn-frontend/dsa-allinone-${implementation}"
+pool_workdir="/home/scratch.longcheng_gpu/.dsa-allinone-pool/${implementation}"
 completed=0
+pool_request_id=""
 
 exec > >(tee -a "${session_log}") 2>&1
 
 cleanup() {
   local rc=$?
   set +e
+  if [[ -z "${pool_request_id}" && -s "${session_log}" ]]; then
+    pool_request_id="$(
+      sed -n 's/.*project=[^ ]* request=\(r[0-9a-f]*\).*/\1/p' \
+        "${session_log}" | tail -n 1
+    )"
+  fi
+  if [[ -n "${pool_request_id}" ]]; then
+    ssh -o BatchMode=yes "${frontend}" \
+      "$(printf '%q ' "${gpu_pool}" release --wait "${pool_request_id}")" \
+      >/dev/null 2>&1 || true
+  fi
   rm -rf "${temp_dir}"
   if ((completed)); then
     rm -f "${session_log}"
@@ -132,6 +205,12 @@ implementation="$1"
 repo="$2"
 result="$3"
 worktree="$4"
+mode="$5"
+expected_revision="$6"
+expected_release_sha256="$7"
+expected_trace_sha256="$8"
+upstream_remote="$9"
+upstream_branch="${10}"
 run_root="$(dirname "${result}")"
 package_rel="python/cudnn/deepseek_sparse_attention/sparse_attention_backward"
 interface_template="/home/scratch.longcheng_gpu/dsa-b200-harness-image/interface_sm100.py"
@@ -162,7 +241,11 @@ finish() {
   STATUS_LINE="${error_line}" \
   STATUS_COMMAND="${error_command}" \
   STATUS_IMPL="${implementation}" \
+  STATUS_MODE="${mode}" \
   STATUS_REPO="${repo}" \
+  STATUS_REVISION="${expected_revision}" \
+  STATUS_RELEASE_SHA256="${expected_release_sha256}" \
+  STATUS_TRACE_SHA256="${expected_trace_sha256}" \
   python3 - "${result}/status.json" <<'PY_STATUS'
 import json
 import os
@@ -176,7 +259,13 @@ payload = {
     "error_line": os.environ["STATUS_LINE"] or None,
     "error_command": os.environ["STATUS_COMMAND"] or None,
     "implementation": os.environ["STATUS_IMPL"],
+    "mode": os.environ["STATUS_MODE"],
     "repo": os.environ["STATUS_REPO"],
+    "source": {
+        "revision": os.environ["STATUS_REVISION"],
+        "release_sha256": os.environ["STATUS_RELEASE_SHA256"],
+        "trace_sha256": os.environ["STATUS_TRACE_SHA256"],
+    },
 }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(payload, handle, indent=2, sort_keys=True)
@@ -191,9 +280,17 @@ trap finish EXIT
 [[ "${result}" == /home/scratch.longcheng_gpu/* ]]
 [[ "${worktree}" == /home/scratch.longcheng_gpu/* ]]
 [[ -d "${repo}/.git" || -f "${repo}/.git" ]]
+[[ "${mode}" == "perf" || "${mode}" == "all" ]]
+[[ "${expected_revision}" =~ ^[0-9a-f]{40}$ ]]
+[[ "${expected_release_sha256}" =~ ^[0-9a-f]{64}$ ]]
+[[ "${expected_trace_sha256}" =~ ^[0-9a-f]{64}$ ]]
+[[ "${upstream_remote}" =~ ^[A-Za-z0-9_.-]+$ ]]
+[[ "${upstream_branch}" =~ ^[A-Za-z0-9_./-]+$ ]]
 
+stage="verify_source_available"
+git -C "${repo}" cat-file -e "${expected_revision}^{commit}"
 stage="create_worktree"
-git -C "${repo}" worktree add --detach "${worktree}" HEAD
+git -C "${repo}" worktree add --detach "${worktree}" "${expected_revision}"
 
 package="${worktree}/${package_rel}"
 release_source="${package}/dsa_bwd_sm100_2cta_${implementation}.py"
@@ -201,10 +298,23 @@ trace_source="${package}/dsa_bwd_sm100_2cta_${implementation}_trace.py"
 active_source="${package}/dsa_bwd_sm100_2cta_v2.py"
 stage="locate_runtime"
 [[ -s "${release_source}" ]]
-[[ -s "${trace_source}" ]]
+if [[ "${mode}" == "all" ]]; then
+  [[ -s "${trace_source}" ]]
+fi
 [[ -s "${interface_template}" ]]
 [[ -x "${release_python}" ]]
-[[ -x "${trace_python}" ]]
+if [[ "${mode}" == "all" ]]; then
+  [[ -x "${trace_python}" ]]
+fi
+actual_revision="$(git -C "${worktree}" rev-parse HEAD)"
+actual_release_sha256="$(sha256sum "${release_source}" | awk '{print $1}')"
+[[ "${actual_revision}" == "${expected_revision}" ]]
+[[ "${actual_release_sha256}" == "${expected_release_sha256}" ]]
+if [[ "${mode}" == "all" ]]; then
+  actual_trace_sha256="$(sha256sum "${trace_source}" | awk '{print $1}')"
+  [[ "${actual_trace_sha256}" == "${expected_trace_sha256}" ]]
+fi
+echo "DSA_REMOTE_SOURCE revision=${actual_revision} release_sha256=${actual_release_sha256} trace_sha256=${expected_trace_sha256}"
 
 compiled_module="$(find "${repo}/python/cudnn" -maxdepth 1 -type f \
   -name '_compiled_module*.so' -print -quit)"
@@ -230,10 +340,23 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="${worktree}/python:${worktree}/test/python:${worktree}"
 export DSA_DEV_CANDIDATE_VARIANT="v2native"
 export DSA_DEV_IMPLEMENTATION="${implementation}"
+export DSA_BL_QDO_STAGE=1
+export DSA_BL_K_STAGE=1
+export DSA_BL_HALFK=0
+export DSA_BL_KSTAGE2=0
+export DSA_BL_OVPAD=0
 unset DSA_DEV_IKET DKG_IKET_INSTRUMENTATION_METHOD IKET_STANDALONE_SITE_PACKAGES
 
 stage="release_correctness_and_perf"
-"${release_python}" - "${worktree}" "${result}/correctness.json" "${result}/perf.json" <<'PY_RELEASE'
+"${release_python}" - \
+  "${worktree}" \
+  "${result}/correctness.json" \
+  "${result}/perf.json" \
+  "${implementation}" \
+  "${mode}" \
+  "${expected_revision}" \
+  "${expected_release_sha256}" \
+  "${expected_trace_sha256}" <<'PY_RELEASE'
 from __future__ import annotations
 
 import json
@@ -249,8 +372,21 @@ import torch
 repo = Path(sys.argv[1]).resolve()
 correctness_output = Path(sys.argv[2]).resolve()
 perf_output = Path(sys.argv[3]).resolve()
+implementation = sys.argv[4]
+mode = sys.argv[5]
+source_revision = sys.argv[6]
+release_sha256 = sys.argv[7]
+trace_sha256 = sys.argv[8]
 
 os.environ["DSA_DEV_CANDIDATE_VARIANT"] = "v2native"
+baseline_environment = {
+    "DSA_BL_QDO_STAGE": "1",
+    "DSA_BL_K_STAGE": "1",
+    "DSA_BL_HALFK": "0",
+    "DSA_BL_KSTAGE2": "0",
+    "DSA_BL_OVPAD": "0",
+}
+os.environ.update(baseline_environment)
 os.environ.pop("DSA_DEV_IKET", None)
 os.environ.pop("DKG_IKET_INSTRUMENTATION_METHOD", None)
 sys.path[:0] = [str(repo / "python"), str(repo / "test/python"), str(repo)]
@@ -379,7 +515,7 @@ correctness_output.write_text(json.dumps(correctness_payload, indent=2, sort_key
 # the old wrapper-vs-direct bias while retaining the validation anchor shape.
 import cutlass
 import cutlass.cute as cute
-from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100 import (
+from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_baseline import (
     FlashAttentionDSABackwardSm100,
 )
 from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2cta_v2 import (
@@ -455,6 +591,20 @@ def build_direct_runner(impl_cls, has_trace_args):
         block_tile=64,
         max_topk=p_topk,
     )
+    if impl_cls is FlashAttentionDSABackwardSm100:
+        kernel._setup_attributes()
+        observed_baseline = {
+            "load_mma_QdO_stage": kernel.load_mma_QdO_stage,
+            "load_mma_K_stage": kernel.load_mma_K_stage,
+        }
+        expected_baseline = {
+            "load_mma_QdO_stage": 1,
+            "load_mma_K_stage": 1,
+        }
+        if observed_baseline != expected_baseline:
+            raise RuntimeError(
+                f"baseline environment isolation failed: {observed_baseline}"
+            )
     prototypes = [
         to_cute_tensor(q, divisibility=p_dim),
         to_cute_tensor(kv, divisibility=p_dim),
@@ -596,12 +746,15 @@ paired_ratio = statistics.median(paired_ratios)
 flops = bench.flops_bwd(p_s_q, p_topk, p_heads, p_dim, p_dim)
 perf = {
     "status": "pass",
+    "implementation": implementation,
+    "mode": mode,
     "benchmark": "fair_direct_program_only_20260810",
     "primary_metric": "program_only",
     "trace_enabled": False,
     "fairness_contract": {
-        "baseline_path": "direct cute.compile(FlashAttentionDSABackwardSm100)",
+        "baseline_path": "direct cute.compile(dsa_bwd_sm100_baseline.FlashAttentionDSABackwardSm100)",
         "candidate_path": "direct cute.compile(FlashAttentionDSABackwardSm100TwoCTAV2)",
+        "baseline_environment": baseline_environment,
         "same_inputs": True,
         "same_output_and_workspace_addresses": True,
         "same_reset_set": ["dkv", "workspace_dkv", "d_sink"],
@@ -627,6 +780,11 @@ perf = {
     "latency_ms": round(candidate_latency_ms, 6),
     "tflops": round(flops / (candidate_latency_ms * 1e-3) / 1e12, 6),
     "correctness_crosscheck": crosscheck,
+    "source": {
+        "revision": source_revision,
+        "release_sha256": release_sha256,
+        "trace_sha256": trace_sha256,
+    },
     "raw_ms": samples,
     "torch_version": torch.__version__,
     "torch_cuda_version": torch.version.cuda,
@@ -634,6 +792,12 @@ perf = {
 perf_output.write_text(json.dumps(perf, indent=2, sort_keys=True) + "\n")
 print(json.dumps(perf, indent=2, sort_keys=True), flush=True)
 PY_RELEASE
+
+if [[ "${mode}" == "perf" ]]; then
+  stage="complete"
+  echo "DSA_ALLINONE_PASS mode=perf correctness=${result}/correctness.json perf=${result}/perf.json"
+  exit 0
+fi
 
 stage="prepare_trace"
 cp "${trace_source}" "${active_source}"
@@ -690,72 +854,156 @@ decoded=("${capture}"/iket/pid_*/iket.decoded_results.json)
 cp "${decoded[0]}" "${result}/trace.json"
 
 stage="complete"
-echo "DSA_ALLINONE_PASS perf=${result}/perf.json trace=${result}/trace.json"
+echo "DSA_ALLINONE_PASS mode=all correctness=${result}/correctness.json perf=${result}/perf.json trace=${result}/trace.json"
 REMOTE_SCRIPT
 
+echo "Fetching the exact pushed revision into the shared scratch repository..."
+ssh -o BatchMode=yes "${frontend}" \
+  "$(printf '%q ' git -C "${remote_repo}" fetch --no-tags "${upstream_remote}" "refs/heads/${upstream_branch}:refs/remotes/${upstream_remote}/${upstream_branch}")"
+ssh -o BatchMode=yes "${frontend}" \
+  "$(printf '%q ' git -C "${remote_repo}" cat-file -e "${local_revision}^{commit}")"
+
 echo "Staging all-in-one payload: ${frontend}:${remote_payload}"
-ssh -o BatchMode=yes "${frontend}" "mkdir -p '${remote_run_root}'"
+ssh -o BatchMode=yes "${frontend}" \
+  "mkdir -p '${remote_run_root}' '${pool_workdir}'"
 scp -q "${remote_payload_local}" "${frontend}:${remote_payload}"
 ssh -o BatchMode=yes "${frontend}" \
   "chmod 700 '${remote_payload}' && test -x '${remote_payload}'"
 
-manager_label="dsa-allinone"
 remote_command="$(printf "%q " \
-  "${remote_manager}" \
-  with-lock \
-  --label "${manager_label}" \
-  --sync-repo "${remote_repo}" \
-  -- \
   "${remote_payload}" \
   "${implementation}" \
   "${remote_repo}" \
   "${remote_result}" \
-  "${remote_worktree}")"
+  "${remote_worktree}" \
+  "${mode}" \
+  "${local_revision}" \
+  "${release_sha256}" \
+  "${trace_sha256}" \
+  "${upstream_remote}" \
+  "${upstream_branch}")"
+pool_stdin="${temp_dir}/pool.stdin"
+{
+  printf '%s\n' "${remote_command}"
+  printf '%s\n' 'dsa_workload_rc=$?'
+  printf '%s\n' 'exit "${dsa_workload_rc}"'
+} >"${pool_stdin}"
+pool_command="$(printf "%q " \
+  "${gpu_pool}" \
+  enter \
+  --project "${pool_project}" \
+  --model B200 \
+  --gpus 1 \
+  --time 04:00:00 \
+  --workdir "${pool_workdir}")"
 
-echo "Reusing the managed B200 worker and acquiring pipeline.lock..."
+echo "Entering the shared v2 B200 pool with a foreground guardian..."
 set +e
-ssh -o BatchMode=yes "${frontend}" "${remote_command}"
+ssh -tt \
+  -o BatchMode=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=4 \
+  "${frontend}" \
+  "${pool_command}" \
+  <"${pool_stdin}"
 run_rc=$?
 set -e
 
-if ((run_rc != 0)); then
-  echo "Remote run failed (rc=${run_rc}); downloading diagnostics..." >&2
+pool_request_id="$(
+  sed -n 's/.*project=[^ ]* request=\(r[0-9a-f]*\).*/\1/p' \
+    "${session_log}" | tail -n 1
+)"
+if [[ -z "${pool_request_id}" ]]; then
+  echo "ERROR: gpu-pool did not report a request ID" >&2
+  exit 70
+fi
+ssh -o BatchMode=yes "${frontend}" \
+  "$(printf '%q ' "${gpu_pool}" release --wait "${pool_request_id}")"
+
+status_probe="${temp_dir}/status.json"
+if ! scp -q "${frontend}:${remote_result}/status.json" "${status_probe}"; then
+  echo "ERROR: workload produced no status artifact (attach_rc=${run_rc})" >&2
+  if ((run_rc != 0)); then
+    exit "${run_rc}"
+  fi
+  exit 1
+fi
+status_rc="$(python3 - "${status_probe}" <<'PY_STATUS_RC'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    status = json.load(handle)
+if status.get("status") == "pass" and status.get("stage") == "complete":
+    print(0)
+else:
+    print(int(status.get("exit_code") or 1))
+PY_STATUS_RC
+)"
+if ((status_rc != 0)); then
+  echo "Remote workload failed (rc=${status_rc}, attach_rc=${run_rc}); downloading diagnostics..." >&2
   scp -q -r "${frontend}:${remote_result}/." "${output_dir}/" || \
     echo "WARNING: remote diagnostics were unavailable; session.log is complete" >&2
-  exit "${run_rc}"
+  exit "${status_rc}"
 fi
-
-managed_status="$(
-  ssh -o BatchMode=yes "${frontend}" \
-    "$(printf '%q' "${remote_manager}") status"
-)"
-printf '%s\n' "${managed_status}"
-if ! grep -Fq 'heartbeat=fresh state=ready' <<<"${managed_status}"; then
-  echo "ERROR: managed B200 worker was not retained after pipeline.lock release" >&2
-  exit 70
+if ((run_rc != 0)); then
+  echo "WARNING: attach returned ${run_rc}, but the exact workload status passed" >&2
 fi
 
 echo "Downloading compact success artifacts..."
+success_artifacts=(correctness.json perf.json)
+if [[ "${mode}" == "all" ]]; then
+  success_artifacts+=(trace.json)
+fi
 ssh -o BatchMode=yes "${frontend}" \
-  "tar -C '${remote_result}' -cf - perf.json trace.json" |
+  "$(printf '%q ' tar -C "${remote_result}" -cf - "${success_artifacts[@]}")" |
   tar -C "${output_dir}" -xf -
 
-python3 - "${output_dir}/perf.json" "${output_dir}/trace.json" <<'PY_VERIFY'
+trace_output=""
+if [[ "${mode}" == "all" ]]; then
+  trace_output="${output_dir}/trace.json"
+fi
+python3 - \
+  "${output_dir}/perf.json" \
+  "${output_dir}/correctness.json" \
+  "${trace_output}" \
+  "${implementation}" \
+  "${mode}" \
+  "${local_revision}" \
+  "${release_sha256}" <<'PY_VERIFY'
 import json
 import os
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     perf = json.load(handle)
-if perf.get("status") != "pass" or perf.get("trace_enabled") is not False:
-    raise SystemExit(f"invalid perf JSON: {perf}")
-if not os.path.getsize(sys.argv[2]):
-    raise SystemExit("trace JSON is empty")
 with open(sys.argv[2], encoding="utf-8") as handle:
-    json.load(handle)
+    correctness = json.load(handle)
+trace_path, implementation, mode, revision, release_sha256 = sys.argv[3:]
+if (
+    perf.get("status") != "pass"
+    or perf.get("trace_enabled") is not False
+    or perf.get("implementation") != implementation
+    or perf.get("mode") != mode
+    or perf.get("source", {}).get("revision") != revision
+    or perf.get("source", {}).get("release_sha256") != release_sha256
+):
+    raise SystemExit(f"invalid perf JSON: {perf}")
+if correctness.get("status") != "pass" or correctness.get("patterns") != [
+    "dense", "lengths", "holes", "all_empty"
+]:
+    raise SystemExit(f"invalid correctness JSON: {correctness}")
+if mode == "all":
+    if not trace_path or not os.path.getsize(trace_path):
+        raise SystemExit("trace JSON is empty")
+    with open(trace_path, encoding="utf-8") as handle:
+        json.load(handle)
 print(
-    f"PASS latency_ms={perf['latency_ms']} tflops={perf['tflops']} "
-    f"perf={sys.argv[1]} trace={sys.argv[2]}"
+    f"PASS baseline_ms={perf['baseline_latency_ms']} "
+    f"candidate_ms={perf['candidate_latency_ms']} "
+    f"ratio={perf['candidate_over_baseline']} "
+    f"speedup_percent={perf['candidate_speedup_percent']} "
+    f"tflops={perf['tflops']} perf={sys.argv[1]}"
 )
 PY_VERIFY
 
