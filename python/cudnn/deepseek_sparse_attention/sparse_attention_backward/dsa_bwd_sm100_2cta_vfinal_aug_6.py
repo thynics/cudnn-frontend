@@ -27,8 +27,12 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
 # vfinal_aug_6 pacing knob: rejoin all reducer warps every N red.global
 # iterations inside each dKV atomic burst (plus one barrier at burst end).
-# N=4 measured 9.03 -> 8.94 ms; N=2 doubles the pace points per slot.
-REDUCE_PACE_EVERY = 2
+# Sweep: no pacing 9.02 / N=4 8.94 / N=2 9.05 -> density optimum is 4.
+REDUCE_PACE_EVERY = 4
+# Spread knob: after each pacing barrier every reducer warp naps this many
+# ns, stretching the two 8-op bursts across the period (baseline gets the
+# same spread from its MMA-cadence gating). 0 disables.
+REDUCE_PACE_SLEEP_NS = 200
 
 
 @dsl_user_op
@@ -94,6 +98,26 @@ def _cpasync_bulk_s2cluster(
             "mbarrier::complete_tx::bytes [$0], [$1], $3, [$2];"
         ),
         "r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _pace_nanosleep(
+    sleep_ns: int,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Pacing hint: stall this warp ~sleep_ns between atomic sections."""
+
+    llvm.inline_asm(
+        None,
+        [Int32(sleep_ns).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -7316,7 +7340,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
         self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7354,7 +7382,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
         self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
         return wait_state, release_state
 
 
