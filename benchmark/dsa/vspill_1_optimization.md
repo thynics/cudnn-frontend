@@ -69,7 +69,7 @@
 | A2 | 2026-08-14 | Four reducers/CTA match baseline's eight cluster-wide writers; doubled sequential work may lower peak pressure. | W8-W11 active, W12-W15 idle; one N64 T2R fragment, 16 REDG groups/thread, 160 reducer registers. | 9.092323 ms / 604.637 TFLOPS | -1.99% | REJECTED | Revision `5ae43d4` vs M0 8.914872 ms: +0.177451 ms / 1.019905x runtime. Source restored byte-identically to M0. |
 | A3 | 2026-08-14 | Exact M0 executes three reducer-local spill sites 6.291M times; raising reducer warps by eight registers appeared able to remove this path without changing occupancy. | Not run: reducer `setmaxregister_increase(120→128)` would consume 63,488 registers/CTA versus the 61,440-register launch pool; each SMSP would be 16 warp-register units short. | N/A | N/A | REJECTED | Static `setmaxnreg` pool audit: physical 65,536-register capacity does not enlarge the launch-time `640 threads × 96 registers` CTA pool; an unfunded increase may block permanently. |
 | A4 | 2026-08-14 | Reducer `LDL [R1+0x4] → R2UR` at `0x10800` and `0x11940` reloads the uniform loop bound 4.194M times and carries 11,336 long-scoreboard samples; explicitly retaining `tile_count` in the uniform domain should remove this stack round trip without changing the CTA pool. | Applied `cute.arch.make_warp_uniform(tile_count)` immediately after the existing ceil-div; preserved role split `48/128/120/64`, atomics, schedule, and topology. | Compile-only: reducer locals unchanged apart from `-0x30` PC shift (`LDL 0x107d0`, `STL 0x11090`, `LDL 0x11910`); whole main kernel 48→49 LDL, 21→22 STL, STACK 16→24 bytes. | N/A | REJECTED | Revision `108006c`; exact B200 cubin `/home/scratch.longcheng_gpu/.dsa-allinone/a4-108006c/capture/`. The uniform hint did not shorten the live range and worsened static spill shape, so perf was skipped by the predeclared SASS gate. |
-| A5 | 2026-08-14 | A4 proves a common-prologue hint is re-spilled; recomputing `topk`, `tile_count`, and CTA rank inside the reducer role should break cross-role CSE/LICM and eliminate both hot loop-bound LDLs plus the dead rank STL without changing register budgets. | Pending: reducer-local reload/clamp of `topk`, local ceil-div and `make_warp_uniform`, plus local `block_idx_in_cluster`; pass only these local scalars to `_drain_dkv_v8`. | pending | pending | — | Pre-change hypothesis from exact SASS def-use: `[R1+0x4]` is `tile_count`; `UR16 ← SR_CgaCtaId → STL [R1+0x8]` is a rank dead-store with no executed reload before reducer exit. |
+| A5 | 2026-08-14 | Reducer-local scalar rematerialization should remove three hot local sites without changing the register pool. | Recomputed topk/tile count/rank after role dispatch. | M0 9.073792 ms; A5 9.095104 ms / 604.452 TFLOPS | -0.088% | REJECTED | B200 48-pair AB. Static main kernel 48→45 LDL, 21 STL/STACK16; reducer has no local ops. Artifact `.dsa-allinone/a5-1120280/perf-m0-vs-a5-r1/perf.json`. Restored M0. |
 
 ## Next steps
 
@@ -86,8 +86,8 @@
 - [x] A3 unfunded reducer allocation 120→128 — statically rejected before launch: 63,488
   required versus 61,440 in the CTA launch pool; possible permanent `setmaxnreg.inc` wait —
   class config
-- [ ] Reducer-role local rematerialization of loop-bound/CTA-rank values — eliminate the three
-  exact local sites without changing any role budget — expected 1-5% — cost code — class staging
+- [x] Reducer-role local rematerialization removed all three exact reducer local sites but was
+  0.088% slower in a 48-pair AB; rejected and restored — class staging
 - [ ] Sweep dKV done stages 2→3 subject to TMEM budget — add producer slack around bursty drain — expected 1-5% — cost config — class staging
 - [ ] Reorder dQ rounds versus dV/dK head after P/dS publish — cover relay/write long poles with useful MMA — expected 2-8% — cost design-revision — class scheduling
 - [ ] Privatize dKV partials by query block and finalize in a bandwidth-efficient kernel if collision statistics permit — remove in-pipeline atomics — expected uncertain, potentially >10% — cost design-revision — class design
@@ -104,6 +104,9 @@
 - Global `make_warp_uniform(tile_count)` hint — exact B200 compile leaves all three reducer
   local sites intact and worsens the main kernel from 48/21 LDL/STL with STACK16 to 49/22 with
   STACK24; revision `108006c`, no perf run — regime current `48/128/120/64`
+- Reducer-local rematerialization — removed the target reducer LDL/STL sites and reduced static
+  main-kernel LDL 48→45 with unchanged 21 STL/STACK16, but measured 0.088% slower than same-device
+  M0 over 48 AB pairs; revision `1120280`, source restored — regime current reducer schedule
 
 ## Session log
 
@@ -116,3 +119,6 @@
 - 2026-08-14 A4 static gate: global uniform `tile_count` retained none of the intended values
   and added one static LDL/STL pair plus 8 stack bytes. Rejected without perf; A5 moves the
   rematerialization after reducer role dispatch and keeps the GPU lease for a fast compile gate.
+- 2026-08-14 A5 closeout: role-local rematerialization removed the three reducer-region local
+  sites, but same-device M0/A5 measured 9.073792/9.095104 ms over 48 AB pairs (-0.088%). The
+  spill signature is not on the current end-to-end critical path; A5 was rejected and restored.

@@ -6223,21 +6223,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # and released off the head commit, slot 1 off the tail commit,
             # then both atomic bursts run back-to-back.  Split wait/release
             # states let each release trail its own fence.
-            if cutlass.const_expr(mTopkLength is not None):
-                reduce_topk = mTopkLength[token_idx]
-            else:
-                reduce_topk = Int32(mTopkIdxs.shape[0])
-            if reduce_topk > Int32(mTopkIdxs.shape[0]):
-                reduce_topk = Int32(mTopkIdxs.shape[0])
-            if reduce_topk < Int32(0):
-                reduce_topk = Int32(0)
-            reduce_tiles = cute.arch.make_warp_uniform(
-                (reduce_topk + Int32(self.N_TILE - 1))
-                // Int32(self.N_TILE)
-            )
-            reduce_rank = cute.arch.make_warp_uniform(
-                cute.arch.block_idx_in_cluster()
-            )
             rtx = tidx - Int32(self.REDUCE_THREAD_BEGIN)
             dkv_wait = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
@@ -6247,19 +6232,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Consumer,
                 self.MMA_DONE_STAGES,
             )
-            for loop_iter in cutlass.range(reduce_tiles):
-                tile_index = reduce_tiles - Int32(1) - loop_iter
+            for loop_iter in cutlass.range(tile_count):
+                tile_index = tile_count - Int32(1) - loop_iter
                 dkv_wait, dkv_rel = self._drain_dkv_v8(
                     t_dkv[0],
                     t_dkv[1],
                     mdKV_acc,
                     mTopkIdxs,
                     tile_index,
-                    reduce_topk,
+                    topk,
                     token_idx,
                     batch_idx,
                     rtx,
-                    reduce_rank,
+                    rank,
                     loop_iter,
                     pipe_dkv_done,
                     dkv_wait,
