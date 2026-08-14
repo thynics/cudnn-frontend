@@ -36,7 +36,7 @@ REDUCE_PACE_EVERY = 4
 # the 200ns spread variant was never benchmarked.
 REDUCE_PACE_SLEEP_NS = 0
 # Attribution only: -1 keeps both ranks, 0 masks rank 0, 1 masks rank 1.
-REDG_DISABLED_RANK = -1
+REDG_DISABLED_RANK = 0
 
 
 @dsl_user_op
