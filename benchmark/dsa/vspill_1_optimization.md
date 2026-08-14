@@ -71,7 +71,7 @@
 | A4 | 2026-08-14 | Reducer `LDL [R1+0x4] → R2UR` at `0x10800` and `0x11940` reloads the uniform loop bound 4.194M times and carries 11,336 long-scoreboard samples; explicitly retaining `tile_count` in the uniform domain should remove this stack round trip without changing the CTA pool. | Applied `cute.arch.make_warp_uniform(tile_count)` immediately after the existing ceil-div; preserved role split `48/128/120/64`, atomics, schedule, and topology. | Compile-only: reducer locals unchanged apart from `-0x30` PC shift (`LDL 0x107d0`, `STL 0x11090`, `LDL 0x11910`); whole main kernel 48→49 LDL, 21→22 STL, STACK 16→24 bytes. | N/A | REJECTED | Revision `108006c`; exact B200 cubin `/home/scratch.longcheng_gpu/.dsa-allinone/a4-108006c/capture/`. The uniform hint did not shorten the live range and worsened static spill shape, so perf was skipped by the predeclared SASS gate. |
 | A5 | 2026-08-14 | Reducer-local scalar rematerialization should remove three hot local sites without changing the register pool. | Recomputed topk/tile count/rank after role dispatch. | M0 9.073792 ms; A5 9.095104 ms / 604.452 TFLOPS | -0.088% | REJECTED | B200 48-pair AB. Static main kernel 48→45 LDL, 21 STL/STACK16; reducer has no local ops. Artifact `.dsa-allinone/a5-1120280/perf-m0-vs-a5-r1/perf.json`. Restored M0. |
 | A6 | 2026-08-14 | Four static rank/warp REDG orders could spread concurrent row-index waves without delays. | Not run: 0/2/4/6 mechanism clones 16→64 static REDG sites. | Historical final-gate ratio 1.009475 | N/A | REJECTED | `76f5df1` includes dual-warp-loan+rotation vs f987, so rotation-only timing is unavailable; final gate was 0.948% slower/STACK24. Existing structural cost rejected a duplicate current port. |
-| A7 | 2026-08-14 | Slot-0's terminal 256-thread barrier re-locksteps reducers into a sharp slot-1 burst; removing only that gate should let wait/T2R latency dephase them naturally. | Pending: retain the N=4 mid-slot gates and final slot-1 gate; remove only slot-0 terminal pace gate. | pending | pending | — | Slots target disjoint D panels; per-thread pipeline release remains before REDG. Compile/perf gate before any trace. |
+| A7 | 2026-08-14 | Slot-0's terminal 256-thread barrier re-locksteps reducers into a sharp slot-1 burst; removing only that gate should let wait/T2R latency dephase them naturally. | Retained the N=4 mid-slot gates and final slot-1 gate; removed only slot-0 terminal pace gate. | M0 9.087824 ms; A7 9.086576 ms / 605.020 TFLOPS | +0.029% | REJECTED | Same-B200 ABBA-balanced 48-pair run, commit `def3acf`; ratio 0.999709. Artifact `.dsa-allinone/a7-def3acf/perf-m0-vs-a7-r1-result/perf.json`. Below the predeclared 2% acceptance threshold; no second run or trace. |
 
 ## Next steps
 
@@ -113,6 +113,10 @@
   dual-warp-loan+rotation candidate missed the f987 final gate by 0.948%; there was no direct c6
   arm, so rotation-only timing is unavailable. Current duplicate abandoned due the known
   8,248-instruction/STACK24 structural cost — regime dual parent; smaller schedules remain live.
+- Slot-0 terminal pacing-barrier removal — safe but neutral: M0/A7 measured
+  9.087824/9.086576 ms over 48 ABBA-balanced pairs (+0.029%, ratio 0.999709), far below
+  the 2% acceptance threshold. The slot-1 wait/T2R does not create useful natural dephasing by
+  itself — revision `def3acf`, source restored — regime current N=4 reducer schedule.
 
 ## Session log
 
@@ -128,3 +132,6 @@
 - 2026-08-14 A5 closeout: role-local rematerialization removed the three reducer-region local
   sites, but same-device M0/A5 measured 9.073792/9.095104 ms over 48 AB pairs (-0.088%). The
   spill signature is not on the current end-to-end critical path; A5 was rejected and restored.
+- 2026-08-14 A7 closeout: removing only the slot-0 terminal pacing barrier was correctness-safe
+  but neutral at 9.087824/9.086576 ms over 48 ABBA-balanced pairs (+0.029%). Rejected without a
+  second run or SMART trace; source restored to the byte-identical M0 reducer schedule.
