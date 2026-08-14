@@ -7341,12 +7341,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     rdkv_frg_0.load(),
                 )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
-                self.reduce_pace_barrier.arrive_and_wait()
-                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
-        self.reduce_pace_barrier.arrive_and_wait()
-        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+                # A18: preserve the measured N=4 shaping only on the
+                # rank whose REDG path was sensitive in the A16 probe.
+                if rank == Int32(1):
+                    self.reduce_pace_barrier.arrive_and_wait()
+                    if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                        _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        if rank == Int32(1):
+            self.reduce_pace_barrier.arrive_and_wait()
+            if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7383,12 +7387,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     rdkv_frg_1.load(),
                 )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
-                self.reduce_pace_barrier.arrive_and_wait()
-                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
-        self.reduce_pace_barrier.arrive_and_wait()
-        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+                if rank == Int32(1):
+                    self.reduce_pace_barrier.arrive_and_wait()
+                    if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                        _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        if rank == Int32(1):
+            self.reduce_pace_barrier.arrive_and_wait()
+            if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
         return wait_state, release_state
 
 
