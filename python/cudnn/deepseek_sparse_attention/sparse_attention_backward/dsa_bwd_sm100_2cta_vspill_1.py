@@ -7187,7 +7187,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             num_128_tiles = self.head_dim_main // 64
             for i in cutlass.range(num_128_tiles, unroll_full=True):
                 for j in cutlass.range(2, unroll_full=True):
-                    scrambled = tile_acc_row[tidx, j, i]
+                    # A19: compensate the physical rank-panel swap while
+                    # preserving the canonical logical dimension order.
+                    physical_i = i ^ Int32(2)
+                    scrambled = tile_acc_row[tidx, j, physical_i]
                     dim_idx = (
                         tidx // 4
                         + tidx % 4 * 8
@@ -7312,8 +7315,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         release_state.advance()
 
         assert cute.size(thread_values_0) == self.N_TILE // 2
-        sub_tile_idx_0 = rank
-        sub_tile_idx_1 = Int32(2) + rank
+        physical_rank = rank ^ Int32(1)
+        sub_tile_idx_0 = physical_rank
+        sub_tile_idx_1 = Int32(2) + physical_rank
         for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
             rdkv_frg_0 = cute.make_rmem_tensor(
