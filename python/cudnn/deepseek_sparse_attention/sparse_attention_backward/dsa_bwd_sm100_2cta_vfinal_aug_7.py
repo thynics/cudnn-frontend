@@ -33,6 +33,26 @@ REDUCE_PACE_SLEEP_NS = 200
 
 
 @dsl_user_op
+def _fence_proxy_async_global(
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """aug_7 (verify H2): order the reducers' async-proxy TMA bulk S2G
+    panel writes before this kernel's generic-proxy tail readback."""
+
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async.global;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _map_smem_to_cluster_rank(
     smem_ptr: cute.Pointer,
     peer_rank: Int32,
@@ -6941,6 +6961,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # ==================================================================
         tmem.relinquish_alloc_permit()
         self.cta_barrier.arrive_and_wait()
+        # aug_7 (H2): TMA bulk S2G runs in the async proxy; fence it
+        # against the generic-proxy LDGs of the tail readback below.
+        _fence_proxy_async_global()
         # aug_7 tail: scatter-accumulate this CTA's compact panel into
         # mdKV_acc by topk index.  All 640 threads; the cta_barrier above
         # ordered every reducer's FULLY-completed bulk-store group before
