@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Canonical B200 correctness gate, fair direct benchmark, and optional IKET
-# trace capture.  GPU ownership is exclusively through the shared v2 gpu-pool;
-# its foreground enter process is the lease guardian for the entire workload.
+# Canonical B200 correctness gate and fair direct benchmark.  The legacy IKET
+# trace path remains available only as an explicit opt-in.  GPU ownership is
+# exclusively through the shared v2 gpu-pool; its foreground enter process is
+# the lease guardian for the entire workload.
 
 usage() {
   cat <<'EOF'
@@ -12,7 +13,7 @@ Usage:
 
 Options:
   --impl TOKEN          Candidate token (default: final)
-  --mode perf|all       Correctness + release perf, optionally IKET (default: all)
+  --mode perf|all       Correctness + release perf, optionally IKET (default: perf)
   --remote-repo PATH    ComputeLab checkout (default:
                         /home/scratch.longcheng_gpu/cudnn-frontend-thynics)
   --output-dir PATH     New local result directory
@@ -32,7 +33,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "${script_dir}/../.." && pwd -P)"
 frontend="${COMPUTELAB_B200_FRONTEND:-longcheng@computelab-sc-01}"
 implementation="final"
-mode="all"
+mode="perf"
 remote_repo="/home/scratch.longcheng_gpu/cudnn-frontend-thynics"
 gpu_pool="${DSA_GPU_POOL:-/home/scratch.longcheng_gpu/.gpu_manager/v2/bin/gpu-pool}"
 output_dir=""
