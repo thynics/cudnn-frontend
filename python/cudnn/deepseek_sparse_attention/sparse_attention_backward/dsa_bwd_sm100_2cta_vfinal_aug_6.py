@@ -25,6 +25,11 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
+# vfinal_aug_6 pacing knob: rejoin all reducer warps every N red.global
+# iterations inside each dKV atomic burst (plus one barrier at burst end).
+# N=4 measured 9.03 -> 8.94 ms; N=2 doubles the pace points per slot.
+REDUCE_PACE_EVERY = 2
+
 
 @dsl_user_op
 def _map_smem_to_cluster_rank(
@@ -7309,7 +7314,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_0.iterator.llvm_ptr,
                     rdkv_frg_0.load(),
                 )
-            if cutlass.const_expr(i == 3):
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
         self.reduce_pace_barrier.arrive_and_wait()
 
@@ -7347,7 +7352,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_1.iterator.llvm_ptr,
                     rdkv_frg_1.load(),
                 )
-            if cutlass.const_expr(i == 3):
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
         self.reduce_pace_barrier.arrive_and_wait()
         return wait_state, release_state
