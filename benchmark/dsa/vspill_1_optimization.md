@@ -76,6 +76,12 @@
 | A9 | 2026-08-14 | If cross-query clusters serialize on the same `(KV row, D quad)`, hashing tokens over two independent FP32 workspace planes should relieve that serialization without changing REDG count, writer width, or upstream work. | Allocated two 8-MiB dKV planes, routed `token_idx % 2`, and summed both planes in the canonical BF16 finalize kernel. | M0 8.922320 ms; A9 8.925792 ms / 615.918 TFLOPS | -0.051% | REJECTED | Same-B200 ABBA-balanced 24-pair diagnostic; ratio 1.000508. Exact candidate workspace was `[1,2,4096,2048]` bytes versus one reference plane. Correct end-to-end P2 is neutral, so cross-query same-address serialization is not a useful production lever. Artifact `.dsa-allinone/a9-3e625dd/run-r0/perf-result/perf.json`; source restored to M0. |
 | A10 | 2026-08-14 | The remaining atomic anomaly may be the synchronized 16-warp injection width rather than same-address collision; two WG waves keep each epoch at 64 warp REDG while halving simultaneous writers. | All eight reducer warps retained their original T2R fragment. `cohort = wg_idx ^ rank`; one 4-warp WG/CTA executed all eight vector atomics per phase, then all reducers rendezvoused on the existing barrier before the complementary phase. | M0 8.916064 ms; A10 9.136528 ms / 601.712 TFLOPS | -2.465% | REJECTED | Same-B200 ABBA-balanced 24-pair diagnostic; ratio 1.024654. PTX retained exactly 16 vector-atomic sites, so work was not cloned. Halving writer width serializes useful issue throughput; no second run, correctness, NCU, or trace. Artifact `.dsa-allinone/a10-029ccf6/run-r0/perf-result/perf.json`; source restored to M0. |
 | A11 | 2026-08-14 | R0 already overlaps dK usefully, while R1 overlaps the following S/dP window; moving only R1 behind the next gradient-head completion may preserve atomic throughput while shifting half the interference. | After slot1 T2R/fence/release, non-final tiles observed the next `pipe_dkv_done` slot0 generation without advancing it, then issued R1; the next drain consumed the same ready generation normally. R0 and both TMEM releases remained unchanged. | M0 8.921376 ms; A11 9.150928 ms / 600.765 TFLOPS | -2.606% | REJECTED | Same-B200 ABBA-balanced 24-pair diagnostic; ratio 1.026065 and exactly 16 PTX vector-atomic sites. Holding R1 until next gradient head delays the next drain cadence more than it protects S/dP. Artifact `.dsa-allinone/a11-ac4e4a4/run-r0/perf-result/perf.json`; source restored to M0. |
+| A12 | 2026-08-14 | W16 might donate enough launch-pool registers to raise the reducer budget and remove its hot spill signature. | Made W16 an active 112-register allocation role while W17-W19 remained at 48, preserving the total CTA launch pool. | Compile PASS; warmup made no forward progress at 100% GPU | N/A | REJECTED | Revisions `754489e`/`f9a93c8`. The allocator/donor ordering creates a runtime `setmaxnreg` wait; no timed samples exist. |
+| A13 | 2026-08-14 | A smaller passive W16 loan might fund another special role without the A12 allocator transition. | W16=96, W17=64, W18-W19=48; total launch pool remained neutral. | Compile PASS; warmup made no forward progress at 100% GPU | N/A | REJECTED | Revisions `991bc17`/`6f5a295`. W16=64 donation is part of the startup scheduling contract unless a new rendezvous is designed. |
+| A14 | 2026-08-14 | Issuing next-tile score MMA in the G7 gradient hole could overlap useful work with the dK/dV tail. | Split the tail around G7 and issued `S(next)` in that gap while preserving all state counts and dependencies. | M0 8.912048 ms; A14 9.830512 ms | -10.288% | REJECTED | Revision `7397772`; static dependency review passed, but the CG2 commit watermark and/or enlarged live state serialized the chains. Artifact `.dsa-allinone/a14-7397772/run-r0/safety-result/perf.json`. |
+| A15 | 2026-08-14 | A rank-masked REDG probe could attribute the no-atomic release between rank 0 and rank 1. | Added a hand-written inline-PTX predicate scaffold with four moves, compare, and predicated REDG. | M0 8.916176 ms; enabled-control 9.240288 ms | -3.619% | REJECTED | Revisions `25fde10`/`d982f8c`. The instrumentation overhead is too large for attribution, so its masked arms were not interpreted. |
+| A16 | 2026-08-14 | A native CTA-uniform rank branch can isolate each CTA's REDG contribution with low fixed overhead. | Compile-time-disabled control, then runtime rank-0-off and rank-1-off arms; all non-REDG reducer work remained. | control 8.964064 vs M0 8.912272; R0-off 8.900112 vs M0 8.912912; R1-off 8.592624 vs M0 8.915376 | control -0.570%; R0-off +0.161%; R1-off +3.648% | DIAGNOSTIC | Revisions `8a5bdd1`, `0d19c04`, `e6ccbe7`, closed by `8932485`. Rank-1 REDG is the materially sensitive half; rank-0 leader-local interference is falsified. Full REDG-off remains nonlinear at about 10%. |
+| A17 | 2026-08-14 | If rank-1's atomic path is critical because pacing delays it into later math, removing only rank-1 CTA-local gates should improve overlap. | Retained rank-0 N=4 pacing; removed all four rank-1 reducer pacing barriers per tile without changing REDG, address, T2R, order, or credits. | M0 8.916976 ms; A17 8.915744 ms / 616.612 TFLOPS | +0.022% | REJECTED | Same-B200 4-pair safety gate, revision `920d2ac`, ratio 0.999779. Far below the 2% acceptance threshold; artifact `.dsa-allinone/a17-920d2ac/run-r0/safety-result/perf.json`. |
 
 ## Next steps
 
@@ -140,6 +146,18 @@
   but measured 8.921376/9.150928 ms over 24 ABBA-balanced pairs (-2.606%, ratio 1.026065).
   Extending R1 lifetime and delaying the next drain cadence outweighs any S/dP overlap relief —
   revision `ac4e4a4`, artifact `.dsa-allinone/a11-ac4e4a4/run-r0/perf-result/perf.json` — regime M0.
+- W16 register loans without a new startup rendezvous — both active W16=112 and passive
+  W16=96/W17=64 pool-neutral splits compile but hang during warmup at 100% GPU. The original
+  W16=64 donation is a runtime scheduling condition, not spare allocation — revisions
+  `754489e`/`991bc17` — regime current 20-warp CTA.
+- Score lookahead across G7 — dependency counts were statically valid, but moving `S(next)` into
+  the gradient tail measured 8.912048/9.830512 ms (-10.288%). CG2 commit ordering and/or the
+  extra live state serializes the intended overlap — revision `7397772` — regime current M0.
+- Inline-PTX rank predicate attribution — its enabled-control arm cost 3.619%, so the masked
+  results would mix instrumentation with REDG removal and are invalid — revision `25fde10`.
+- Rank-1 pacing removal — native rank attribution identified rank 1 as the sensitive REDG half,
+  but removing only its four CTA-local gates measured 8.916976/8.915744 ms (+0.022%). Pacing is
+  not why rank-1 REDG hurts — revision `920d2ac` — regime current N=4 schedule.
 
 ## Session log
 
@@ -171,3 +189,10 @@
 - 2026-08-14 A11 closeout: moving only R1 behind the next gradient head preserved all producer
   releases and static atomics but was 2.606% slower. Simple REDG queue-shape and phase shifts are
   closed; return to reduction mechanism or main gradient-issue ordering before any new trace.
+- 2026-08-14 A12-A15 closeout: W16 pool-neutral register loans deadlocked at runtime; G7 score
+  lookahead regressed 10.288%; inline-PTX rank masking had 3.619% control overhead. Each was
+  rejected before correctness, NCU, or SMART because the cheap gate was decisive.
+- 2026-08-14 A16-A17 closeout: low-overhead native branching shows R0-off is only +0.161% while
+  R1-off is +3.648%; therefore the earlier rank-0 leader-local hypothesis is false. Removing all
+  rank-1 pacing is nevertheless neutral (+0.022%), so the asymmetry follows REDG work/address or
+  overlap pressure rather than its CTA-local gates. A physical-panel attribution test is next.

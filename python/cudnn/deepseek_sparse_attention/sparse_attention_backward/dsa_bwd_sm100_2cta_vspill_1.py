@@ -7341,17 +7341,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     rdkv_frg_0.load(),
                 )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
-                # A17: rank 1 is the critical atomic drain; keep the
-                # measured-best N=4 shaping on rank 0, but let all rank-1
-                # reducer warps finish without CTA-local pacing gates.
-                if rank == Int32(0):
-                    self.reduce_pace_barrier.arrive_and_wait()
-                    if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-                        _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
-        if rank == Int32(0):
-            self.reduce_pace_barrier.arrive_and_wait()
-            if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-                _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+                self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7388,14 +7383,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     rdkv_frg_1.load(),
                 )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
-                if rank == Int32(0):
-                    self.reduce_pace_barrier.arrive_and_wait()
-                    if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-                        _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
-        if rank == Int32(0):
-            self.reduce_pace_barrier.arrive_and_wait()
-            if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-                _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+                self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
         return wait_state, release_state
 
 
