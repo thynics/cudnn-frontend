@@ -881,11 +881,41 @@ stage="complete"
 echo "DSA_ALLINONE_PASS mode=all correctness=${result}/correctness.json perf=${result}/perf.json trace=${result}/trace.json"
 REMOTE_SCRIPT
 
-echo "Fetching the exact pushed revision into the shared scratch repository..."
-ssh -o BatchMode=yes "${frontend}" \
-  "$(printf '%q ' git -C "${remote_repo}" fetch --no-tags "${upstream_remote}" "refs/heads/${upstream_branch}:refs/remotes/${upstream_remote}/${upstream_branch}")"
-ssh -o BatchMode=yes "${frontend}" \
-  "$(printf '%q ' git -C "${remote_repo}" cat-file -e "${local_revision}^{commit}")"
+remote_has_revision() {
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "${frontend}" \
+    "$(printf '%q ' git -C "${remote_repo}" cat-file -e "${local_revision}^{commit}")" \
+    >/dev/null 2>&1
+}
+
+echo "Verifying the exact pushed revision in the shared scratch repository..."
+if remote_has_revision; then
+  echo "DSA_REMOTE_REVISION present=${local_revision}"
+else
+  fetch_rc=0
+  revision_ready=0
+  for fetch_attempt in 1 2 3; do
+    echo "Fetching pushed revision (attempt ${fetch_attempt}/3)..."
+    set +e
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "${frontend}" \
+      "$(printf '%q ' git -C "${remote_repo}" fetch --no-tags "${upstream_remote}" "refs/heads/${upstream_branch}:refs/remotes/${upstream_remote}/${upstream_branch}")"
+    fetch_rc=$?
+    set -e
+    if remote_has_revision; then
+      revision_ready=1
+      if ((fetch_rc != 0)); then
+        echo "WARNING: fetch transport returned ${fetch_rc}, but exact revision verification passed" >&2
+      fi
+      break
+    fi
+    echo "WARNING: fetch attempt ${fetch_attempt} did not make ${local_revision} available (rc=${fetch_rc})" >&2
+  done
+  if ((revision_ready == 0)); then
+    echo "ERROR: exact pushed revision is unavailable after 3 fetch attempts" >&2
+    echo "frontend=${frontend} repo=${remote_repo} revision=${local_revision} last_fetch_rc=${fetch_rc}" >&2
+    exit 69
+  fi
+  echo "DSA_REMOTE_REVISION present=${local_revision}"
+fi
 
 echo "Staging all-in-one payload: ${frontend}:${remote_payload}"
 ssh -o BatchMode=yes "${frontend}" \
