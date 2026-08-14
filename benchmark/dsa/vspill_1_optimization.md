@@ -70,6 +70,7 @@
 | A3 | 2026-08-14 | Exact M0 executes three reducer-local spill sites 6.291M times; raising reducer warps by eight registers appeared able to remove this path without changing occupancy. | Not run: reducer `setmaxregister_increase(120→128)` would consume 63,488 registers/CTA versus the 61,440-register launch pool; each SMSP would be 16 warp-register units short. | N/A | N/A | REJECTED | Static `setmaxnreg` pool audit: physical 65,536-register capacity does not enlarge the launch-time `640 threads × 96 registers` CTA pool; an unfunded increase may block permanently. |
 | A4 | 2026-08-14 | Reducer `LDL [R1+0x4] → R2UR` at `0x10800` and `0x11940` reloads the uniform loop bound 4.194M times and carries 11,336 long-scoreboard samples; explicitly retaining `tile_count` in the uniform domain should remove this stack round trip without changing the CTA pool. | Applied `cute.arch.make_warp_uniform(tile_count)` immediately after the existing ceil-div; preserved role split `48/128/120/64`, atomics, schedule, and topology. | Compile-only: reducer locals unchanged apart from `-0x30` PC shift (`LDL 0x107d0`, `STL 0x11090`, `LDL 0x11910`); whole main kernel 48→49 LDL, 21→22 STL, STACK 16→24 bytes. | N/A | REJECTED | Revision `108006c`; exact B200 cubin `/home/scratch.longcheng_gpu/.dsa-allinone/a4-108006c/capture/`. The uniform hint did not shorten the live range and worsened static spill shape, so perf was skipped by the predeclared SASS gate. |
 | A5 | 2026-08-14 | Reducer-local scalar rematerialization should remove three hot local sites without changing the register pool. | Recomputed topk/tile count/rank after role dispatch. | M0 9.073792 ms; A5 9.095104 ms / 604.452 TFLOPS | -0.088% | REJECTED | B200 48-pair AB. Static main kernel 48→45 LDL, 21 STL/STACK16; reducer has no local ops. Artifact `.dsa-allinone/a5-1120280/perf-m0-vs-a5-r1/perf.json`. Restored M0. |
+| A6 | 2026-08-14 | Four static rank/warp REDG orders could spread concurrent row-index waves without delays. | Not run: exact 0/2/4/6 mechanism already cloned 16→64 static REDG sites. | Historical paired ratio 1.009475 | N/A | REJECTED | `76f5df1` correctness PASS but 0.948% slower over 32 ABBA pairs; 8,248 sites/STACK24. Evidence `smart-trace-runs/dsa-bwd-vspill1-dual-redg-rotate4-f987f3f-20260813T211446Z/DECISION.md`. |
 
 ## Next steps
 
@@ -107,6 +108,10 @@
 - Reducer-local rematerialization — removed the target reducer LDL/STL sites and reduced static
   main-kernel LDL 48→45 with unchanged 21 STL/STACK16, but measured 0.088% slower than same-device
   M0 over 48 AB pairs; revision `1120280`, source restored — regime current reducer schedule
+- Four-way static REDG rotation — exact mechanism `76f5df1` passed correctness but cloned 16→64
+  REDG sites, increased static instructions to 8,248/STACK24, and was 0.948% slower over 32 ABBA
+  pairs. Current duplicate port abandoned before compile — regime dual parent; structural cost
+  unchanged, smaller two-way schedules remain live.
 
 ## Session log
 
