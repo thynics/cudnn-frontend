@@ -25,10 +25,15 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
-# Spread knob: after each reducer pacing barrier every reducer warp naps this many
+# vfinal_aug_6 pacing knob: rejoin all reducer warps every N red.global
+# iterations inside each dKV atomic burst (plus one barrier at burst end).
+# Sweep: no pacing 9.02 / N=4 8.94 / N=2 9.05 -> density optimum is 4.
+REDUCE_PACE_EVERY = 4
+# Spread knob: after each pacing barrier every reducer warp naps this many
 # ns, stretching the two 8-op bursts across the period (baseline gets the
 # same spread from its MMA-cadence gating). 0 disables.
-# PINNED 0: A8 changes only group ordering; it does not add a fixed delay.
+# PINNED 0: the measured-best configuration is N=4 with no nap (8.94 ms);
+# the 200ns spread variant was never benchmarked.
 REDUCE_PACE_SLEEP_NS = 0
 
 
@@ -7192,112 +7197,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     out_row[dim_idx] = self.element_dtype(scrambled)
 
     @cute.jit
-    def _redg_dkv_slot_static_range(
-        self,
-        thread_values: cute.Tensor,
-        r_topk: cute.Tensor,
-        mdKV_acc: cute.Tensor,
-        batch_idx: Int32,
-        dp_idx: Int32,
-        sub_tile_idx: Int32,
-        begin: cutlass.Constexpr[int],
-        end: cutlass.Constexpr[int],
-    ):
-        """Issue a compile-time range of one dKV slot's REDG groups."""
-
-        for i in cutlass.range_constexpr(begin, end):
-            coord_base = i * 2 - i % 2
-            rdkv_frg = cute.make_rmem_tensor(
-                (4,),
-                self.acc_dtype,
-            )
-            rdkv_frg[0] = thread_values[coord_base]
-            rdkv_frg[1] = thread_values[coord_base + 2]
-            rdkv_frg[2] = thread_values[coord_base + 16]
-            rdkv_frg[3] = thread_values[coord_base + 18]
-
-            kv_index = r_topk[i]
-            if kv_index >= Int32(0):
-                dkv_row = mdKV_acc[
-                    None,
-                    kv_index,
-                    (0, batch_idx),
-                ]
-                tile_row = cute.flat_divide(dkv_row, (128,))
-                tile_row = tile_row[None, sub_tile_idx]
-                tile_row = cute.flat_divide(tile_row, (4,))
-                target_frg = tile_row[None, dp_idx // 4]
-                cute.arch.atomic_add(
-                    target_frg.iterator.llvm_ptr,
-                    rdkv_frg.load(),
-                )
-
-    @cute.jit
-    def _redg_dkv_slot_stagger35(
-        self,
-        thread_values: cute.Tensor,
-        r_topk: cute.Tensor,
-        mdKV_acc: cute.Tensor,
-        batch_idx: Int32,
-        dp_idx: Int32,
-        sub_tile_idx: Int32,
-        cohort: Int32,
-    ):
-        """Split reducer warp groups into complementary 3/5 REDG waves."""
-
-        if cohort == Int32(0):
-            self._redg_dkv_slot_static_range(
-                thread_values,
-                r_topk,
-                mdKV_acc,
-                batch_idx,
-                dp_idx,
-                sub_tile_idx,
-                0,
-                3,
-            )
-        else:
-            self._redg_dkv_slot_static_range(
-                thread_values,
-                r_topk,
-                mdKV_acc,
-                batch_idx,
-                dp_idx,
-                sub_tile_idx,
-                3,
-                8,
-            )
-        self.reduce_pace_barrier.arrive_and_wait()
-        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
-
-        if cohort == Int32(0):
-            self._redg_dkv_slot_static_range(
-                thread_values,
-                r_topk,
-                mdKV_acc,
-                batch_idx,
-                dp_idx,
-                sub_tile_idx,
-                3,
-                8,
-            )
-        else:
-            self._redg_dkv_slot_static_range(
-                thread_values,
-                r_topk,
-                mdKV_acc,
-                batch_idx,
-                dp_idx,
-                sub_tile_idx,
-                0,
-                3,
-            )
-        self.reduce_pace_barrier.arrive_and_wait()
-        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
-
-    @cute.jit
     def _drain_dkv_v8(
         self,
         t_dkv_0: cute.Tensor,
@@ -7340,7 +7239,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
         wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
-        reduce_cohort = cute.arch.make_warp_uniform(wg_idx ^ rank)
         # Baseline slices the fragment-C TMEM tensor down to its atom core
         # before building the tmem copy (dsa_bwd_sm100.py L1903-1907); the
         # full-rank tensor makes the tiler rank exceed the 2-D identity.
@@ -7416,15 +7314,39 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         assert cute.size(thread_values_0) == self.N_TILE // 2
         sub_tile_idx_0 = rank
         sub_tile_idx_1 = Int32(2) + rank
-        self._redg_dkv_slot_stagger35(
-            thread_values_0,
-            r_topk,
-            mdKV_acc,
-            batch_idx,
-            dp_idx,
-            sub_tile_idx_0,
-            reduce_cohort,
-        )
+        for i in cutlass.range_constexpr(8):
+            coord_base = i * 2 - i % 2
+            rdkv_frg_0 = cute.make_rmem_tensor(
+                (4,),
+                self.acc_dtype,
+            )
+            rdkv_frg_0[0] = thread_values_0[coord_base]
+            rdkv_frg_0[1] = thread_values_0[coord_base + 2]
+            rdkv_frg_0[2] = thread_values_0[coord_base + 16]
+            rdkv_frg_0[3] = thread_values_0[coord_base + 18]
+
+            kv_index = r_topk[i]
+            if kv_index >= Int32(0):
+                dkv_row = mdKV_acc[
+                    None,
+                    kv_index,
+                    (0, batch_idx),
+                ]
+                tile_row = cute.flat_divide(dkv_row, (128,))
+                tile_row_0 = tile_row[None, sub_tile_idx_0]
+                tile_row_0 = cute.flat_divide(tile_row_0, (4,))
+                target_frg_0 = tile_row_0[None, dp_idx // 4]
+                cute.arch.atomic_add(
+                    target_frg_0.iterator.llvm_ptr,
+                    rdkv_frg_0.load(),
+                )
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
+                self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7434,15 +7356,39 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         done_pipeline.consumer_release(release_state)
         release_state.advance()
 
-        self._redg_dkv_slot_stagger35(
-            thread_values_1,
-            r_topk,
-            mdKV_acc,
-            batch_idx,
-            dp_idx,
-            sub_tile_idx_1,
-            reduce_cohort,
-        )
+        for i in cutlass.range_constexpr(8):
+            coord_base = i * 2 - i % 2
+            rdkv_frg_1 = cute.make_rmem_tensor(
+                (4,),
+                self.acc_dtype,
+            )
+            rdkv_frg_1[0] = thread_values_1[coord_base]
+            rdkv_frg_1[1] = thread_values_1[coord_base + 2]
+            rdkv_frg_1[2] = thread_values_1[coord_base + 16]
+            rdkv_frg_1[3] = thread_values_1[coord_base + 18]
+
+            kv_index = r_topk[i]
+            if kv_index >= Int32(0):
+                dkv_row = mdKV_acc[
+                    None,
+                    kv_index,
+                    (0, batch_idx),
+                ]
+                tile_row = cute.flat_divide(dkv_row, (128,))
+                tile_row_1 = tile_row[None, sub_tile_idx_1]
+                tile_row_1 = cute.flat_divide(tile_row_1, (4,))
+                target_frg_1 = tile_row_1[None, dp_idx // 4]
+                cute.arch.atomic_add(
+                    target_frg_1.iterator.llvm_ptr,
+                    rdkv_frg_1.load(),
+                )
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
+                self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
         return wait_state, release_state
 
 

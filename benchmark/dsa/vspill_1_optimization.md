@@ -72,7 +72,7 @@
 | A5 | 2026-08-14 | Reducer-local scalar rematerialization should remove three hot local sites without changing the register pool. | Recomputed topk/tile count/rank after role dispatch. | M0 9.073792 ms; A5 9.095104 ms / 604.452 TFLOPS | -0.088% | REJECTED | B200 48-pair AB. Static main kernel 48→45 LDL, 21 STL/STACK16; reducer has no local ops. Artifact `.dsa-allinone/a5-1120280/perf-m0-vs-a5-r1/perf.json`. Restored M0. |
 | A6 | 2026-08-14 | Four static rank/warp REDG orders could spread concurrent row-index waves without delays. | Not run: 0/2/4/6 mechanism clones 16→64 static REDG sites. | Historical final-gate ratio 1.009475 | N/A | REJECTED | `76f5df1` includes dual-warp-loan+rotation vs f987, so rotation-only timing is unavailable; final gate was 0.948% slower/STACK24. Existing structural cost rejected a duplicate current port. |
 | A7 | 2026-08-14 | Slot-0's terminal 256-thread barrier re-locksteps reducers into a sharp slot-1 burst; removing only that gate should let wait/T2R latency dephase them naturally. | Retained the N=4 mid-slot gates and final slot-1 gate; removed only slot-0 terminal pace gate. | M0 9.087824 ms; A7 9.086576 ms / 605.020 TFLOPS | +0.029% | REJECTED | Same-B200 ABBA-balanced 48-pair run, commit `def3acf`; ratio 0.999709. Artifact `.dsa-allinone/a7-def3acf/perf-m0-vs-a7-r1-result/perf.json`. Below the predeclared 2% acceptance threshold; no second run or trace. |
-| A8 | 2026-08-14 | The two CTA/two-WG reducers issue the same top-k row wave together; complementary 3/5 orders may lower same-address REDG queue collisions without adding dynamic work or barriers. | Pending: `cohort = wg_idx ^ rank`; cohort 0 issues groups 0:3 then 3:8, cohort 1 issues 3:8 then 0:3, rendezvousing at the existing mid and terminal barriers. Compile-time ranges preserve static register indexing. | pending | pending | — | Pre-gate on B200 compile/SASS: dynamic REDG and barrier counts must remain 16 and 4 per tile; reject if stack/static code growth is excessive. |
+| A8 | 2026-08-14 | The two CTA/two-WG reducers issue the same top-k row wave together; complementary 3/5 orders may lower same-address REDG queue collisions without adding dynamic work or barriers. | `cohort = wg_idx ^ rank`; cohort 0 issued groups 0:3 then 3:8, cohort 1 issued 3:8 then 0:3, rendezvousing at the existing mid and terminal barriers. Compile-time ranges preserved static register indexing. | M0 8.972000 ms; A8 9.014064 ms / 609.887 TFLOPS | -0.434% | REJECTED | Same-B200 ABBA-balanced 48-pair run, commit `5b2c835`; ratio 1.004336. REG96/STACK16 unchanged, static vector-atomic sites 16→32. Artifact `.dsa-allinone/a8-5b2c835/perf-m0-vs-a8-r1/perf.json`. |
 
 ## Next steps
 
@@ -118,6 +118,11 @@
   9.087824/9.086576 ms over 48 ABBA-balanced pairs (+0.029%, ratio 0.999709), far below
   the 2% acceptance threshold. The slot-1 wait/T2R does not create useful natural dephasing by
   itself — revision `def3acf`, source restored — regime current N=4 reducer schedule.
+- Complementary 3/5 reducer group ordering — retained all 16 dynamic REDG and four barriers per
+  tile with REG96/STACK16, but cloned static vector-atomic sites 16→32 and measured
+  8.972000/9.014064 ms over 48 ABBA-balanced pairs (-0.434%, ratio 1.004336). Address-wave
+  permutation without reducing active writers is not a useful lever — revision `5b2c835`, source
+  restored — regime current N=4 reducer schedule.
 
 ## Session log
 
@@ -136,3 +141,6 @@
 - 2026-08-14 A7 closeout: removing only the slot-0 terminal pacing barrier was correctness-safe
   but neutral at 9.087824/9.086576 ms over 48 ABBA-balanced pairs (+0.029%). Rejected without a
   second run or SMART trace; source restored to the byte-identical M0 reducer schedule.
+- 2026-08-14 A8 closeout: two complementary 3/5 REDG group orders kept dynamic work and barrier
+  count unchanged and compiled at REG96/STACK16, but were 0.434% slower (8.972000/9.014064 ms,
+  48 ABBA-balanced pairs). Pure address permutation is rejected; no second run or trace.
