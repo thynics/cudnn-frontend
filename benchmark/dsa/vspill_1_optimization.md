@@ -68,7 +68,8 @@
 | A1 | 2026-08-14 | Rank-1 delay may break the simultaneous 16-warp REDG burst and lower peak queue pressure. | Inserted 256 ns rank-1 sleep before each slot burst; retained N=4 pacing and all handoffs. | 9.015439 ms / 609.794 TFLOPS | -1.13% | REJECTED | Revision `8199655` vs M0 8.914872 ms; fixed delay adds tail/backpressure. |
 | A2 | 2026-08-14 | Four reducers/CTA match baseline's eight cluster-wide writers; doubled sequential work may lower peak pressure. | W8-W11 active, W12-W15 idle; one N64 T2R fragment, 16 REDG groups/thread, 160 reducer registers. | 9.092323 ms / 604.637 TFLOPS | -1.99% | REJECTED | Revision `5ae43d4` vs M0 8.914872 ms: +0.177451 ms / 1.019905x runtime. Source restored byte-identically to M0. |
 | A3 | 2026-08-14 | Exact M0 executes three reducer-local spill sites 6.291M times; raising reducer warps by eight registers appeared able to remove this path without changing occupancy. | Not run: reducer `setmaxregister_increase(120→128)` would consume 63,488 registers/CTA versus the 61,440-register launch pool; each SMSP would be 16 warp-register units short. | N/A | N/A | REJECTED | Static `setmaxnreg` pool audit: physical 65,536-register capacity does not enlarge the launch-time `640 threads × 96 registers` CTA pool; an unfunded increase may block permanently. |
-| A4 | 2026-08-14 | Reducer `LDL [R1+0x4] → R2UR` at `0x10800` and `0x11940` reloads the uniform loop bound 4.194M times and carries 11,336 long-scoreboard samples; explicitly retaining `tile_count` in the uniform domain should remove this stack round trip without changing the CTA pool. | Pending: apply `cute.arch.make_warp_uniform(tile_count)` immediately after the existing ceil-div; preserve role split `48/128/120/64`, atomics, schedule, and topology. | pending | pending | — | Pre-change hypothesis from exact M0 SourceCounters and SASS dataflow: `[R1+0x4]` gates loop entry, feeds per-tile state, and terminates the reducer loop. |
+| A4 | 2026-08-14 | Reducer `LDL [R1+0x4] → R2UR` at `0x10800` and `0x11940` reloads the uniform loop bound 4.194M times and carries 11,336 long-scoreboard samples; explicitly retaining `tile_count` in the uniform domain should remove this stack round trip without changing the CTA pool. | Applied `cute.arch.make_warp_uniform(tile_count)` immediately after the existing ceil-div; preserved role split `48/128/120/64`, atomics, schedule, and topology. | Compile-only: reducer locals unchanged apart from `-0x30` PC shift (`LDL 0x107d0`, `STL 0x11090`, `LDL 0x11910`); whole main kernel 48→49 LDL, 21→22 STL, STACK 16→24 bytes. | N/A | REJECTED | Revision `108006c`; exact B200 cubin `/home/scratch.longcheng_gpu/.dsa-allinone/a4-108006c/capture/`. The uniform hint did not shorten the live range and worsened static spill shape, so perf was skipped by the predeclared SASS gate. |
+| A5 | 2026-08-14 | A4 proves a common-prologue hint is re-spilled; recomputing `topk`, `tile_count`, and CTA rank inside the reducer role should break cross-role CSE/LICM and eliminate both hot loop-bound LDLs plus the dead rank STL without changing register budgets. | Pending: reducer-local reload/clamp of `topk`, local ceil-div and `make_warp_uniform`, plus local `block_idx_in_cluster`; pass only these local scalars to `_drain_dkv_v8`. | pending | pending | — | Pre-change hypothesis from exact SASS def-use: `[R1+0x4]` is `tile_count`; `UR16 ← SR_CgaCtaId → STL [R1+0x8]` is a rank dead-store with no executed reload before reducer exit. |
 
 ## Next steps
 
@@ -100,6 +101,9 @@
 - Unfunded reducer 120→128 register increase — requires 63,488 registers/CTA versus the
   61,440-register launch pool and can wait forever at `setmaxnreg.inc`; rejected statically,
   never launched — regime current 640-thread role split
+- Global `make_warp_uniform(tile_count)` hint — exact B200 compile leaves all three reducer
+  local sites intact and worsens the main kernel from 48/21 LDL/STL with STACK16 to 49/22 with
+  STACK24; revision `108006c`, no perf run — regime current `48/128/120/64`
 
 ## Session log
 
@@ -109,3 +113,6 @@
   instructions as a strong cross-binary signature, not strict one-site causality. A3 direct
   120→128 was rejected before editing because it exceeds the CTA launch pool; no new SMART
   trace warranted before source-local liveness and compile-only SASS tests.
+- 2026-08-14 A4 static gate: global uniform `tile_count` retained none of the intended values
+  and added one static LDL/STL pair plus 8 stack bytes. Rejected without perf; A5 moves the
+  rematerialization after reducer role dispatch and keeps the GPU lease for a fast compile gate.

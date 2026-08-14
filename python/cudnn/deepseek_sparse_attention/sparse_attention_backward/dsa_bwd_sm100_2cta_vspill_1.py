@@ -5566,10 +5566,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         tile_count = (topk + Int32(self.N_TILE - 1)) // Int32(
             self.N_TILE
         )
-        # The token length is warp-uniform.  Keep its ceil-div loop bound in
-        # the uniform domain so reducer loops do not spill/reload it through
-        # local memory at every tile boundary.
-        tile_count = cute.arch.make_warp_uniform(tile_count)
 
         # vfinal_aug_4: 48/128/120/64 split (pool-neutral vs 48/128/128/48).
         # Leaders get 64 so ptxas stops live-range-splitting the rank value
@@ -6227,6 +6223,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             # and released off the head commit, slot 1 off the tail commit,
             # then both atomic bursts run back-to-back.  Split wait/release
             # states let each release trail its own fence.
+            if cutlass.const_expr(mTopkLength is not None):
+                reduce_topk = mTopkLength[token_idx]
+            else:
+                reduce_topk = Int32(mTopkIdxs.shape[0])
+            if reduce_topk > Int32(mTopkIdxs.shape[0]):
+                reduce_topk = Int32(mTopkIdxs.shape[0])
+            if reduce_topk < Int32(0):
+                reduce_topk = Int32(0)
+            reduce_tiles = cute.arch.make_warp_uniform(
+                (reduce_topk + Int32(self.N_TILE - 1))
+                // Int32(self.N_TILE)
+            )
+            reduce_rank = cute.arch.make_warp_uniform(
+                cute.arch.block_idx_in_cluster()
+            )
             rtx = tidx - Int32(self.REDUCE_THREAD_BEGIN)
             dkv_wait = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
@@ -6236,19 +6247,19 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Consumer,
                 self.MMA_DONE_STAGES,
             )
-            for loop_iter in cutlass.range(tile_count):
-                tile_index = tile_count - Int32(1) - loop_iter
+            for loop_iter in cutlass.range(reduce_tiles):
+                tile_index = reduce_tiles - Int32(1) - loop_iter
                 dkv_wait, dkv_rel = self._drain_dkv_v8(
                     t_dkv[0],
                     t_dkv[1],
                     mdKV_acc,
                     mTopkIdxs,
                     tile_index,
-                    topk,
+                    reduce_topk,
                     token_idx,
                     batch_idx,
                     rtx,
-                    rank,
+                    reduce_rank,
                     loop_iter,
                     pipe_dkv_done,
                     dkv_wait,
