@@ -36,6 +36,12 @@ REDUCE_PACE_EVERY = 4
 # the 200ns spread variant was never benchmarked.
 REDUCE_PACE_SLEEP_NS = 0
 
+# P1 attribution probe: preserve the complete reducer dataflow and suppress
+# only the required REDG side effect behind a runtime-false predicate.  The
+# topk value is a runtime kernel argument, so ptxas must retain T2R, register
+# gathers, index/address calculation, fences, releases, and pacing.
+ATOMIC_GMEM_NOP = True
+
 
 @dsl_user_op
 def _map_smem_to_cluster_rank(
@@ -7336,10 +7342,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 tile_row_0 = tile_row[None, sub_tile_idx_0]
                 tile_row_0 = cute.flat_divide(tile_row_0, (4,))
                 target_frg_0 = tile_row_0[None, dp_idx // 4]
-                cute.arch.atomic_add(
-                    target_frg_0.iterator.llvm_ptr,
-                    rdkv_frg_0.load(),
-                )
+                if cutlass.const_expr(ATOMIC_GMEM_NOP):
+                    if topk < Int32(0):
+                        cute.arch.atomic_add(
+                            target_frg_0.iterator.llvm_ptr,
+                            rdkv_frg_0.load(),
+                        )
+                else:
+                    cute.arch.atomic_add(
+                        target_frg_0.iterator.llvm_ptr,
+                        rdkv_frg_0.load(),
+                    )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
@@ -7378,10 +7391,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 tile_row_1 = tile_row[None, sub_tile_idx_1]
                 tile_row_1 = cute.flat_divide(tile_row_1, (4,))
                 target_frg_1 = tile_row_1[None, dp_idx // 4]
-                cute.arch.atomic_add(
-                    target_frg_1.iterator.llvm_ptr,
-                    rdkv_frg_1.load(),
-                )
+                if cutlass.const_expr(ATOMIC_GMEM_NOP):
+                    if topk < Int32(0):
+                        cute.arch.atomic_add(
+                            target_frg_1.iterator.llvm_ptr,
+                            rdkv_frg_1.load(),
+                        )
+                else:
+                    cute.arch.atomic_add(
+                        target_frg_1.iterator.llvm_ptr,
+                        rdkv_frg_1.load(),
+                    )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
