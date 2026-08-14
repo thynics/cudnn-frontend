@@ -4931,7 +4931,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         token_idx = physical_x // self.CLUSTER_SHAPE_MNK[0]
         is_leader_cta = rank == Int32(0)
 
-        if warp_idx == Int32(self.LOAD_WARP):
+        # A23: move rank 1's round/TMA producer from W17 to the otherwise
+        # idle follower-MMA W16.  Both are 64-register physical WG4 roles.
+        role_warp_idx = warp_idx
+        if rank == Int32(1):
+            if warp_idx == Int32(self.MMA_WARP):
+                role_warp_idx = Int32(self.LOAD_WARP)
+            elif warp_idx == Int32(self.LOAD_WARP):
+                role_warp_idx = Int32(self.MMA_WARP)
+
+        if role_warp_idx == Int32(self.LOAD_WARP):
             cpasync.prefetch_descriptor(tma_atom_q)
             cpasync.prefetch_descriptor(tma_atom_do)
             cpasync.prefetch_descriptor(tma_atom_qt)
@@ -6251,7 +6260,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     dkv_rel,
                 )
 
-        elif warp_idx == Int32(self.MMA_WARP):
+        elif role_warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
             # executes no pipeline operation at all (FA4 rule).
             if is_leader_cta:
@@ -6483,7 +6492,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_dkv_done.producer_tail(dkv_prod)
                     pipe_dq_done.producer_tail(dq_done_prod)
 
-        elif warp_idx == Int32(self.LOAD_WARP):
+        elif role_warp_idx == Int32(self.LOAD_WARP):
             lane_idx = tidx % Int32(32)
             round_acq = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
