@@ -75,7 +75,7 @@
 | A8 | 2026-08-14 | The two CTA/two-WG reducers issue the same top-k row wave together; complementary 3/5 orders may lower same-address REDG queue collisions without adding dynamic work or barriers. | `cohort = wg_idx ^ rank`; cohort 0 issued groups 0:3 then 3:8, cohort 1 issued 3:8 then 0:3, rendezvousing at the existing mid and terminal barriers. Compile-time ranges preserved static register indexing. | M0 8.972000 ms; A8 9.014064 ms / 609.887 TFLOPS | -0.434% | REJECTED | Same-B200 ABBA-balanced 48-pair run, commit `5b2c835`; ratio 1.004336. REG96/STACK16 unchanged, static vector-atomic sites 16→32. Artifact `.dsa-allinone/a8-5b2c835/perf-m0-vs-a8-r1/perf.json`. |
 | A9 | 2026-08-14 | If cross-query clusters serialize on the same `(KV row, D quad)`, hashing tokens over two independent FP32 workspace planes should relieve that serialization without changing REDG count, writer width, or upstream work. | Allocated two 8-MiB dKV planes, routed `token_idx % 2`, and summed both planes in the canonical BF16 finalize kernel. | M0 8.922320 ms; A9 8.925792 ms / 615.918 TFLOPS | -0.051% | REJECTED | Same-B200 ABBA-balanced 24-pair diagnostic; ratio 1.000508. Exact candidate workspace was `[1,2,4096,2048]` bytes versus one reference plane. Correct end-to-end P2 is neutral, so cross-query same-address serialization is not a useful production lever. Artifact `.dsa-allinone/a9-3e625dd/run-r0/perf-result/perf.json`; source restored to M0. |
 | A10 | 2026-08-14 | The remaining atomic anomaly may be the synchronized 16-warp injection width rather than same-address collision; two WG waves keep each epoch at 64 warp REDG while halving simultaneous writers. | All eight reducer warps retained their original T2R fragment. `cohort = wg_idx ^ rank`; one 4-warp WG/CTA executed all eight vector atomics per phase, then all reducers rendezvoused on the existing barrier before the complementary phase. | M0 8.916064 ms; A10 9.136528 ms / 601.712 TFLOPS | -2.465% | REJECTED | Same-B200 ABBA-balanced 24-pair diagnostic; ratio 1.024654. PTX retained exactly 16 vector-atomic sites, so work was not cloned. Halving writer width serializes useful issue throughput; no second run, correctness, NCU, or trace. Artifact `.dsa-allinone/a10-029ccf6/run-r0/perf-result/perf.json`; source restored to M0. |
-| A11 | 2026-08-14 | R0 already overlaps dK usefully, while R1 overlaps the following S/dP window; moving only R1 behind the next gradient-head completion may preserve atomic throughput while shifting half the interference. | After slot1 T2R/fence/release, non-final tiles observe the next `pipe_dkv_done` slot0 generation without advancing it, then issue R1; the next drain consumes the same ready generation normally. R0 and both TMEM releases remain unchanged. | PENDING | PENDING | RUNNING | Predeclared static gate: REG96/STACK16 and reducer local sites must not worsen. Historical both-slot gates were -3.03%/-6.06%, but this single-wave phase change is untested. Accept only at >=2%, then correctness and repeat. |
+| A11 | 2026-08-14 | R0 already overlaps dK usefully, while R1 overlaps the following S/dP window; moving only R1 behind the next gradient-head completion may preserve atomic throughput while shifting half the interference. | After slot1 T2R/fence/release, non-final tiles observed the next `pipe_dkv_done` slot0 generation without advancing it, then issued R1; the next drain consumed the same ready generation normally. R0 and both TMEM releases remained unchanged. | M0 8.921376 ms; A11 9.150928 ms / 600.765 TFLOPS | -2.606% | REJECTED | Same-B200 ABBA-balanced 24-pair diagnostic; ratio 1.026065 and exactly 16 PTX vector-atomic sites. Holding R1 until next gradient head delays the next drain cadence more than it protects S/dP. Artifact `.dsa-allinone/a11-ac4e4a4/run-r0/perf-result/perf.json`; source restored to M0. |
 
 ## Next steps
 
@@ -136,6 +136,10 @@
   ratio 1.024654). The current 16-warp injection width is useful throughput rather than the gap;
   serializing complementary WGs is rejected — revision `029ccf6`, artifact
   `.dsa-allinone/a10-029ccf6/run-r0/perf-result/perf.json` — regime current M0.
+- Tail-only next-gradient-head gate — kept R0 earliest and both TMEM releases ahead of the gate,
+  but measured 8.921376/9.150928 ms over 24 ABBA-balanced pairs (-2.606%, ratio 1.026065).
+  Extending R1 lifetime and delaying the next drain cadence outweighs any S/dP overlap relief —
+  revision `ac4e4a4`, artifact `.dsa-allinone/a11-ac4e4a4/run-r0/perf-result/perf.json` — regime M0.
 
 ## Session log
 
@@ -164,3 +168,6 @@
 - 2026-08-14 A10 closeout: real two-wave writer gating preserved 16 static vector-atomic sites
   but was 2.465% slower. Both address-plane and issue-width hypotheses are now falsified at the
   production boundary; next test should change R1 overlap phase without delaying R0 or TMEM credit.
+- 2026-08-14 A11 closeout: moving only R1 behind the next gradient head preserved all producer
+  releases and static atomics but was 2.606% slower. Simple REDG queue-shape and phase shifts are
+  closed; return to reduction mechanism or main gradient-issue ordering before any new trace.

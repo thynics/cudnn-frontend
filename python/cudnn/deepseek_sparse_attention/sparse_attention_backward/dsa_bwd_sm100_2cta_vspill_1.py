@@ -7356,15 +7356,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         done_pipeline.consumer_release(release_state)
         release_state.advance()
 
-        # Keep R0 at its earliest proven-good position, but move only the
-        # second atomic wave behind the next tile's gradient head.  Observing
-        # wait_state is non-destructive: the next drain iteration consumes
-        # and advances this same generation after R1 has issued.  Slot 1 was
-        # already T2R'd, fenced, and released, so this gate cannot withhold a
-        # TMEM producer credit.  The final tile has no following generation.
-        if tile_index > Int32(0):
-            done_pipeline.consumer_wait(wait_state)
-
         for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
             rdkv_frg_1 = cute.make_rmem_tensor(
