@@ -6455,8 +6455,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         # The h==rank panel is a contiguous byte-identical
                         # 16 KiB slice of this CTA's own stationary tensor
                         # (K-major [H64,D512] M-atom pair 4r+2c): one local
-                        # bulk copy replaces the fragmented 64-row TMA box.
-                        # The h==peer panel keeps the GMEM TMA (L2-hot).
+                        # bulk copy usually replaces the fragmented 64-row
+                        # TMA box.  G6/Q_r1/H0 is the exception: its CTA0
+                        # local bulk is the cross-CTA readiness long pole, so
+                        # both ranks keep the L2-hot GMEM TMA for that panel.
                         if cutlass.const_expr(tensor_kind == 0):
                             if cutlass.const_expr(h_half == 0):
                                 if cutlass.const_expr(self.OWN_HALF_BULK):
@@ -6528,7 +6530,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     )
                         else:
                             if cutlass.const_expr(h_half == 0):
-                                if cutlass.const_expr(self.OWN_HALF_BULK):
+                                if cutlass.const_expr(
+                                    self.OWN_HALF_BULK and flat_gen != 4
+                                ):
                                     if rank == Int32(0):
                                         with cute.arch.elect_one():
                                             _cpasync_bulk_s2cluster(
