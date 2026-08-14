@@ -36,7 +36,7 @@ REDUCE_PACE_EVERY = 4
 # the 200ns spread variant was never benchmarked.
 REDUCE_PACE_SLEEP_NS = 0
 # A19 attribution only: mask one physical-panel-swapped CTA rank.
-REDG_DISABLED_RANK = 0
+REDG_DISABLED_RANK = 1
 
 
 @dsl_user_op
