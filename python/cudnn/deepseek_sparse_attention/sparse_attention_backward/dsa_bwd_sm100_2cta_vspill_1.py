@@ -5567,15 +5567,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.N_TILE
         )
 
-        # vfinal_aug_4: 48/128/120/64 split (pool-neutral vs 48/128/128/48).
-        # Leaders get 64 so ptxas stops live-range-splitting the rank value
-        # to local memory at the S->dP / dQ phase boundaries (STACK:24,
-        # STL@0x148e0 / dead LDL@0x156e0 in the candidate build); reducers
-        # fund it (128->120) -- they are the least latency-critical group.
+        # A12: keep the same CTA-pool total as the 48/128/120/64 split, but
+        # distinguish the special roles.  The MMA leader owns the complete
+        # score/gradient issue state and gets 112 registers; the scalar
+        # load/relay/commit warps donate the matching 3 * 16 registers.
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(48)
-        elif warp_idx >= Int32(self.MMA_WARP):
-            cute.arch.setmaxregister_decrease(64)
+        elif warp_idx == Int32(self.MMA_WARP):
+            cute.arch.setmaxregister_increase(112)
+        elif warp_idx > Int32(self.MMA_WARP):
+            cute.arch.setmaxregister_decrease(48)
         else:
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
                 cute.arch.setmaxregister_increase(128)
