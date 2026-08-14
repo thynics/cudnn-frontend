@@ -166,6 +166,10 @@ class FlashAttentionDSABackwardSm100:
         k = (k + 7) // 8 * 8  # round up to 8
         # FP32 versions of dKV
         workspace_bytes = d * acc_dtype.width // 8
+        # aug_7 (mirror of dsa_bwd_sm100.py): SM-indexed topk-compact dKV
+        # panels; keeps the allinone workspace-shape equality guard green.
+        # The baseline kernel never reads or writes this tail region.
+        workspace_bytes += 148 * (d // 2) * (acc_dtype.width // 8)
         return (b, 1, k, workspace_bytes)
 
     def get_workspace_tensor(
