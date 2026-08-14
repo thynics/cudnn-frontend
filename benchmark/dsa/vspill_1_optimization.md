@@ -82,6 +82,7 @@
 | A15 | 2026-08-14 | A rank-masked REDG probe could attribute the no-atomic release between rank 0 and rank 1. | Added a hand-written inline-PTX predicate scaffold with four moves, compare, and predicated REDG. | M0 8.916176 ms; enabled-control 9.240288 ms | -3.619% | REJECTED | Revisions `25fde10`/`d982f8c`. The instrumentation overhead is too large for attribution, so its masked arms were not interpreted. |
 | A16 | 2026-08-14 | A native CTA-uniform rank branch can isolate each CTA's REDG contribution with low fixed overhead. | Compile-time-disabled control, then runtime rank-0-off and rank-1-off arms; all non-REDG reducer work remained. | control 8.964064 vs M0 8.912272; R0-off 8.900112 vs M0 8.912912; R1-off 8.592624 vs M0 8.915376 | control -0.570%; R0-off +0.161%; R1-off +3.648% | DIAGNOSTIC | Revisions `8a5bdd1`, `0d19c04`, `e6ccbe7`, closed by `8932485`. Rank-1 REDG is the materially sensitive half; rank-0 leader-local interference is falsified. Full REDG-off remains nonlinear at about 10%. |
 | A17 | 2026-08-14 | If rank-1's atomic path is critical because pacing delays it into later math, removing only rank-1 CTA-local gates should improve overlap. | Retained rank-0 N=4 pacing; removed all four rank-1 reducer pacing barriers per tile without changing REDG, address, T2R, order, or credits. | M0 8.916976 ms; A17 8.915744 ms / 616.612 TFLOPS | +0.022% | REJECTED | Same-B200 4-pair safety gate, revision `920d2ac`, ratio 0.999779. Far below the 2% acceptance threshold; artifact `.dsa-allinone/a17-920d2ac/run-r0/safety-result/perf.json`. |
+| A18 | 2026-08-14 | Keeping shaping only on the sensitive rank 1 while freeing rank 0 completes the rank-specific pacing attribution. | Removed all rank-0 pacing; retained rank-1 N=4 mid and terminal gates, with REDG/T2R/address/credits unchanged. | M0 8.915056 ms; A18 8.923840 ms / 616.053 TFLOPS | -0.097% | REJECTED | Same-B200 4-pair safety gate, revision `a24d73d`, ratio 1.000971. Together with A17 this closes rank-specific pacing; artifact `.dsa-allinone/a18-a24d73d/run-r0/safety-result/perf.json`. |
 
 ## Next steps
 
@@ -158,6 +159,9 @@
 - Rank-1 pacing removal — native rank attribution identified rank 1 as the sensitive REDG half,
   but removing only its four CTA-local gates measured 8.916976/8.915744 ms (+0.022%). Pacing is
   not why rank-1 REDG hurts — revision `920d2ac` — regime current N=4 schedule.
+- Rank-0 pacing removal — the inverse arm retained rank-1 N=4 shaping and measured
+  8.915056/8.923840 ms (-0.097%). Both asymmetric pacing arms are neutral, so do not retry
+  terminal-only or slot-specific pacing variants without new evidence — revision `a24d73d`.
 
 ## Session log
 
@@ -196,3 +200,6 @@
   R1-off is +3.648%; therefore the earlier rank-0 leader-local hypothesis is false. Removing all
   rank-1 pacing is nevertheless neutral (+0.022%), so the asymmetry follows REDG work/address or
   overlap pressure rather than its CTA-local gates. A physical-panel attribution test is next.
+- 2026-08-14 A18 closeout: inverse rank pacing is also neutral (-0.097%). Rank-specific pacing is
+  closed; the next cheap discriminator swaps rank-owned physical 128-D workspace panels and then
+  repeats the native rank mask to separate CTA-role pressure from address/L2 partition effects.
