@@ -7344,9 +7344,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
                     _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
-        self.reduce_pace_barrier.arrive_and_wait()
-        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
-            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        # Let the independent slot-1 wait/T2R dephase reducer warps instead
+        # of re-lockstepping them into a second cluster-wide REDG burst.
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
