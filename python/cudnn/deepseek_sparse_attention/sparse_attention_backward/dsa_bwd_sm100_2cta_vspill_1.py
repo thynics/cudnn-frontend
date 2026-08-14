@@ -35,8 +35,6 @@ REDUCE_PACE_EVERY = 4
 # PINNED 0: the measured-best configuration is N=4 with no nap (8.94 ms);
 # the 200ns spread variant was never benchmarked.
 REDUCE_PACE_SLEEP_NS = 0
-# A20 attribution only: mask rank 1's tail-committed dKV slot.
-REDG_DISABLED_RANK = 1
 
 
 @dsl_user_op
@@ -7380,11 +7378,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 tile_row_1 = tile_row[None, sub_tile_idx_1]
                 tile_row_1 = cute.flat_divide(tile_row_1, (4,))
                 target_frg_1 = tile_row_1[None, dp_idx // 4]
-                if rank != Int32(REDG_DISABLED_RANK):
-                    cute.arch.atomic_add(
-                        target_frg_1.iterator.llvm_ptr,
-                        rdkv_frg_1.load(),
-                    )
+                cute.arch.atomic_add(
+                    target_frg_1.iterator.llvm_ptr,
+                    rdkv_frg_1.load(),
+                )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):

@@ -41,6 +41,15 @@
   instructions and form a near-one-to-one signature of REDG-off's net 6,225,920
   spill-instruction drop. Cross-binary ptxas reallocation prevents a strict one-site causal
   claim; source-local liveness relief is the smallest safe discriminating test.
+- rank-1 NCU differential: masking rank-1 REDG improves NCU duration 8.73898→8.41357 ms
+  (-3.724%) while dynamic SASS spill instructions increase 16.896M→19.059M (+12.80%).
+  Long-scoreboard samples are nearly unchanged (-0.63%), but MIO throttle falls 35.63%, short
+  scoreboard 24.34%, LG throttle 31.94%, and barrier 6.33%. This falsifies spill as the primary
+  cause of the rank-1 release and supports LSU/MIO interference with co-resident pipeline roles.
+- slot attribution: masking only rank-1 slot 0 improves 8.910176→8.593200 ms (+3.570%), while
+  masking only rank-1 slot 1 regresses 8.914736→9.259552 ms (-3.859%). Required REDG work is not
+  uniformly harmful: the head slot is the sensitive overlap window and the tail slot is useful
+  drain overlap. Optimization should preserve both results and change placement/issue contention.
 - baseline comparison: 1-CTA uses eight reducer warps total; candidate uses eight per CTA, sixteen per cluster, so symmetric pipeline release can create a 2x-wide cluster REDG burst for the same logical work.
 - occupancy: 20 warps/CTA, 96 allocated registers/thread, and 231.42 KiB dynamic SMEM force one block/SM; theoretical and achieved occupancy both equal about 31.2%. Register tuning cannot add a second resident CTA while SMEM remains full, but role-neutral register-pool redistribution is still available.
 - P/dS: aug5 split P/dS release improved paired ratio by about 0.22%; retain it. Current compact no-atomic trace is aug3, not exact aug_6.
@@ -84,6 +93,7 @@
 | A17 | 2026-08-14 | If rank-1's atomic path is critical because pacing delays it into later math, removing only rank-1 CTA-local gates should improve overlap. | Retained rank-0 N=4 pacing; removed all four rank-1 reducer pacing barriers per tile without changing REDG, address, T2R, order, or credits. | M0 8.916976 ms; A17 8.915744 ms / 616.612 TFLOPS | +0.022% | REJECTED | Same-B200 4-pair safety gate, revision `920d2ac`, ratio 0.999779. Far below the 2% acceptance threshold; artifact `.dsa-allinone/a17-920d2ac/run-r0/safety-result/perf.json`. |
 | A18 | 2026-08-14 | Keeping shaping only on the sensitive rank 1 while freeing rank 0 completes the rank-specific pacing attribution. | Removed all rank-0 pacing; retained rank-1 N=4 mid and terminal gates, with REDG/T2R/address/credits unchanged. | M0 8.915056 ms; A18 8.923840 ms / 616.053 TFLOPS | -0.097% | REJECTED | Same-B200 4-pair safety gate, revision `a24d73d`, ratio 1.000971. Together with A17 this closes rank-specific pacing; artifact `.dsa-allinone/a18-a24d73d/run-r0/safety-result/perf.json`. |
 | A19 | 2026-08-14 | Swapping rank-owned physical workspace panels can distinguish CTA-role pressure from panel-address/L2 effects behind A16's rank asymmetry. | Swapped adjacent 128-D rank panels in both dKV rounds and decoded them with `logical_i ^ 2`; then repeated native rank masks under the swapped mapping. | full: M0 8.915056 / swap 8.901408; R0-off 8.914144 vs 8.915040; R1-off 8.596144 vs 8.929856 | full +0.162%; R0-off +0.020%; R1-off +3.672% | DIAGNOSTIC | Revisions `16a7b66`, `a9ef841`, `6f2ce46`. The large release remains on CTA rank 1 and does not follow the physical panel, excluding workspace-panel/L2 partition as the primary cause. Artifacts `.dsa-allinone/a19-{16a7b66,r0off-a9ef841,r1off-6f2ce46}/run-r0/safety-result/perf.json`. |
+| A20 | 2026-08-14 | Splitting rank-1 REDG by dKV slot can identify which overlap window creates the A16 release. | Masked rank-1 slot 0 and slot 1 independently; retained the other slot plus all T2R, fences, releases, pacing, and control flow. | slot0-off: M0 8.910176 / 8.593200; slot1-off: M0 8.914736 / 9.259552 | slot0-off +3.570%; slot1-off -3.859% | DIAGNOSTIC | Revisions `2c3030b`, `9bb3dae`; four-pair same-B200 safety runs. The anomaly belongs to rank-1 slot 0, not REDG volume in general. Artifacts `.dsa-allinone/a20-{s0-2c3030b,s1-9bb3dae}/run-r0/safety-result/perf.json`; source restored to M0. |
 
 ## Next steps
 
@@ -167,6 +177,9 @@
   masked arms preserved the original asymmetry: R0-off +0.020%, R1-off +3.672%. The effect follows
   CTA rank/role rather than the 128-D workspace panel or L2 address partition — revisions
   `16a7b66`/`a9ef841`/`6f2ce46`.
+- Rank-1 slot-1 suppression — removing the tail slot regressed 8.914736→9.259552 ms (-3.859%).
+  Do not treat both REDG slots as interchangeable or reduce tail-slot throughput; revision
+  `9bb3dae`. Slot 0 remains the targeted overlap window, but its accumulation is required.
 
 ## Session log
 
@@ -212,3 +225,8 @@
   (R0-off +0.020%, R1-off +3.672%). Address partition and pacing are closed. Use a targeted
   M0-vs-rank1-off NCU differential to identify the affected rank-1 co-resident role before paying
   for a new SMART trace or changing the pipeline topology.
+- 2026-08-14 targeted NCU/A20 closeout: rank-1-off speeds up 3.724% even though dynamic spill
+  instructions increase 12.80%; the dominant scheduler relief is MIO (-35.63%), not long
+  scoreboard (-0.63%). Slot isolation then localizes almost all benefit to rank-1 slot 0
+  (+3.570%), while removing slot 1 is actively harmful (-3.859%). Restore exact M0 and next test
+  rank-1 slot-0 issue placement/co-resident SMSP pressure without deleting required accumulation.
