@@ -35,6 +35,8 @@ REDUCE_PACE_EVERY = 4
 # PINNED 0: the measured-best configuration is N=4 with no nap (8.94 ms);
 # the 200ns spread variant was never benchmarked.
 REDUCE_PACE_SLEEP_NS = 0
+# Attribution only: -1 keeps both ranks, 0 masks rank 0, 1 masks rank 1.
+REDG_DISABLED_RANK = -1
 
 
 @dsl_user_op
@@ -2562,6 +2564,52 @@ def _atomic_add_fp32x4_v1(
             "}\n"
         ),
         "l,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _atomic_add_fp32x4_rank_mask_v1(
+    value_0: Float32,
+    value_1: Float32,
+    value_2: Float32,
+    value_3: Float32,
+    destination: cute.Pointer,
+    rank: Int32,
+    disabled_rank: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Issue an FP32x4 reduction unless this CTA rank is masked."""
+
+    destination_i64 = destination.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [
+            destination_i64,
+            Float32(value_0).ir_value(loc=loc, ip=ip),
+            Float32(value_1).ir_value(loc=loc, ip=ip),
+            Float32(value_2).ir_value(loc=loc, ip=ip),
+            Float32(value_3).ir_value(loc=loc, ip=ip),
+            rank.ir_value(loc=loc, ip=ip),
+            disabled_rank.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n\t"
+            ".reg .pred enabled;\n\t"
+            ".reg .v4 .f32 values;\n\t"
+            "mov.f32 values.x, $1;\n\t"
+            "mov.f32 values.y, $2;\n\t"
+            "mov.f32 values.z, $3;\n\t"
+            "mov.f32 values.w, $4;\n\t"
+            "setp.ne.s32 enabled, $5, $6;\n\t"
+            "@enabled red.global.add.v4.f32 [$0], values;\n\t"
+            "}\n"
+        ),
+        "l,f,f,f,f,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -7336,9 +7384,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 tile_row_0 = tile_row[None, sub_tile_idx_0]
                 tile_row_0 = cute.flat_divide(tile_row_0, (4,))
                 target_frg_0 = tile_row_0[None, dp_idx // 4]
-                cute.arch.atomic_add(
-                    target_frg_0.iterator.llvm_ptr,
-                    rdkv_frg_0.load(),
+                _atomic_add_fp32x4_rank_mask_v1(
+                    rdkv_frg_0[0],
+                    rdkv_frg_0[1],
+                    rdkv_frg_0[2],
+                    rdkv_frg_0[3],
+                    target_frg_0.iterator,
+                    rank,
+                    Int32(REDG_DISABLED_RANK),
                 )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
@@ -7378,9 +7431,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 tile_row_1 = tile_row[None, sub_tile_idx_1]
                 tile_row_1 = cute.flat_divide(tile_row_1, (4,))
                 target_frg_1 = tile_row_1[None, dp_idx // 4]
-                cute.arch.atomic_add(
-                    target_frg_1.iterator.llvm_ptr,
-                    rdkv_frg_1.load(),
+                _atomic_add_fp32x4_rank_mask_v1(
+                    rdkv_frg_1[0],
+                    rdkv_frg_1[1],
+                    rdkv_frg_1[2],
+                    rdkv_frg_1[3],
+                    target_frg_1.iterator,
+                    rank,
+                    Int32(REDG_DISABLED_RANK),
                 )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
