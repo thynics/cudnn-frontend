@@ -49,7 +49,8 @@
 
 | id | date | hypothesis (WHY it should help) | change (WHAT, minimal) | result (ms/TFLOPS) | vs best | verdict | evidence |
 |----|------|--------------------------------|------------------------|--------------------|---------|---------|----------|
-| P1 | 2026-08-14 | If exact aug_6 still approaches the historical 7.81 ms when only REDG is suppressed, required dKV writes—not current P/dS or round changes—remain the dominant interference lever. | Pending diagnostic variant: retain T2R, top-k preload, addresses, fences, releases, pacing, and loop control; runtime-false only the two atomic calls; audit SASS for REDG-only removal. | pending | pending | INCONCLUSIVE | Must run candidate-only because output is intentionally incomplete. |
+| P1 | 2026-08-14 | If exact aug_6 still approaches the historical no-write bound when only REDG is suppressed, required dKV writes—not current P/dS or round changes—remain the dominant interference lever. | Retained T2R, top-k preload, addresses, fences, releases, pacing, and loop control; runtime-false only the two atomic calls. | 8.004798 ms / 686.783 TFLOPS (candidate-only; exact full M0 8.914872 ms) | +10.21% diagnostic upper bound | INCONCLUSIVE | Exact revisions `3c82bab` vs `4baffdb`, same B200 allocation/protocol, 8 warmups + 24 repeats. Confirms a 0.910074 ms write-path lever; counters are still needed to split LSU/MIO/L2/issue causes. |
+| A1 | 2026-08-14 | Both CTAs release the same dKV generation symmetrically, so 16 reducer warps issue REDG together. Delaying rank 1 by 256 ns after T2R release should lower peak write-queue pressure while hiding the delay under independent pipeline work. | Pending: restore REDG and insert one rank-1 nanosleep before each slot's eight-group atomic burst; preserve N=4 pacing and all producer/consumer edges. | pending | pending | INCONCLUSIVE | First use candidate-only screen; run full correctness+ABBA only if at least 2% faster. |
 
 ## Next steps
 

@@ -36,11 +36,10 @@ REDUCE_PACE_EVERY = 4
 # the 200ns spread variant was never benchmarked.
 REDUCE_PACE_SLEEP_NS = 0
 
-# P1 attribution probe: preserve the complete reducer dataflow and suppress
-# only the required REDG side effect behind a runtime-false predicate.  The
-# topk value is a runtime kernel argument, so ptxas must retain T2R, register
-# gathers, index/address calculation, fences, releases, and pacing.
-ATOMIC_GMEM_NOP = True
+# A1: de-correlate the two CTA-local reducer groups after their TMEM reads
+# have already released the producer stage.  This changes only the REDG issue
+# phase; all arithmetic, synchronization, and address order remain intact.
+REDUCE_RANK_STAGGER_NS = 256
 
 
 @dsl_user_op
@@ -7317,6 +7316,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         done_pipeline.consumer_release(release_state)
         release_state.advance()
 
+        if cutlass.const_expr(REDUCE_RANK_STAGGER_NS > 0):
+            if rank == Int32(1):
+                _pace_nanosleep(REDUCE_RANK_STAGGER_NS)
+
         assert cute.size(thread_values_0) == self.N_TILE // 2
         sub_tile_idx_0 = rank
         sub_tile_idx_1 = Int32(2) + rank
@@ -7342,17 +7345,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 tile_row_0 = tile_row[None, sub_tile_idx_0]
                 tile_row_0 = cute.flat_divide(tile_row_0, (4,))
                 target_frg_0 = tile_row_0[None, dp_idx // 4]
-                if cutlass.const_expr(ATOMIC_GMEM_NOP):
-                    if topk < Int32(0):
-                        cute.arch.atomic_add(
-                            target_frg_0.iterator.llvm_ptr,
-                            rdkv_frg_0.load(),
-                        )
-                else:
-                    cute.arch.atomic_add(
-                        target_frg_0.iterator.llvm_ptr,
-                        rdkv_frg_0.load(),
-                    )
+                cute.arch.atomic_add(
+                    target_frg_0.iterator.llvm_ptr,
+                    rdkv_frg_0.load(),
+                )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
@@ -7368,6 +7364,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         cute.arch.fence_view_async_tmem_load()
         done_pipeline.consumer_release(release_state)
         release_state.advance()
+
+        if cutlass.const_expr(REDUCE_RANK_STAGGER_NS > 0):
+            if rank == Int32(1):
+                _pace_nanosleep(REDUCE_RANK_STAGGER_NS)
 
         for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
@@ -7391,17 +7391,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 tile_row_1 = tile_row[None, sub_tile_idx_1]
                 tile_row_1 = cute.flat_divide(tile_row_1, (4,))
                 target_frg_1 = tile_row_1[None, dp_idx // 4]
-                if cutlass.const_expr(ATOMIC_GMEM_NOP):
-                    if topk < Int32(0):
-                        cute.arch.atomic_add(
-                            target_frg_1.iterator.llvm_ptr,
-                            rdkv_frg_1.load(),
-                        )
-                else:
-                    cute.arch.atomic_add(
-                        target_frg_1.iterator.llvm_ptr,
-                        rdkv_frg_1.load(),
-                    )
+                cute.arch.atomic_add(
+                    target_frg_1.iterator.llvm_ptr,
+                    rdkv_frg_1.load(),
+                )
             if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
