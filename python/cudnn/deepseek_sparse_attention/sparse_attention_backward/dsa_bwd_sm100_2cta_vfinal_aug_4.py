@@ -4058,6 +4058,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             barrier_id=7,
             num_threads=(self.GATHER_WARPS + 1) * 32,
         )
+        self.kdq_barrier_b = pipeline.NamedBarrier(
+            barrier_id=8,
+            num_threads=(self.GATHER_WARPS + 1) * 32,
+        )
 
     def _make_score_tmem_load(self, score_cta_shape, score_epi_tile):
         """v9.3: force the 16-DP/256-bit T2R atom for S/dP.
@@ -4129,6 +4133,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             pds_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
             khot_seq: cute.struct.MemRange[cutlass.Int64, 1]
             kdq_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            kdq_ready_mbar_b: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -4439,6 +4444,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         kv_index_1: Int32,
         kv_index_2: Int32,
         kv_index_3: Int32,
+        half: cutlass.Constexpr[int] = -1,
     ) -> None:
         """_fill_kdq_pair_v8's copy half, fed pre-A indices (W2).
 
@@ -4474,39 +4480,43 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             local_n = kdq_local_n[row_iteration]
             kv_index = kdq_kv_index[row_iteration]
             if kv_index >= Int32(0):
-                self._copy_sparse_k_d128_row(
-                    mKV,
-                    kd_rows_0,
-                    Int32(local_n),
-                    kv_index,
-                    batch_idx,
-                    d_offset_0,
-                    index_in_group,
-                    copy_atom,
-                    thread_copy,
-                )
-                self._copy_sparse_k_d128_row(
-                    mKV,
-                    kd_rows_1,
-                    Int32(local_n),
-                    kv_index,
-                    batch_idx,
-                    d_offset_1,
-                    index_in_group,
-                    copy_atom,
-                    thread_copy,
-                )
+                if cutlass.const_expr(half != 1):
+                    self._copy_sparse_k_d128_row(
+                        mKV,
+                        kd_rows_0,
+                        Int32(local_n),
+                        kv_index,
+                        batch_idx,
+                        d_offset_0,
+                        index_in_group,
+                        copy_atom,
+                        thread_copy,
+                    )
+                if cutlass.const_expr(half != 0):
+                    self._copy_sparse_k_d128_row(
+                        mKV,
+                        kd_rows_1,
+                        Int32(local_n),
+                        kv_index,
+                        batch_idx,
+                        d_offset_1,
+                        index_in_group,
+                        copy_atom,
+                        thread_copy,
+                    )
             else:
-                self._zero_sparse_k_d128_row(
-                    kd_rows_0,
-                    Int32(local_n),
-                    index_in_group,
-                )
-                self._zero_sparse_k_d128_row(
-                    kd_rows_1,
-                    Int32(local_n),
-                    index_in_group,
-                )
+                if cutlass.const_expr(half != 1):
+                    self._zero_sparse_k_d128_row(
+                        kd_rows_0,
+                        Int32(local_n),
+                        index_in_group,
+                    )
+                if cutlass.const_expr(half != 0):
+                    self._zero_sparse_k_d128_row(
+                        kd_rows_1,
+                        Int32(local_n),
+                        index_in_group,
+                    )
 
     @cute.jit
     def _gather_kdq_v8(
@@ -4524,6 +4534,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         copy_atom: cute.CopyAtom,
         thread_copy: cute.TiledCopy,
         kdq_ready_mbar: cute.Pointer,
+        kdq_ready_mbar_b: cute.Pointer,
     ) -> None:
         """Gather-side half of the v8 kdq handshake.
 
@@ -4552,6 +4563,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 kv_index = mTopkIdxs[global_n, (token_idx, batch_idx)]
             kdq_kv_index.append(kv_index)
 
+        # vfinal_aug_4 split credits: barrier A hands over slot A only
+        # (freed by g6(prev)); the round-0 image is announced on
+        # kdq_ready_mbar so g0 can commit while the round-1 image is
+        # still filling behind barrier B (slot B, freed by g7(prev)).
         self.kdq_barrier.arrive_and_wait()
         self._fill_kdq_pair_vk7(
             mKV,
@@ -4567,9 +4582,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             kdq_kv_index[1],
             kdq_kv_index[2],
             kdq_kv_index[3],
+            0,
         )
         _cp_async_mbarrier_arrive(kdq_ready_mbar)
         cute.arch.mbarrier_arrive(kdq_ready_mbar, rank)
+        self.kdq_barrier_b.arrive_and_wait()
+        self._fill_kdq_pair_vk7(
+            mKV,
+            kd_rows_0,
+            kd_rows_1,
+            batch_idx,
+            rank,
+            role_tidx,
+            self.GATHER_THREADS,
+            copy_atom,
+            thread_copy,
+            kdq_kv_index[0],
+            kdq_kv_index[1],
+            kdq_kv_index[2],
+            kdq_kv_index[3],
+            1,
+        )
+        _cp_async_mbarrier_arrive(kdq_ready_mbar_b)
+        cute.arch.mbarrier_arrive(kdq_ready_mbar_b, rank)
 
     @cute.jit
     def _fill_score_loan_do_r0_vc2(
@@ -4876,6 +4911,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         loan_tma_mbars = storage.loan_tma_mbars.data_ptr()
         loan_epi_safe_mbar = storage.loan_epi_safe_mbar.ptr
         kdq_ready_mbar = storage.kdq_ready_mbar.data_ptr()
+        kdq_ready_mbar_b = storage.kdq_ready_mbar_b.data_ptr()
         khot_seq = cute.recast_ptr(
             storage.khot_seq.data_ptr(),
             dtype=cutlass.Int32,
@@ -5388,6 +5424,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 kdq_ready_mbar,
                 self.GATHER_THREADS,
             )
+            cute.arch.mbarrier_init(
+                kdq_ready_mbar_b,
+                self.GATHER_THREADS,
+            )
             cute.arch.mbarrier_init(loan_epi_safe_mbar, 1)
             _store_shared_seq_v4(khot_seq, Int32(0))
         cute.arch.fence_view_async_shared()
@@ -5542,6 +5582,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         kv_copy_atom,
                         kv_thread_copy,
                         kdq_ready_mbar,
+                        kdq_ready_mbar_b,
                     )
                     pipe_kscore.producer_acquire(gather_state)
                     loan_phase = self._fill_score_loan_do_r0_vc2(
@@ -5596,6 +5637,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         kv_copy_atom,
                         kv_thread_copy,
                         kdq_ready_mbar,
+                        kdq_ready_mbar_b,
                     )
 
                     # score_iter i consumes K(i), then grads(i-1) consumes
@@ -5646,6 +5688,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 kv_copy_atom,
                                 kv_thread_copy,
                                 kdq_ready_mbar,
+                                kdq_ready_mbar_b,
                             )
                         else:
                             next_iter = score_iter + Int32(1)
@@ -5682,6 +5725,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 kv_copy_atom,
                                 kv_thread_copy,
                                 kdq_ready_mbar,
+                                kdq_ready_mbar_b,
                             )
                 pipe_kscore.producer_tail(gather_state)
                 # producer_tail observes the final borrowed dO generation's
@@ -6367,6 +6411,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self.ROUND_STAGES,
             )
             kdq_ready_phase = Int32(0)
+            kdq_ready_phase_b = Int32(0)
             if tile_count > Int32(0):
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
@@ -6414,13 +6459,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_index = (
                         tile_count - Int32(1) - loop_iter
                     )
-                    # g0/g1: both K_dQ rounds in one fused gather pass
-                    # (one index read per row; both stage credits held).
-                    pipe_round.producer_acquire(round_acq)
-                    round_acq.advance()
+                    # g0/g1 (vfinal_aug_4 split credits): hand slot A to
+                    # the gather warps as soon as g6(prev) recycles it and
+                    # commit g0 as soon as the round-0 image lands -- dQ
+                    # round 0 no longer waits for the fused pair.
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
                     self.kdq_barrier.arrive_and_wait()
+                    pipe_round.producer_acquire(round_acq)
+                    round_acq.advance()
+                    self.kdq_barrier_b.arrive_and_wait()
                     cute.arch.mbarrier_wait(
                         kdq_ready_mbar,
                         kdq_ready_phase,
@@ -6430,6 +6478,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     with cute.arch.elect_one():
                         pipe_round.producer_commit(round_com)
                     round_com.advance()
+                    cute.arch.mbarrier_wait(
+                        kdq_ready_mbar_b,
+                        kdq_ready_phase_b,
+                    )
+                    kdq_ready_phase_b = Int32(1) - kdq_ready_phase_b
+                    cute.arch.fence_view_async_shared()
                     with cute.arch.elect_one():
                         pipe_round.producer_commit(round_com)
                     round_com.advance()
