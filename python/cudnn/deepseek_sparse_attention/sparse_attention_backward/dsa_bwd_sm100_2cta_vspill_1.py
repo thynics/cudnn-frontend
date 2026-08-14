@@ -6294,23 +6294,28 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 for loop_iter in cutlass.range(tile_count):
                     has_prev = loop_iter > Int32(0)
 
-                    pipe_kscore.consumer_wait(kscore_cons)
-                    # vfinal_aug_4: dp_done never blocks (verified 32/32
-                    # first-try pass); acquire it before S so the TRYWAIT
-                    # and its ?WAIT10 tail leave the S->dP handoff.
-                    pipe_dp_done.producer_acquire(sdp_prod)
-                    sdp_prod = self._issue_score_v2(
-                        score_tiled_mma,
-                        t_score,
-                        t_score_pp,
-                        score_q_fragment,
-                        score_k_fragment,
-                        pipe_s_done,
-                        sdp_prod,
-                        loop_iter,
-                        False,
-                        False,
-                    )
+                    # A14: starting with tile 2, S was issued in the prior
+                    # tile's round-1 dK G7 hole.  K and the shared S/dP
+                    # producer stage stay owned until dP below, so do not
+                    # repeat their wait/acquire here.
+                    if loop_iter <= Int32(1):
+                        pipe_kscore.consumer_wait(kscore_cons)
+                        # vfinal_aug_4: dp_done never blocks (verified 32/32
+                        # first-try pass); acquire it before S so the TRYWAIT
+                        # and its ?WAIT10 tail leave the S->dP handoff.
+                        pipe_dp_done.producer_acquire(sdp_prod)
+                        sdp_prod = self._issue_score_v2(
+                            score_tiled_mma,
+                            t_score,
+                            t_score_pp,
+                            score_q_fragment,
+                            score_k_fragment,
+                            pipe_s_done,
+                            sdp_prod,
+                            loop_iter,
+                            False,
+                            False,
+                        )
 
                     # dP(t) then early K recycle.  The first dP also
                     # gates on the dO half of the split stationary load.
@@ -6382,7 +6387,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             )
                         )
                         round_cons, dkv_prod = (
-                            self._issue_prev_grads_tail_v2(
+                            self._issue_prev_grads_tail_pre_g7_v2(
                                 dkv_tiled_mma,
                                 t_dkv[1],
                                 quad_fragment_a,
@@ -6390,14 +6395,39 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 p_fragments[0],
                                 p_fragments[1],
                                 ds_fragments[0],
-                                ds_fragments[1],
                                 pipe_round,
                                 round_cons,
                                 pipe_p,
                                 p_cons,
                                 pipe_dkv_done,
                                 dkv_prod,
-                                loop_iter - Int32(1),
+                            )
+                        )
+                        if loop_iter + Int32(1) < tile_count:
+                            pipe_kscore.consumer_wait(kscore_cons)
+                            pipe_dp_done.producer_acquire(sdp_prod)
+                            sdp_prod = self._issue_score_v2(
+                                score_tiled_mma,
+                                t_score,
+                                t_score_pp,
+                                score_q_fragment,
+                                score_k_fragment,
+                                pipe_s_done,
+                                sdp_prod,
+                                loop_iter + Int32(1),
+                                False,
+                                False,
+                            )
+                        round_cons, dkv_prod = (
+                            self._issue_prev_grads_tail_post_g7_v2(
+                                dkv_tiled_mma,
+                                t_dkv[1],
+                                quad_fragment_b,
+                                ds_fragments[1],
+                                pipe_round,
+                                round_cons,
+                                pipe_dkv_done,
+                                dkv_prod,
                             )
                         )
                         # F1: P was released inside the tail after the
@@ -7075,6 +7105,90 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             ds_consumer_state,
             dq_done_state,
         )
+
+    @cute.jit
+    def _issue_prev_grads_tail_pre_g7_v2(
+        self,
+        dkv_tiled_mma: cute.TiledMma,
+        t_dkv_1: cute.Tensor,
+        quad_fragment_a: cute.Tensor,
+        quad_fragment_b: cute.Tensor,
+        p_fragment_0: cute.Tensor,
+        p_fragment_1: cute.Tensor,
+        ds_fragment_0: cute.Tensor,
+        round_pipeline,
+        round_consumer_state: pipeline.PipelineState,
+        p_pipeline,
+        p_consumer_state: pipeline.PipelineState,
+        dkv_done_pipeline,
+        dkv_producer_state: pipeline.PipelineState,
+    ):
+        """Issue round-1 dV and the first dK half, stopping before G7."""
+
+        dkv_done_pipeline.producer_acquire(dkv_producer_state)
+        round_pipeline.consumer_wait(round_consumer_state)
+        self._issue_dkv_pass_v2(
+            dkv_tiled_mma,
+            t_dkv_1,
+            quad_fragment_a,
+            p_fragment_0,
+            False,
+        )
+        round_pipeline.consumer_release(round_consumer_state)
+        round_consumer_state.advance()
+        round_pipeline.consumer_wait(round_consumer_state)
+        self._issue_dkv_pass_v2(
+            dkv_tiled_mma,
+            t_dkv_1,
+            quad_fragment_b,
+            p_fragment_1,
+            True,
+        )
+        p_pipeline.consumer_release(p_consumer_state)
+        round_pipeline.consumer_release(round_consumer_state)
+        round_consumer_state.advance()
+        round_pipeline.consumer_wait(round_consumer_state)
+        self._issue_dkv_pass_v2(
+            dkv_tiled_mma,
+            t_dkv_1,
+            quad_fragment_a,
+            ds_fragment_0,
+            True,
+        )
+        round_pipeline.consumer_release(round_consumer_state)
+        round_consumer_state.advance()
+
+        return round_consumer_state, dkv_producer_state
+
+    @cute.jit
+    def _issue_prev_grads_tail_post_g7_v2(
+        self,
+        dkv_tiled_mma: cute.TiledMma,
+        t_dkv_1: cute.Tensor,
+        quad_fragment_b: cute.Tensor,
+        ds_fragment_1: cute.Tensor,
+        round_pipeline,
+        round_consumer_state: pipeline.PipelineState,
+        dkv_done_pipeline,
+        dkv_producer_state: pipeline.PipelineState,
+    ):
+        """Wait G7, issue the final round-1 dK half, and commit slot 1."""
+
+        round_pipeline.consumer_wait(round_consumer_state)
+        self._issue_dkv_pass_v2(
+            dkv_tiled_mma,
+            t_dkv_1,
+            quad_fragment_b,
+            ds_fragment_1,
+            True,
+        )
+        round_pipeline.consumer_release(round_consumer_state)
+        round_consumer_state.advance()
+        cute.arch.fence_view_async_tmem_store()
+        dkv_done_pipeline.producer_commit(dkv_producer_state)
+        dkv_producer_state.advance()
+
+        return round_consumer_state, dkv_producer_state
 
     @cute.jit
     def _issue_prev_grads_tail_v2(
