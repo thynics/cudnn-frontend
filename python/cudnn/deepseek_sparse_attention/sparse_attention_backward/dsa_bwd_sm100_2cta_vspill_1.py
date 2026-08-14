@@ -25,6 +25,17 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
+# vfinal_aug_6 pacing knob: rejoin all reducer warps every N red.global
+# iterations inside each dKV atomic burst (plus one barrier at burst end).
+# Sweep: no pacing 9.02 / N=4 8.94 / N=2 9.05 -> density optimum is 4.
+REDUCE_PACE_EVERY = 4
+# Spread knob: after each pacing barrier every reducer warp naps this many
+# ns, stretching the two 8-op bursts across the period (baseline gets the
+# same spread from its MMA-cadence gating). 0 disables.
+# PINNED 0: the measured-best configuration is N=4 with no nap (8.94 ms);
+# the 200ns spread variant was never benchmarked.
+REDUCE_PACE_SLEEP_NS = 0
+
 
 @dsl_user_op
 def _map_smem_to_cluster_rank(
@@ -89,6 +100,26 @@ def _cpasync_bulk_s2cluster(
             "mbarrier::complete_tx::bytes [$0], [$1], $3, [$2];"
         ),
         "r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _pace_nanosleep(
+    sleep_ns: int,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Pacing hint: stall this warp ~sleep_ns between atomic sections."""
+
+    llvm.inline_asm(
+        None,
+        [Int32(sleep_ns).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -4058,6 +4089,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             barrier_id=7,
             num_threads=(self.GATHER_WARPS + 1) * 32,
         )
+        self.kdq_barrier_b = pipeline.NamedBarrier(
+            barrier_id=8,
+            num_threads=(self.GATHER_WARPS + 1) * 32,
+        )
+        # vfinal_aug_6: baseline-style pacing barrier for the dKV atomic
+        # bursts -- rejoins all reducer warps every 4 red.global iterations
+        # so the instantaneous MIO/L2 queue depth stays shallow.
+        self.reduce_pace_barrier = pipeline.NamedBarrier(
+            barrier_id=9,
+            num_threads=(self.MMA_WARP - self.REDUCE_WARP_BEGIN) * 32,
+        )
 
     def _make_score_tmem_load(self, score_cta_shape, score_epi_tile):
         """v9.3: force the 16-DP/256-bit T2R atom for S/dP.
@@ -4116,6 +4158,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             round_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            pds_mbars_b: cute.struct.MemRange[cutlass.Int64, 2]
             dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             # Raw single-phase-per-tile barriers.
@@ -4129,6 +4172,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             pds_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
             khot_seq: cute.struct.MemRange[cutlass.Int64, 1]
             kdq_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            kdq_ready_mbar_b: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -4439,6 +4483,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         kv_index_1: Int32,
         kv_index_2: Int32,
         kv_index_3: Int32,
+        half: cutlass.Constexpr[int] = -1,
     ) -> None:
         """_fill_kdq_pair_v8's copy half, fed pre-A indices (W2).
 
@@ -4474,39 +4519,43 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             local_n = kdq_local_n[row_iteration]
             kv_index = kdq_kv_index[row_iteration]
             if kv_index >= Int32(0):
-                self._copy_sparse_k_d128_row(
-                    mKV,
-                    kd_rows_0,
-                    Int32(local_n),
-                    kv_index,
-                    batch_idx,
-                    d_offset_0,
-                    index_in_group,
-                    copy_atom,
-                    thread_copy,
-                )
-                self._copy_sparse_k_d128_row(
-                    mKV,
-                    kd_rows_1,
-                    Int32(local_n),
-                    kv_index,
-                    batch_idx,
-                    d_offset_1,
-                    index_in_group,
-                    copy_atom,
-                    thread_copy,
-                )
+                if cutlass.const_expr(half != 1):
+                    self._copy_sparse_k_d128_row(
+                        mKV,
+                        kd_rows_0,
+                        Int32(local_n),
+                        kv_index,
+                        batch_idx,
+                        d_offset_0,
+                        index_in_group,
+                        copy_atom,
+                        thread_copy,
+                    )
+                if cutlass.const_expr(half != 0):
+                    self._copy_sparse_k_d128_row(
+                        mKV,
+                        kd_rows_1,
+                        Int32(local_n),
+                        kv_index,
+                        batch_idx,
+                        d_offset_1,
+                        index_in_group,
+                        copy_atom,
+                        thread_copy,
+                    )
             else:
-                self._zero_sparse_k_d128_row(
-                    kd_rows_0,
-                    Int32(local_n),
-                    index_in_group,
-                )
-                self._zero_sparse_k_d128_row(
-                    kd_rows_1,
-                    Int32(local_n),
-                    index_in_group,
-                )
+                if cutlass.const_expr(half != 1):
+                    self._zero_sparse_k_d128_row(
+                        kd_rows_0,
+                        Int32(local_n),
+                        index_in_group,
+                    )
+                if cutlass.const_expr(half != 0):
+                    self._zero_sparse_k_d128_row(
+                        kd_rows_1,
+                        Int32(local_n),
+                        index_in_group,
+                    )
 
     @cute.jit
     def _gather_kdq_v8(
@@ -4524,6 +4573,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         copy_atom: cute.CopyAtom,
         thread_copy: cute.TiledCopy,
         kdq_ready_mbar: cute.Pointer,
+        kdq_ready_mbar_b: cute.Pointer,
     ) -> None:
         """Gather-side half of the v8 kdq handshake.
 
@@ -4552,6 +4602,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 kv_index = mTopkIdxs[global_n, (token_idx, batch_idx)]
             kdq_kv_index.append(kv_index)
 
+        # vfinal_aug_4 split credits: barrier A hands over slot A only
+        # (freed by g6(prev)); the round-0 image is announced on
+        # kdq_ready_mbar so g0 can commit while the round-1 image is
+        # still filling behind barrier B (slot B, freed by g7(prev)).
         self.kdq_barrier.arrive_and_wait()
         self._fill_kdq_pair_vk7(
             mKV,
@@ -4567,9 +4621,29 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             kdq_kv_index[1],
             kdq_kv_index[2],
             kdq_kv_index[3],
+            0,
         )
         _cp_async_mbarrier_arrive(kdq_ready_mbar)
         cute.arch.mbarrier_arrive(kdq_ready_mbar, rank)
+        self.kdq_barrier_b.arrive_and_wait()
+        self._fill_kdq_pair_vk7(
+            mKV,
+            kd_rows_0,
+            kd_rows_1,
+            batch_idx,
+            rank,
+            role_tidx,
+            self.GATHER_THREADS,
+            copy_atom,
+            thread_copy,
+            kdq_kv_index[0],
+            kdq_kv_index[1],
+            kdq_kv_index[2],
+            kdq_kv_index[3],
+            1,
+        )
+        _cp_async_mbarrier_arrive(kdq_ready_mbar_b)
+        cute.arch.mbarrier_arrive(kdq_ready_mbar_b, rank)
 
     @cute.jit
     def _fill_score_loan_do_r0_vc2(
@@ -4876,6 +4950,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         loan_tma_mbars = storage.loan_tma_mbars.data_ptr()
         loan_epi_safe_mbar = storage.loan_epi_safe_mbar.ptr
         kdq_ready_mbar = storage.kdq_ready_mbar.data_ptr()
+        kdq_ready_mbar_b = storage.kdq_ready_mbar_b.data_ptr()
         khot_seq = cute.recast_ptr(
             storage.khot_seq.data_ptr(),
             dtype=cutlass.Int32,
@@ -5342,11 +5417,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             pipeline.Agent.Thread,
             atom_thr_size,
         )
-        pipe_pds = pipeline.PipelineAsyncUmma.create(
+        # F1 split: pipe_p guards the P byte-set (p_blocks + p_xchg,
+        # EMPTY = pds_mbars[1] @ struct +0x78, released after the last dV
+        # read); pipe_ds guards the dS byte-set (ds_image + ds_blocks,
+        # EMPTY = pds_mbars_b[1] @ +0x88, released after the last dK read).
+        pipe_p = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
             producer_group=pds_commit_group,
             consumer_group=leader_group,
             barrier_storage=storage.pds_mbars.data_ptr(),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        pipe_ds = pipeline.PipelineAsyncUmma.create(
+            num_stages=1,
+            producer_group=pds_commit_group,
+            consumer_group=leader_group,
+            barrier_storage=storage.pds_mbars_b.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
@@ -5386,6 +5473,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(loan_tma_mbars + 1, 1)
             cute.arch.mbarrier_init(
                 kdq_ready_mbar,
+                self.GATHER_THREADS,
+            )
+            cute.arch.mbarrier_init(
+                kdq_ready_mbar_b,
                 self.GATHER_THREADS,
             )
             cute.arch.mbarrier_init(loan_epi_safe_mbar, 1)
@@ -5476,19 +5567,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.N_TILE
         )
 
-        # Keep the final kernel's 48/128/128/48 register split.  The S/dP
-        # producer states below advance in lockstep and now share one state,
-        # so the leader's live range is reduced without moving pressure into
-        # the gather or reducer warpgroups.
+        # vfinal_aug_4: 48/128/120/64 split (pool-neutral vs 48/128/128/48).
+        # Leaders get 64 so ptxas stops live-range-splitting the rank value
+        # to local memory at the S->dP / dQ phase boundaries (STACK:24,
+        # STL@0x148e0 / dead LDL@0x156e0 in the candidate build); reducers
+        # fund it (128->120) -- they are the least latency-critical group.
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(48)
         elif warp_idx >= Int32(self.MMA_WARP):
-            cute.arch.setmaxregister_decrease(48)
+            cute.arch.setmaxregister_decrease(64)
         else:
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
                 cute.arch.setmaxregister_increase(128)
             else:
-                cute.arch.setmaxregister_increase(128)
+                cute.arch.setmaxregister_increase(120)
 
         # ==================================================================
         # Role bodies.
@@ -5541,6 +5633,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         kv_copy_atom,
                         kv_thread_copy,
                         kdq_ready_mbar,
+                        kdq_ready_mbar_b,
                     )
                     pipe_kscore.producer_acquire(gather_state)
                     loan_phase = self._fill_score_loan_do_r0_vc2(
@@ -5595,6 +5688,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         kv_copy_atom,
                         kv_thread_copy,
                         kdq_ready_mbar,
+                        kdq_ready_mbar_b,
                     )
 
                     # score_iter i consumes K(i), then grads(i-1) consumes
@@ -5645,6 +5739,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 kv_copy_atom,
                                 kv_thread_copy,
                                 kdq_ready_mbar,
+                                kdq_ready_mbar_b,
                             )
                         else:
                             next_iter = score_iter + Int32(1)
@@ -5681,6 +5776,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 kv_copy_atom,
                                 kv_thread_copy,
                                 kdq_ready_mbar,
+                                kdq_ready_mbar_b,
                             )
                 pipe_kscore.producer_tail(gather_state)
                 # producer_tail observes the final borrowed dO generation's
@@ -5725,7 +5821,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Consumer,
                 self.SCORE_DONE_STAGES,
             )
-            pds_state = pipeline.make_pipeline_state(
+            p_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer,
+                1,
+            )
+            ds_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 1,
             )
@@ -6005,7 +6105,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         r_p[local_n] = self.element_dtype(p_value)
                         r_ds[local_n] = self.element_dtype(ds_value)
 
-                pipe_pds.producer_acquire(pds_state)
+                # F1: P-empty (pds_mbars[1] @ +0x78) is released right
+                # after the prev tile's last dV read -- this wait now
+                # unblocks ~mid-grad instead of end-of-grads.
+                pipe_p.producer_acquire(p_state)
 
                 # Publish P/dS with stmatrix. Each pair of warps owns one
                 # N32 half, so this branch is warp-uniform.
@@ -6021,16 +6124,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         r_p_store,
                         t_rs_p_local_tile,
                     )
-                    cute.copy(
-                        tiled_copy_r2s,
-                        r_ds_store,
-                        t_rs_ds_local_tile,
-                    )
                 else:
                     cute.copy(
                         tiled_copy_r2s,
                         r_p_store,
                         t_rs_p_xchg_tile,
+                    )
+
+                # F1: dS-empty (pds_mbars_b[1] @ +0x88) is released only
+                # after the prev tile's last dK read; waiting here lets the
+                # P stmatrix stores issue while dK still reads dS.
+                pipe_ds.producer_acquire(ds_state)
+                if owns_n:
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_ds_store,
+                        t_rs_ds_local_tile,
                     )
 
                 # Whole-image dS store for the dQ B operand.
@@ -6052,7 +6161,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pds_ready_mbars,
                     rank,
                 )
-                pds_state.advance()
+                p_state.advance()
+                ds_state.advance()
 
             # dQ epilogue: wait for the last dQ generation, then store both
             # rank-owned [D128, H128] slices (disjoint across CTAs/rounds).
@@ -6157,7 +6267,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Consumer,
                     self.ROUND_STAGES,
                 )
-                pds_cons = pipeline.make_pipeline_state(
+                p_cons = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer,
+                    1,
+                )
+                ds_cons = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer,
                     1,
                 )
@@ -6181,6 +6295,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     has_prev = loop_iter > Int32(0)
 
                     pipe_kscore.consumer_wait(kscore_cons)
+                    # vfinal_aug_4: dp_done never blocks (verified 32/32
+                    # first-try pass); acquire it before S so the TRYWAIT
+                    # and its ?WAIT10 tail leave the S->dP handoff.
+                    pipe_dp_done.producer_acquire(sdp_prod)
                     sdp_prod = self._issue_score_v2(
                         score_tiled_mma,
                         t_score,
@@ -6212,6 +6330,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         loop_iter,
                         True,
                         True,
+                        False,
                     )
                     pipe_kscore.consumer_release(kscore_cons)
                     kscore_cons.advance()
@@ -6222,7 +6341,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             round_cons,
                             kscore_cons,
                             dkv_prod,
-                            pds_cons,
+                            p_cons,
+                            ds_cons,
                             dq_done_prod,
                         ) = (
                             self._issue_prev_grads_head_v2(
@@ -6249,8 +6369,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 round_cons,
                                 pipe_kscore,
                                 kscore_cons,
-                                pipe_pds,
-                                pds_cons,
+                                pipe_p,
+                                p_cons,
+                                pipe_ds,
+                                ds_cons,
                                 pipe_dkv_done,
                                 dkv_prod,
                                 pipe_dq_done,
@@ -6271,13 +6393,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 ds_fragments[1],
                                 pipe_round,
                                 round_cons,
+                                pipe_p,
+                                p_cons,
                                 pipe_dkv_done,
                                 dkv_prod,
                                 loop_iter - Int32(1),
                             )
                         )
-                        pipe_pds.consumer_release(pds_cons)
-                        pds_cons.advance()
+                        # F1: P was released inside the tail after the
+                        # last dV pass; only dS waits for the dK passes.
+                        pipe_ds.consumer_release(ds_cons)
+                        ds_cons.advance()
+                        p_cons.advance()
                         relay_phase = Int32(1) - relay_phase
 
                 # Drain the final tile's gradients.
@@ -6287,7 +6414,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         round_cons,
                         kscore_cons,
                         dkv_prod,
-                        pds_cons,
+                        p_cons,
+                        ds_cons,
                         dq_done_prod,
                     ) = (
                         self._issue_prev_grads_head_v2(
@@ -6314,8 +6442,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             round_cons,
                             pipe_kscore,
                             kscore_cons,
-                            pipe_pds,
-                            pds_cons,
+                            pipe_p,
+                            p_cons,
+                            pipe_ds,
+                            ds_cons,
                             pipe_dkv_done,
                             dkv_prod,
                             pipe_dq_done,
@@ -6336,13 +6466,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             ds_fragments[1],
                             pipe_round,
                             round_cons,
+                            pipe_p,
+                            p_cons,
                             pipe_dkv_done,
                             dkv_prod,
                             tile_count - Int32(1),
                         )
                     )
-                    pipe_pds.consumer_release(pds_cons)
-                    pds_cons.advance()
+                    pipe_ds.consumer_release(ds_cons)
+                    ds_cons.advance()
+                    p_cons.advance()
 
                     dp_tail_prod = sdp_prod.clone()
                     pipe_s_done.producer_tail(sdp_prod)
@@ -6361,6 +6494,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 self.ROUND_STAGES,
             )
             kdq_ready_phase = Int32(0)
+            kdq_ready_phase_b = Int32(0)
             if tile_count > Int32(0):
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
@@ -6408,13 +6542,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     tile_index = (
                         tile_count - Int32(1) - loop_iter
                     )
-                    # g0/g1: both K_dQ rounds in one fused gather pass
-                    # (one index read per row; both stage credits held).
-                    pipe_round.producer_acquire(round_acq)
-                    round_acq.advance()
+                    # g0/g1 (vfinal_aug_4 split credits): hand slot A to
+                    # the gather warps as soon as g6(prev) recycles it and
+                    # commit g0 as soon as the round-0 image lands -- dQ
+                    # round 0 no longer waits for the fused pair.
                     pipe_round.producer_acquire(round_acq)
                     round_acq.advance()
                     self.kdq_barrier.arrive_and_wait()
+                    pipe_round.producer_acquire(round_acq)
+                    round_acq.advance()
+                    self.kdq_barrier_b.arrive_and_wait()
                     cute.arch.mbarrier_wait(
                         kdq_ready_mbar,
                         kdq_ready_phase,
@@ -6424,6 +6561,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     with cute.arch.elect_one():
                         pipe_round.producer_commit(round_com)
                     round_com.advance()
+                    cute.arch.mbarrier_wait(
+                        kdq_ready_mbar_b,
+                        kdq_ready_phase_b,
+                    )
+                    kdq_ready_phase_b = Int32(1) - kdq_ready_phase_b
+                    cute.arch.fence_view_async_shared()
                     with cute.arch.elect_one():
                         pipe_round.producer_commit(round_com)
                     round_com.advance()
@@ -6607,7 +6750,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             if tidx % Int32(32) == Int32(0):
                 landing_phase = Int32(0)
                 ready_phase = Int32(0)
-                pds_com = pipeline.make_pipeline_state(
+                p_com = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer,
+                    1,
+                )
+                ds_com = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
                     1,
                 )
@@ -6659,8 +6806,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
-                    pipe_pds.producer_commit(pds_com)
-                    pds_com.advance()
+                    pipe_p.producer_commit(p_com)
+                    p_com.advance()
+                    pipe_ds.producer_commit(ds_com)
+                    ds_com.advance()
                     _mbarrier_wait_acquire_cluster(
                         landing_mbars,
                         landing_phase,
@@ -6679,7 +6828,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
                     landing_phase = Int32(1) - landing_phase
                 if tile_count > Int32(0):
-                    pipe_pds.producer_tail(pds_com)
+                    pipe_p.producer_tail(p_com)
+                    pipe_ds.producer_tail(ds_com)
 
         elif warp_idx == Int32(self.COMMIT_WARP):
             commit_com = pipeline.make_pipeline_state(
@@ -6732,6 +6882,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         issue_seq: Int32,
         is_dp: cutlass.Constexpr[bool],
         advance_state: cutlass.Constexpr[bool],
+        do_acquire: cutlass.Constexpr[bool] = True,
     ) -> pipeline.PipelineState:
         """Issue one score-side CG2 GEMM over four resident D128 chunks.
 
@@ -6741,7 +6892,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         does).
         """
 
-        done_pipeline.producer_acquire(producer_state)
+        if cutlass.const_expr(do_acquire):
+            done_pipeline.producer_acquire(producer_state)
         if producer_state.index == Int32(0):
             self._issue_score_chunks_v7(
                 tiled_mma,
@@ -6819,8 +6971,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         round_consumer_state: pipeline.PipelineState,
         kscore_pipeline,
         kscore_consumer_state: pipeline.PipelineState,
-        pds_pipeline,
-        pds_consumer_state: pipeline.PipelineState,
+        p_pipeline,
+        p_consumer_state: pipeline.PipelineState,
+        ds_pipeline,
+        ds_consumer_state: pipeline.PipelineState,
         dkv_done_pipeline,
         dkv_producer_state: pipeline.PipelineState,
         dq_done_pipeline,
@@ -6838,7 +6992,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
         # P/dS images, blocks, and xchg staging of the previous tile are
         # published (and its DSM sends issued): invariant I1's only gate.
-        pds_pipeline.consumer_wait(pds_consumer_state)
+        # F1 split: both FULLs are committed back-to-back by the relay,
+        # so waiting both here adds no latency (dQ reads ds_image ->
+        # dS-full; dV reads p_blocks -> P-full).
+        ds_pipeline.consumer_wait(ds_consumer_state)
+        p_pipeline.consumer_wait(p_consumer_state)
 
         # dQ both rounds back-to-back; releases free the round buffers for
         # the quadrant refills.
@@ -6913,7 +7071,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             round_consumer_state,
             kscore_consumer_state,
             dkv_producer_state,
-            pds_consumer_state,
+            p_consumer_state,
+            ds_consumer_state,
             dq_done_state,
         )
 
@@ -6930,6 +7089,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         ds_fragment_1: cute.Tensor,
         round_pipeline,
         round_consumer_state: pipeline.PipelineState,
+        p_pipeline,
+        p_consumer_state: pipeline.PipelineState,
         dkv_done_pipeline,
         dkv_producer_state: pipeline.PipelineState,
         issue_seq: Int32,
@@ -6962,6 +7123,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             p_fragment_1,
             True,
         )
+        # F1: last P read (round-1 dV on p_fragment_1) just issued.
+        # Same primitive as the old whole-set release: tcgen05.commit
+        # multicast self|peer, CtaGroup.TWO -- P-empty fires in both CTAs
+        # once every UMMA issued so far completes, i.e. before the four
+        # round-1 dK passes below.  Caller advances p_consumer_state.
+        p_pipeline.consumer_release(p_consumer_state)
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
@@ -7173,6 +7340,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_0.iterator.llvm_ptr,
                     rdkv_frg_0.load(),
                 )
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
+                self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7208,6 +7382,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_1.iterator.llvm_ptr,
                     rdkv_frg_1.load(),
                 )
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
+                self.reduce_pace_barrier.arrive_and_wait()
+                if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+                    _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
+        self.reduce_pace_barrier.arrive_and_wait()
+        if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
+            _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
         return wait_state, release_state
 
 
