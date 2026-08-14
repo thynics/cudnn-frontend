@@ -5566,6 +5566,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         tile_count = (topk + Int32(self.N_TILE - 1)) // Int32(
             self.N_TILE
         )
+        # The token length is warp-uniform.  Keep its ceil-div loop bound in
+        # the uniform domain so reducer loops do not spill/reload it through
+        # local memory at every tile boundary.
+        tile_count = cute.arch.make_warp_uniform(tile_count)
 
         # vfinal_aug_4: 48/128/120/64 split (pool-neutral vs 48/128/128/48).
         # Leaders get 64 so ptxas stops live-range-splitting the rank value

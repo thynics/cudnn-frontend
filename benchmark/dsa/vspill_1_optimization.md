@@ -30,13 +30,25 @@
 - measured state: exact-current NCU classifies M0 as L1TEX-latency/resource-contention bound, not HBM-bandwidth bound. Full NCU reports 8.74 ms, DRAM 2.44%, L1/TEX 63.91%, L2 31.81%, compute 43.91%, and only 0.24 eligible warps/scheduler.
 - issue gap: long scoreboard is 18.5 of 28.1 cycles between issued instructions (65.6%); exact SourceCounters records 322,759 not-issued long-scoreboard samples out of 460,497. The largest sites are pipeline-poll branches in the reducer and math roles, so the number is an end-to-end dependency symptom rather than isolated load latency.
 - spill: exact-current NCU executes 4,845,568 local-memory spilling requests and 1,220,608 shared-memory spilling requests. Local traffic is 5.71% of L1TEX sectors and NCU's isolated local-memory rule gives a 20.02% upper bound; 100% of local loads hit L1, so spill is real but not yet proven to explain the full 0.910 ms REDG-off delta.
-- component isolation: old 2-CTA lineage retained T2R/index/sync but disabled REDG and measured 7.808864 ms; ordinary STG measured 9.396032 ms. This proves a large write-path/interference lever historically, but exact aug_6 must be remeasured before using the magnitude.
+- component isolation: exact aug6 REDG-off measures 8.004798 ms versus same-device M0
+  8.914872 ms, a 0.910074 ms / 10.21% release-timing upper bound. Exact NCU measures
+  7.823488 versus 8.742880 ms (-10.52%), but executed instructions also fall 34.90%.
+  The runtime-false branch therefore isolates the joint REDG operand/address/live-range and
+  atomic side-effect path, not atomic memory alone.
+- reducer spill localization: exact M0's reducer-relative SASS region
+  `[0x10800,0x11a00)` contains one `LDL`, one `STL`, and one `LDL`, each
+  executing 2,097,152 times. Their 6,291,456 instructions are 37.24% of M0 spill
+  instructions and form a near-one-to-one signature of REDG-off's net 6,225,920
+  spill-instruction drop. Cross-binary ptxas reallocation prevents a strict one-site causal
+  claim; source-local liveness relief is the smallest safe discriminating test.
 - baseline comparison: 1-CTA uses eight reducer warps total; candidate uses eight per CTA, sixteen per cluster, so symmetric pipeline release can create a 2x-wide cluster REDG burst for the same logical work.
 - occupancy: 20 warps/CTA, 96 allocated registers/thread, and 231.42 KiB dynamic SMEM force one block/SM; theoretical and achieved occupancy both equal about 31.2%. Register tuning cannot add a second resident CTA while SMEM remains full, but role-neutral register-pool redistribution is still available.
 - P/dS: aug5 split P/dS release improved paired ratio by about 0.22%; retain it. Current compact no-atomic trace is aug3, not exact aug_6.
 - estimated headroom: no-write historical upper bound is enough to cross the 1-CTA reference; legal scheduling must recover at least ~11% candidate time without removing required accumulation.
 - exact profile: `profile/vspill1-aug6-current-20260814/` (`source_aug6_m0.ncu-rep` SHA256 `07e9bdca...`, `full_aug6_m0.ncu-rep` SHA256 `bdc35e2d...`).
-- last refreshed: M0 full+source NCU / 2026-08-14
+- exact A/B report:
+  `profile/vspill1-aug6-m0-vs-redg-off-20260814/REPORT.md`
+- last refreshed: exact M0 vs REDG-off full+source NCU / 2026-08-14
 
 ## Catalog adjudication (session 1)
 
@@ -55,18 +67,26 @@
 | P1 | 2026-08-14 | If exact aug6 speeds up when only REDG is suppressed, dKV writes remain a dominant lever. | Runtime-false the two atomics; retain T2R, top-k loads, addresses, fences, releases, pacing, and control flow. | 8.004798 ms / 686.783 TFLOPS vs M0 8.914872 ms | +10.21% | INCONCLUSIVE | Revisions `3c82bab` vs `4baffdb`; same B200, 8 warmups + 24 repeats. The 0.910074 ms bound needs NCU cause-splitting. |
 | A1 | 2026-08-14 | Rank-1 delay may break the simultaneous 16-warp REDG burst and lower peak queue pressure. | Inserted 256 ns rank-1 sleep before each slot burst; retained N=4 pacing and all handoffs. | 9.015439 ms / 609.794 TFLOPS | -1.13% | REJECTED | Revision `8199655` vs M0 8.914872 ms; fixed delay adds tail/backpressure. |
 | A2 | 2026-08-14 | Four reducers/CTA match baseline's eight cluster-wide writers; doubled sequential work may lower peak pressure. | W8-W11 active, W12-W15 idle; one N64 T2R fragment, 16 REDG groups/thread, 160 reducer registers. | 9.092323 ms / 604.637 TFLOPS | -1.99% | REJECTED | Revision `5ae43d4` vs M0 8.914872 ms: +0.177451 ms / 1.019905x runtime. Source restored byte-identically to M0. |
+| A3 | 2026-08-14 | Exact M0 executes three reducer-local spill sites 6.291M times; raising reducer warps by eight registers appeared able to remove this path without changing occupancy. | Not run: reducer `setmaxregister_increase(120→128)` would consume 63,488 registers/CTA versus the 61,440-register launch pool; each SMSP would be 16 warp-register units short. | N/A | N/A | REJECTED | Static `setmaxnreg` pool audit: physical 65,536-register capacity does not enlarge the launch-time `640 threads × 96 registers` CTA pool; an unfunded increase may block permanently. |
+| A4 | 2026-08-14 | Reducer `LDL [R1+0x4] → R2UR` at `0x10800` and `0x11940` reloads the uniform loop bound 4.194M times and carries 11,336 long-scoreboard samples; explicitly retaining `tile_count` in the uniform domain should remove this stack round trip without changing the CTA pool. | Pending: apply `cute.arch.make_warp_uniform(tile_count)` immediately after the existing ceil-div; preserve role split `48/128/120/64`, atomics, schedule, and topology. | pending | pending | — | Pre-change hypothesis from exact M0 SourceCounters and SASS dataflow: `[R1+0x4]` gates loop entry, feeds per-tile state, and terminates the reducer loop. |
 
 ## Next steps
 
 - [x] P1 exact-current REDG-off isolation — 8.004798 vs 8.914872 ms, a measured 0.910074 ms / 10.21% write-path upper bound — class data-movement
-- [ ] Rebind exact-current ptxas stack/LDL/STL with line info — prevents optimizing stale PCs — expected attribution only — cost compile/NCU-source — class staging
+- [x] Localize exact-current reducer LDL/STL from exact SourceCounters and dynamic role
+  boundaries — three sites / 6.291M instructions; DSL 4.5 line-marked `.sass` dump unavailable
+  — class staging
 - [ ] Four-wave CTA/WG phase stagger without extra total barriers — halve instantaneous cluster write issue width — expected 3-10% — cost code — class scheduling
 - [x] Four reducer warps per CTA with doubled per-thread drain — rejected at 9.092323 ms, 1.99% slower than candidate-only M0 — class warp-topology
 - [ ] Separate P and dS REDG slots in time (dV slot before/under dK compute) — avoid two back-to-back bursts — expected 2-6% — cost code — class scheduling
 - [ ] Move dKV atomic issue behind the next score's TMA/score MMA rather than P/dS math — exploit different pipe pressure — expected 2-6% — cost design-revision — class scheduling
 - [ ] Add a coarse two-tile write queue with no per-chunk waits — preserve aug7's off-critical-path goal without its 32 barriers/tile — expected 5-12% — cost design-revision — class staging
 - [ ] Audit FP32x4 REDG address order and L2 sector locality; reorder i/subtile traversal — improve merging and reduce queue residency — expected 1-4% — cost code/NCU — class data-movement
-- [ ] Sweep reducer register allocation 112/120/128 while keeping total pool neutral — eliminate exact proven spills only — expected 0-3% — cost config — class config
+- [x] A3 unfunded reducer allocation 120→128 — statically rejected before launch: 63,488
+  required versus 61,440 in the CTA launch pool; possible permanent `setmaxnreg.inc` wait —
+  class config
+- [ ] Reducer-role local rematerialization of loop-bound/CTA-rank values — eliminate the three
+  exact local sites without changing any role budget — expected 1-5% — cost code — class staging
 - [ ] Sweep dKV done stages 2→3 subject to TMEM budget — add producer slack around bursty drain — expected 1-5% — cost config — class staging
 - [ ] Reorder dQ rounds versus dV/dK head after P/dS publish — cover relay/write long poles with useful MMA — expected 2-8% — cost design-revision — class scheduling
 - [ ] Privatize dKV partials by query block and finalize in a bandwidth-efficient kernel if collision statistics permit — remove in-pipeline atomics — expected uncertain, potentially >10% — cost design-revision — class design
@@ -77,7 +97,15 @@
 - Per-chunk compact TMA drain with barrier/wait/reuse on every chunk — 21.238784 ms, ratio 2.667651 — `outputs/20260814T151311Z_vfinal_aug_7_600215/perf.json` — regime aug7
 - Uniformly raising all low-role register budgets — older exact SASS stack sites increased rather than decreased — `profile/vspill1-spill-forensics-e213fd4-20260814/REPORT.md` — regime old source, direction only
 - Four reducers/CTA with one 64-value fragment and 16 REDG groups/thread — 9.092323 ms, 1.99% slower than exact candidate-only M0 — revision `5ae43d4` — regime current math/pacing, source restored to M0
+- Unfunded reducer 120→128 register increase — requires 63,488 registers/CTA versus the
+  61,440-register launch pool and can wait forever at `setmaxnreg.inc`; rejected statically,
+  never launched — regime current 640-thread role split
 
 ## Session log
 
 - 2026-08-14 session 1 continuation: exact-current REDG-off measured a 10.21% diagnostic upper bound; A1 rank stagger and A2 four-reducer topology both rejected; A2 source restored byte-identically to M0. Exact M0 source+full NCU collected before any new SMART trace.
+- 2026-08-14 exact NCU closeout: REDG-off is a joint atomic plus reducer-live-range
+  bound, not atomic-only. Three exact reducer-local sites account for 6.291M dynamic spill
+  instructions as a strong cross-binary signature, not strict one-site causality. A3 direct
+  120→128 was rejected before editing because it exceeds the CTA launch pool; no new SMART
+  trace warranted before source-local liveness and compile-only SASS tests.
