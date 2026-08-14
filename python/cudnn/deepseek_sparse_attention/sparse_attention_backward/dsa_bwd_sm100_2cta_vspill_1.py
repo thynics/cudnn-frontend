@@ -36,12 +36,6 @@ REDUCE_PACE_EVERY = 4
 # the 200ns spread variant was never benchmarked.
 REDUCE_PACE_SLEEP_NS = 0
 
-# A1: de-correlate the two CTA-local reducer groups after their TMEM reads
-# have already released the producer stage.  This changes only the REDG issue
-# phase; all arithmetic, synchronization, and address order remain intact.
-REDUCE_RANK_STAGGER_NS = 256
-
-
 @dsl_user_op
 def _map_smem_to_cluster_rank(
     smem_ptr: cute.Pointer,
@@ -4006,8 +4000,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
 
     Per-CTA roles: warps 0-3 gather the sparse K tile and the dQ-A
     images; warps 4-7 run the softmax backward and publish P/dS; warps
-    8-15 drain the fused dV+dK partial sums to the f32 workspace; warp
-    16 issues every GEMM and manages pipeline credits; warp 17 feeds
+    8-11 drain the fused dV+dK partial sums to the f32 workspace; warps
+    12-15 are idle; warp 16 issues every GEMM and manages pipeline credits; warp 17 feeds
     the round ring from the stationary panels; warp 18 relays P/dS
     across the cluster; warp 19 relays ring TMA completions.
 
@@ -4027,7 +4021,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     MATH_WARP_BEGIN = 4
     MATH_WARPS = 4
     REDUCE_WARP_BEGIN = 8
-    REDUCE_WARPS = 8
+    REDUCE_WARPS = 4
     MMA_WARP = 16
     LOAD_WARP = 17
     RELAY_WARP = 18
@@ -4103,7 +4097,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # so the instantaneous MIO/L2 queue depth stays shallow.
         self.reduce_pace_barrier = pipeline.NamedBarrier(
             barrier_id=9,
-            num_threads=(self.MMA_WARP - self.REDUCE_WARP_BEGIN) * 32,
+            num_threads=self.REDUCE_THREADS,
         )
 
     def _make_score_tmem_load(self, score_cta_shape, score_epi_tile):
@@ -5572,20 +5566,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.N_TILE
         )
 
-        # vfinal_aug_4: 48/128/120/64 split (pool-neutral vs 48/128/128/48).
-        # Leaders get 64 so ptxas stops live-range-splitting the rank value
-        # to local memory at the S->dP / dQ phase boundaries (STACK:24,
-        # STL@0x148e0 / dead LDL@0x156e0 in the candidate build); reducers
-        # fund it (128->120) -- they are the least latency-critical group.
+        # A2: four reducers consume one unsplit N64 fragment each, so fund
+        # their doubled register fragment with the now-idle W12-W15 group.
+        # Every setmaxnreg boundary remains warpgroup-aligned.
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(48)
-        elif warp_idx >= Int32(self.MMA_WARP):
+        elif warp_idx >= Int32(
+            self.REDUCE_WARP_BEGIN + self.REDUCE_WARPS
+        ):
             cute.arch.setmaxregister_decrease(64)
         else:
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
                 cute.arch.setmaxregister_increase(128)
             else:
-                cute.arch.setmaxregister_increase(120)
+                cute.arch.setmaxregister_increase(160)
 
         # ==================================================================
         # Role bodies.
@@ -6223,7 +6217,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     mtx,
                 )
 
-        elif warp_idx < Int32(self.MMA_WARP):
+        elif warp_idx < Int32(
+            self.REDUCE_WARP_BEGIN + self.REDUCE_WARPS
+        ):
             # --- reduce: one fused drain call per tile; slot 0 is T2R'd
             # and released off the head commit, slot 1 off the tail commit,
             # then both atomic bursts run back-to-back.  Split wait/release
@@ -7222,7 +7218,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         """Drain both rank-owned dKV slots in one fused register pass.
 
         Per-slot mechanics are the v6 baseline-verbatim reducer (Ld16x256b
-        Rep-4 T2R split across two warp groups, register-gathered FP32x4
+        Rep-4 T2R, register-gathered FP32x4
         quads, preloaded KV indices, thread-group-addressed 16B red.global;
         column scramble decoded by convert_canonical).  v8 keeps the v7
         fused savings -- ONE shared KV-index preload, a fused back-to-back
@@ -7243,7 +7239,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         wait_state.advance()
 
         dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
-        wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
         # Baseline slices the fragment-C TMEM tensor down to its atom core
         # before building the tmem copy (dsa_bwd_sm100.py L1903-1907); the
         # full-rank tensor makes the tiler rank exceed the 2-D identity.
@@ -7268,24 +7263,20 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         thread_coordinates = self.split_wg(
             thread_t2r_0.partition_D(c_dkv),
-            2,
-            wg_idx,
+            1,
+            Int32(0),
         )
         thread_source_0 = self.split_wg(
             thread_t2r_0.partition_S(t_dkv_core_0),
-            2,
-            wg_idx,
+            1,
+            Int32(0),
         )
         thread_source_1 = self.split_wg(
             thread_t2r_1.partition_S(t_dkv_core_1),
-            2,
-            wg_idx,
+            1,
+            Int32(0),
         )
-        thread_values_0 = cute.make_rmem_tensor(
-            thread_coordinates.shape,
-            self.acc_dtype,
-        )
-        thread_values_1 = cute.make_rmem_tensor(
+        thread_values = cute.make_rmem_tensor(
             thread_coordinates.shape,
             self.acc_dtype,
         )
@@ -7293,9 +7284,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # Preload the per-thread KV indices as independent loads so they
         # overlap the T2R (baseline reducer pattern); shared by both slots.
         tile_base = tile_index * Int32(self.N_TILE)
-        r_topk = cute.make_rmem_tensor((8,), cutlass.Int32)
-        for i in cutlass.range_constexpr(8):
-            coord_base = i * 2 - i % 2
+        r_topk = cute.make_rmem_tensor((16,), cutlass.Int32)
+        for i in cutlass.range_constexpr(16):
+            row_group = i % 8
+            coord_base = (
+                row_group * 2 - row_group % 2 + (i // 8) * 32
+            )
             local_row = Int32(
                 cute.get(
                     thread_coordinates[coord_base],
@@ -7311,28 +7305,27 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             else:
                 r_topk[i] = Int32(-1)
 
-        cute.copy(tiled_t2r_0, thread_source_0, thread_values_0)
+        cute.copy(tiled_t2r_0, thread_source_0, thread_values)
         cute.arch.fence_view_async_tmem_load()
         done_pipeline.consumer_release(release_state)
         release_state.advance()
 
-        if cutlass.const_expr(REDUCE_RANK_STAGGER_NS > 0):
-            if rank == Int32(1):
-                _pace_nanosleep(REDUCE_RANK_STAGGER_NS)
-
-        assert cute.size(thread_values_0) == self.N_TILE // 2
+        assert cute.size(thread_values) == self.N_TILE
         sub_tile_idx_0 = rank
         sub_tile_idx_1 = Int32(2) + rank
-        for i in cutlass.range_constexpr(8):
-            coord_base = i * 2 - i % 2
+        for i in cutlass.range_constexpr(16):
+            row_group = i % 8
+            coord_base = (
+                row_group * 2 - row_group % 2 + (i // 8) * 32
+            )
             rdkv_frg_0 = cute.make_rmem_tensor(
                 (4,),
                 self.acc_dtype,
             )
-            rdkv_frg_0[0] = thread_values_0[coord_base]
-            rdkv_frg_0[1] = thread_values_0[coord_base + 2]
-            rdkv_frg_0[2] = thread_values_0[coord_base + 16]
-            rdkv_frg_0[3] = thread_values_0[coord_base + 18]
+            rdkv_frg_0[0] = thread_values[coord_base]
+            rdkv_frg_0[1] = thread_values[coord_base + 2]
+            rdkv_frg_0[2] = thread_values[coord_base + 16]
+            rdkv_frg_0[3] = thread_values[coord_base + 18]
 
             kv_index = r_topk[i]
             if kv_index >= Int32(0):
@@ -7349,7 +7342,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_0.iterator.llvm_ptr,
                     rdkv_frg_0.load(),
                 )
-            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 15):
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
                     _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
@@ -7360,25 +7353,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
         wait_state.advance()
-        cute.copy(tiled_t2r_1, thread_source_1, thread_values_1)
+        cute.copy(tiled_t2r_1, thread_source_1, thread_values)
         cute.arch.fence_view_async_tmem_load()
         done_pipeline.consumer_release(release_state)
         release_state.advance()
 
-        if cutlass.const_expr(REDUCE_RANK_STAGGER_NS > 0):
-            if rank == Int32(1):
-                _pace_nanosleep(REDUCE_RANK_STAGGER_NS)
-
-        for i in cutlass.range_constexpr(8):
-            coord_base = i * 2 - i % 2
+        for i in cutlass.range_constexpr(16):
+            row_group = i % 8
+            coord_base = (
+                row_group * 2 - row_group % 2 + (i // 8) * 32
+            )
             rdkv_frg_1 = cute.make_rmem_tensor(
                 (4,),
                 self.acc_dtype,
             )
-            rdkv_frg_1[0] = thread_values_1[coord_base]
-            rdkv_frg_1[1] = thread_values_1[coord_base + 2]
-            rdkv_frg_1[2] = thread_values_1[coord_base + 16]
-            rdkv_frg_1[3] = thread_values_1[coord_base + 18]
+            rdkv_frg_1[0] = thread_values[coord_base]
+            rdkv_frg_1[1] = thread_values[coord_base + 2]
+            rdkv_frg_1[2] = thread_values[coord_base + 16]
+            rdkv_frg_1[3] = thread_values[coord_base + 18]
 
             kv_index = r_topk[i]
             if kv_index >= Int32(0):
@@ -7395,7 +7387,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_1.iterator.llvm_ptr,
                     rdkv_frg_1.load(),
                 )
-            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 7):
+            if cutlass.const_expr((i + 1) % REDUCE_PACE_EVERY == 0 and i != 15):
                 self.reduce_pace_barrier.arrive_and_wait()
                 if cutlass.const_expr(REDUCE_PACE_SLEEP_NS > 0):
                     _pace_nanosleep(REDUCE_PACE_SLEEP_NS)
