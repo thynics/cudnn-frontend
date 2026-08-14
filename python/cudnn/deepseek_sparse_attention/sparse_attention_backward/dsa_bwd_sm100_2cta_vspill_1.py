@@ -4931,6 +4931,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         token_idx = physical_x // self.CLUSTER_SHAPE_MNK[0]
         is_leader_cta = rank == Int32(0)
 
+        # A22: keep rank 0 untouched; on rank 1 move the round-commit relay
+        # from W19 to the otherwise-idle follower-MMA W16.  Both physical
+        # warps remain in the same 64-register warpgroup.
+        role_warp_idx = warp_idx
+        if rank == Int32(1):
+            if warp_idx == Int32(self.MMA_WARP):
+                role_warp_idx = Int32(self.COMMIT_WARP)
+            elif warp_idx == Int32(self.COMMIT_WARP):
+                role_warp_idx = Int32(self.MMA_WARP)
+
         if warp_idx == Int32(self.LOAD_WARP):
             cpasync.prefetch_descriptor(tma_atom_q)
             cpasync.prefetch_descriptor(tma_atom_do)
@@ -6251,7 +6261,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     dkv_rel,
                 )
 
-        elif warp_idx == Int32(self.MMA_WARP):
+        elif role_warp_idx == Int32(self.MMA_WARP):
             # --- leader MMA: rotated schedule.  The follower CTA's MMA warp
             # executes no pipeline operation at all (FA4 rule).
             if is_leader_cta:
@@ -6831,7 +6841,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_p.producer_tail(p_com)
                     pipe_ds.producer_tail(ds_com)
 
-        elif warp_idx == Int32(self.COMMIT_WARP):
+        elif role_warp_idx == Int32(self.COMMIT_WARP):
             commit_com = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.ROUND_STAGES,
