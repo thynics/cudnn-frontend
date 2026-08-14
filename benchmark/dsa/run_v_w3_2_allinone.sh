@@ -455,6 +455,29 @@ def error_metrics(actual, expected):
     return {"max_abs": float(difference.max()), "mean_abs": float(difference.mean()), "cosine": cosine}
 
 
+def assert_close_named(pattern, tensor_name, actual, expected):
+    actual = actual.float()
+    expected = expected.float()
+    atol = 5e-2
+    rtol = 5e-2
+    try:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    except AssertionError:
+        mismatch_mask = ~torch.isclose(actual, expected, atol=atol, rtol=rtol)
+        mismatch_count = int(mismatch_mask.sum())
+        element_count = mismatch_mask.numel()
+        mismatch_percent = 100.0 * mismatch_count / element_count
+        max_abs = float((actual - expected).abs().max())
+        summary = (
+            f"DSA_CORRECTNESS_FAIL pattern={pattern} tensor={tensor_name} "
+            f"mismatched={mismatch_count}/{element_count} "
+            f"({mismatch_percent:.2f}%) max_abs={max_abs:.9g} "
+            f"atol={atol:g} rtol={rtol:g}"
+        )
+        print(summary, file=sys.stderr, flush=True)
+        raise AssertionError(summary) from None
+
+
 correctness_records = []
 for pattern in patterns:
     torch.manual_seed(c_seed)
@@ -481,9 +504,9 @@ for pattern in patterns:
         topk_length=lengths, softmax_scale=scale,
     )
     out_ref.backward(dout.float())
-    torch.testing.assert_close(result["dq"].float(), q_ref.grad, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(result["dkv"].float(), kv_ref.grad, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(result["d_sink"].float(), sink_ref.grad, atol=5e-2, rtol=5e-2)
+    assert_close_named(pattern, "dq", result["dq"], q_ref.grad)
+    assert_close_named(pattern, "dkv", result["dkv"], kv_ref.grad)
+    assert_close_named(pattern, "d_sink", result["d_sink"], sink_ref.grad)
 
     correctness_records.append({
         "pattern": pattern,
@@ -945,6 +968,37 @@ if ((status_rc != 0)); then
   echo "Remote workload failed (rc=${status_rc}, attach_rc=${run_rc}); downloading diagnostics..." >&2
   scp -q -r "${frontend}:${remote_result}/." "${output_dir}/" || \
     echo "WARNING: remote diagnostics were unavailable; session.log is complete" >&2
+  python3 - "${status_probe}" "${output_dir}/remote.stderr.log" <<'PY_FAILURE_SUMMARY'
+import json
+import pathlib
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    status = json.load(handle)
+print(
+    f"FAIL stage={status.get('stage', 'unknown')} "
+    f"exit_code={status.get('exit_code', 'unknown')}",
+    file=sys.stderr,
+)
+
+stderr_path = pathlib.Path(sys.argv[2])
+if stderr_path.is_file():
+    lines = stderr_path.read_text(errors="replace").splitlines()
+    summaries = [
+        line[line.index("DSA_CORRECTNESS_FAIL") :]
+        for line in lines
+        if "DSA_CORRECTNESS_FAIL" in line
+    ]
+    if summaries:
+        print(summaries[-1], file=sys.stderr)
+    else:
+        meaningful = [line for line in lines if line.strip()]
+        if meaningful:
+            print("REMOTE_STDERR_TAIL", file=sys.stderr)
+            for line in meaningful[-20:]:
+                print(line, file=sys.stderr)
+PY_FAILURE_SUMMARY
+  echo "diagnostics=${output_dir}" >&2
   exit "${status_rc}"
 fi
 if ((run_rc != 0)); then
