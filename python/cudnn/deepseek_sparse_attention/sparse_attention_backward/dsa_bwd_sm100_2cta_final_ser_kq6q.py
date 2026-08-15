@@ -5904,7 +5904,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.arch.mbarrier_init(stationary_ready_mbar + 1, 2)
             cute.arch.mbarrier_init(landing_mbars, 1)
             cute.arch.mbarrier_init(landing_mbars + 1, 1)
-            cute.arch.mbarrier_init(relay_mbars, 2)
+            # H9: P block 0 opens from rank 1's local landing; block 1 is
+            # gated separately by the leader's rank-0-local landing wait.
+            cute.arch.mbarrier_init(relay_mbars, 1)
             cute.arch.mbarrier_init(relay_mbars + 1, 2)
             # kq2 (e12 adjudication): count-4 closes -- one elected
             # arrive per math warp after a warp-level sync, instead of
@@ -6787,6 +6789,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         dq_acc,
                         relay_phase,
                         relay_mbars,
+                        landing_mbars,
                         ds_local_ready_mbar,
                         pipe_round,
                         round_cons,
@@ -7049,8 +7052,23 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     1,
                 )
                 for loop_iter in cutlass.range(tile_count):
-                    # ---- P leg first: fire p_ready -> peer landing ->
-                    # relay 0 with nothing else on the warp.
+                    # H9: rank 1 first waits for rank 0's block-0 copy and
+                    # alone opens relay 0.  Rank 0 can produce that copy
+                    # without waiting for rank 1's slower P publication.
+                    if rank == Int32(1):
+                        _mbarrier_wait_acquire_cluster(
+                            landing_mbars,
+                            p_landing_phase,
+                        )
+                        p_landing_phase = Int32(1) - p_landing_phase
+                        cute.arch.mbarrier_arrive(
+                            relay_mbars,
+                            Int32(0),
+                        )
+
+                    # Publish this CTA's non-local P block to its peer.  The
+                    # rank-1 -> rank-0 copy is gated by W16 only when the
+                    # first p_fragment_1 pass becomes imminent.
                     cute.arch.mbarrier_wait(
                         p_ready_mbars,
                         p_ready_phase,
@@ -7077,15 +7095,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
-                    _mbarrier_wait_acquire_cluster(
-                        landing_mbars,
-                        p_landing_phase,
-                    )
-                    p_landing_phase = Int32(1) - p_landing_phase
-                    cute.arch.mbarrier_arrive(
-                        relay_mbars,
-                        Int32(0),
-                    )
+                    # Preserve H1's rank-0 relay timing for this first
+                    # split-gate experiment.  W16 also waits on this local
+                    # landing; mbarrier phase waits are non-consuming.
+                    if rank == Int32(0):
+                        _mbarrier_wait_acquire_cluster(
+                            landing_mbars,
+                            p_landing_phase,
+                        )
+                        p_landing_phase = Int32(1) - p_landing_phase
                     # ---- dS leg strictly after relay 0.
                     cute.arch.mbarrier_wait(
                         pds_ready_mbars,
@@ -7257,6 +7275,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dq_accumulate: cutlass.Boolean,
         relay_phase: Int32,
         relay_mbars: cute.Pointer,
+        landing_mbars: cute.Pointer,
         ds_local_ready_mbar: cute.Pointer,
         round_pipeline,
         round_consumer_state: pipeline.PipelineState,
@@ -7275,10 +7294,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         micro-generations (two per original K64 panel); the K_dQ
         pair rides a kscore generation in score_kv (filled under the
         dV window, released to the next tile's score-K gather by dQ).
-        Gates: relay 0 (P published + exchanged cluster-wide) opens
-        dV; ds_local_ready (both CTAs' relay lanes observed their
-        local dS publish close) opens dQ -- dQ's B is the LOCAL dS
-        image per CTA, so it does not wait the dS DSM landing; relay 1
+        Gates: relay 0 opens the two p_fragment_0 passes as soon as block 0
+        has landed on rank 1; rank 0's local landing separately gates the
+        p_fragment_1 passes.  ds_local_ready (both CTAs' relay lanes
+        observed their local dS publish close) opens dQ -- dQ's B is the
+        LOCAL dS image per CTA, so it does not wait the dS DSM landing; relay 1
         (dS exchanged) opens dK, now additionally covered by dQ's
         execution window.  The pds consumer handshake sits before dQ
         as buffer backpressure.
@@ -7314,6 +7334,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         )
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
+        # H9: p_fragment_0 is ready cluster-wide at relay 0.  The peer
+        # p_fragment_1 copy into rank 0 runs concurrently with the first two
+        # dV passes and is consumed only after this local landing acquire.
+        _mbarrier_wait_acquire_cluster(landing_mbars, relay_phase)
         round_pipeline.consumer_wait(round_consumer_state)
         self._issue_dkv_pass_v2(
             dkv_tiled_mma,
