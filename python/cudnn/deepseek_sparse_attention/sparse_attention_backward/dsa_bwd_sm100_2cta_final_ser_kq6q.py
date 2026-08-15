@@ -5825,6 +5825,17 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
+        # H1 spill containment: for the fixed two-CTA cluster the library's
+        # runtime consumer mask is identically zero.  Rebuild the frozen
+        # pipeline value so that it cannot become a loop-spanning stack slot.
+        pipe_s_done = pipeline.PipelineUmmaAsync(
+            sync_object_full=pipe_s_done.sync_object_full,
+            sync_object_empty=pipe_s_done.sync_object_empty,
+            num_stages=pipe_s_done.num_stages,
+            producer_mask=pipe_s_done.producer_mask,
+            consumer_mask=Int32(0),
+            cta_group=pipe_s_done.cta_group,
+        )
         pipe_dp_done = pipeline.PipelineUmmaAsync.create(
             num_stages=self.SCORE_DONE_STAGES,
             producer_group=leader_group,
@@ -5832,6 +5843,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             barrier_storage=storage.dp_done_mbars.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
+        )
+        pipe_dp_done = pipeline.PipelineUmmaAsync(
+            sync_object_full=pipe_dp_done.sync_object_full,
+            sync_object_empty=pipe_dp_done.sync_object_empty,
+            num_stages=pipe_dp_done.num_stages,
+            producer_mask=pipe_dp_done.producer_mask,
+            consumer_mask=Int32(0),
+            cta_group=pipe_dp_done.cta_group,
         )
         pipe_kscore = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
@@ -6224,7 +6243,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 )
                 // Int32(self.N_TILE_CTA)
             )
-            owns_n = n_owner == rank
             aligned_p_blocks_ptr = cute.make_ptr(
                 self.element_dtype,
                 p_blocks[0].iterator.toint(),
@@ -6453,7 +6471,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 r_p_store = thread_copy_r2s.retile(r_p)
                 assert t_rs_p_local_tile.shape == r_p_store.shape
                 assert t_rs_p_xchg_tile.shape == r_p_store.shape
-                if owns_n:
+                # H1: rematerialize the uniform CTA rank at the use instead
+                # of keeping owns_n live across the P and dS math phases.
+                if n_owner == cute.arch.make_warp_uniform(
+                    cute.arch.block_idx_in_cluster()
+                ):
                     cute.copy(
                         tiled_copy_r2s,
                         r_p_store,
@@ -6532,7 +6554,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_ds_local_tile.shape == r_ds_store.shape
                 assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
-                if owns_n:
+                if n_owner == cute.arch.make_warp_uniform(
+                    cute.arch.block_idx_in_cluster()
+                ):
                     cute.copy(
                         tiled_copy_r2s,
                         r_ds_store,
