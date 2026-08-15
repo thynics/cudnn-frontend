@@ -32,6 +32,7 @@ The four-stage K32 round ring streams stationary dO/Q panels to dV/dK.
 | H4 | Raise the complete late warpgroup W16-W19 from `setmaxregister_decrease(64)` to 72, consuming the exact 1,024-register launch-allocation slack. | Give the leader/loader/relay/committer more dynamic registers without changing pipeline order. Require a no-cache line-info SASS audit, TopK=128 deadlock canary, and same-process H1/H4 ABBA. | rejected | Canary and exact-shape crosscheck pass. Local instructions fall only 37 to 36; the loader's three local accesses and committer spill remain. At TopK=2048, H1 is 9.258656 ms and H4 is 9.272320 ms: H4/H1 1.001417, first half 1.001509, second half 1.001244, block-bootstrap 95% CI [1.001237, 1.001521]. Reverted to H1 without SMART capture. |
 | H5 | Rematerialize CTA rank at every W17 loader use and substitute the proven-equal constexpr `h_half` as the bulk-copy destination CTA. | Eliminate the rank live range across the fully unrolled 16-generation loader without changing slot, phase, barrier, or copy ownership. Require all four W17 rank-stack accesses to disappear in no-cache line-info SASS before timing. | rejected at codegen gate | Semantics review passes, but the compiler CSEs the rank reads. Exact SASS remains 37 local instructions and retains the same `LDL.LU + STL + STL + LDL` W17 stack sequence. No wall-time or SMART run was performed; reverted to H1. |
 | H6 | Replace W17's hoisted rank with side-effecting `%cluster_ctarank` reads at its stationary-load and owner-copy uses. | Force short-lived special-register values after H5's ordinary rematerialization was CSE'd. Require the W17 stack sequence to disappear without increasing total local traffic before timing. | rejected at codegen gate | The no-cache build rises from H1's 37 local instructions to 57 (`STL=16`, `LDL=41`). The two unrolled owner tests each gain eight attributed LDLs, for a net increase of 20 local loads. No performance run was performed; reverted to H1. |
+| H7 | Split P and dS storage ownership, release P after dV-r1 source-read completion, and reuse its aligned 8 KiB allocation for late round generation G12. Preserve all 16 normal round generations with a data-free G12 phase token and protect the alias with a one-stage late pipeline. | Remove G12 from the contended four-slot round ring without increasing SMEM or changing dV/dQ/dK order. Require release/trace parity, a barrier happens-before proof, no-cache line-info SASS, a TopK=128 canary, and same-process H1/H7 ABBA. | rejected | Static barrier/phase audit and normalized release/trace parity pass. H7 remains REG=96, STACK=8 and 37 local instructions (`STL=16`, `LDL=21`, unattributed=0), exactly H1's total; the 19th source location is only the existing W16 STL being re-attributed from the generic JIT entry to fragment setup, with no hot-role increase. TopK=128 crosscheck/deadlock canary passes and gives H7/H1 0.998487. At TopK=2048, however, H1 is 9.260080 ms and H7 is 9.316224 ms: H7/H1 1.005928, first half 1.005839, second half 1.005968, block-bootstrap 95% CI [1.005796, 1.006147]. The extra alias-side coordination costs more than relieving one ring generation; reverted to H1 without SMART capture. |
 
 ## Historical suffix audit
 
@@ -66,6 +67,15 @@ The four-stage K32 round ring streams stationary dO/Q panels to dV/dK.
 - Historical suffix adjudication artifact:
   `outputs/final_ser_kq6q_h6_volatile_rank_20260815/final_ser_h1_kq6m_abba.json`,
   SHA256 `3c82a99e6f627032795962f4757a9ac15086b93e1c5dd7e4915974c4a3934d4d`.
+- H7 no-cache spill product:
+  `outputs/final_ser_kq6q_h7_palias_20260815/spill/logs/codegen/compile/*.spill_product.json`,
+  SHA256 `dfdf0971d5e0b0bc75aaf60990bea34eb44da6cfe2b1f6e2ef7d96dcf515cdfa`.
+- H7 TopK=128 canary:
+  `outputs/final_ser_kq6q_h7_palias_20260815/topk128_canary/topk128_canary.json`,
+  SHA256 `9b504e66c13edd029ba8e9004f0ef9115db639b8e0d9db0cfba14ed9967fe9c7`.
+- H7 TopK=2048 adjudication:
+  `outputs/final_ser_kq6q_h7_palias_20260815/topk2048_abba/final_ser_h1_h7_abba_topk2048.json`,
+  SHA256 `0c4b836da6ea08f3f4c4c03259d3fa7e8f4137f39077bf7db588752a8e2fbf31`.
 - The existing H1 SMART capture remains exact after the revert: release SHA256
   `90610120873cebb9177e892e9cecf34df1adab52919961b5d65cdf7b1d8d708e`,
   trace-twin SHA256
