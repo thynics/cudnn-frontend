@@ -6030,16 +6030,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         # +8 regs to the math warps to kill the spills; paid by the
         # reduce warps (-8), which are off the critical path.  WATCH:
         # reduce LDL must not appear (that would feed the same storm).
-        # H4 gives the late warpgroup the remaining launch-allocation slack.
         # HARD CONSTRAINT (v9_3.py:12440, setmaxregister deadlock on
         # B300): the budget is the CTA LAUNCH allocation, 640 x 96 =
-        # 61,440, not the physical file.  128x48 + 128x72 + 128x136 +
-        # 256x112 = 61,440 exactly. Register targets must be multiples of 8
-        # for nvvm.setmaxregister; all four late warps must share the target.
+        # 61,440, not the physical file.  128x48 + 128x64 + 128x136 +
+        # 256x112 = 60,416 <= 61,440. Register targets must be multiples
+        # of 8 for nvvm.setmaxregister.
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(48)
         elif warp_idx >= Int32(self.MMA_WARP):
-            cute.arch.setmaxregister_decrease(72)
+            cute.arch.setmaxregister_decrease(64)
         else:
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
                 cute.arch.setmaxregister_increase(136)

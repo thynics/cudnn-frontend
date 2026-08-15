@@ -6031,16 +6031,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.N_TILE
         )
 
-        # H4 gives the late warpgroup the remaining launch-allocation slack.
-        # HARD CONSTRAINT (v9_3.py:12440, re-learned via a setmaxregister
+        # K1a register relayout 48/64/128/120 (rubin_1.py:102).  HARD
+        # CONSTRAINT (v9_3.py:12440, re-learned via a setmaxregister
         # deadlock on B300): the budget is the CTA LAUNCH allocation,
-        # 640 x 96 = 61,440, not the physical file.  128x48 + 128x72 +
-        # 128x136 + 256x112 = 61,440 exactly.  All targets are multiples of
-        # 8, and all four late warps share one target.
+        # 640 x 96 = 61,440, not the physical file.  128x48 + 128x64 +
+        # 128x128 + 256x120 = 61,440 exactly.
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(48)
         elif warp_idx >= Int32(self.MMA_WARP):
-            cute.arch.setmaxregister_decrease(72)
+            cute.arch.setmaxregister_decrease(64)
         else:
             if warp_idx < Int32(self.REDUCE_WARP_BEGIN):
                 # kq6c: 136/112 relayout; setmaxregister requires multiples of 8.
