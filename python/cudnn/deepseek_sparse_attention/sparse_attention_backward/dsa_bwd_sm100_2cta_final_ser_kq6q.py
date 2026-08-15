@@ -6255,14 +6255,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 ds_blocks[0].memspace,
                 assumed_align=16,
             )
-            p_local_store = cute.make_tensor(
-                cute.recast_ptr(
-                    aligned_p_blocks_ptr,
-                    score_store_layout.inner,
-                    dtype=self.element_dtype,
-                ),
-                score_store_domain,
-            )
             ds_local_store = cute.make_tensor(
                 cute.recast_ptr(
                     aligned_ds_blocks_ptr,
@@ -6285,9 +6277,21 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 ds_xchg_raw.memspace,
                 assumed_align=16,
             )
-            p_xchg_store = cute.make_tensor(
+            # H11: choose the P publication destination once before the KV
+            # loop.  Publication is then straight-line and cannot depend on
+            # an owner reload on the exposed P-to-relay path.
+            p_publish_addr = aligned_p_blocks_ptr.toint()
+            if n_owner != rank:
+                p_publish_addr = aligned_p_xchg_ptr.toint()
+            aligned_p_publish_ptr = cute.make_ptr(
+                self.element_dtype,
+                p_publish_addr,
+                p_xchg_raw.memspace,
+                assumed_align=16,
+            )
+            p_publish_store = cute.make_tensor(
                 cute.recast_ptr(
-                    aligned_p_xchg_ptr,
+                    aligned_p_publish_ptr,
                     score_store_layout.inner,
                     dtype=self.element_dtype,
                 ),
@@ -6301,29 +6305,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 ),
                 score_store_domain,
             )
-            t_rs_p_local = thread_copy_r2s.partition_D(
-                p_local_store
+            t_rs_p_publish = thread_copy_r2s.partition_D(
+                p_publish_store
             )
             t_rs_ds_local = thread_copy_r2s.partition_D(
                 ds_local_store
             )
-            t_rs_p_xchg = thread_copy_r2s.partition_D(
-                p_xchg_store
-            )
             t_rs_ds_xchg = thread_copy_r2s.partition_D(
                 ds_xchg_store
             )
-            assert cute.size(t_rs_p_local, mode=[4]) == 1
+            assert cute.size(t_rs_p_publish, mode=[4]) == 1
             assert cute.size(t_rs_ds_local, mode=[4]) == 1
-            assert cute.size(t_rs_p_xchg, mode=[4]) == 1
             assert cute.size(t_rs_ds_xchg, mode=[4]) == 1
-            t_rs_p_local_tile = t_rs_p_local[
+            t_rs_p_publish_tile = t_rs_p_publish[
                 None, None, None, None, 0
             ]
             t_rs_ds_local_tile = t_rs_ds_local[
-                None, None, None, None, 0
-            ]
-            t_rs_p_xchg_tile = t_rs_p_xchg[
                 None, None, None, None, 0
             ]
             t_rs_ds_xchg_tile = t_rs_ds_xchg[
@@ -6466,27 +6463,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 # serial leader order, so this acquire is quiet.
                 pipe_pds.producer_acquire(pds_state)
 
-                # Publish P with stmatrix. Each pair of warps owns one
-                # N32 half, so this branch is warp-uniform.
+                # Publish P with stmatrix. Each pair of warps owns one N32
+                # half; its local/xchg destination was selected above.
                 r_p_store = thread_copy_r2s.retile(r_p)
-                assert t_rs_p_local_tile.shape == r_p_store.shape
-                assert t_rs_p_xchg_tile.shape == r_p_store.shape
-                # H1: rematerialize the uniform CTA rank at the use instead
-                # of keeping owns_n live across the P and dS math phases.
-                if n_owner == cute.arch.make_warp_uniform(
-                    cute.arch.block_idx_in_cluster()
-                ):
-                    cute.copy(
-                        tiled_copy_r2s,
-                        r_p_store,
-                        t_rs_p_local_tile,
-                    )
-                else:
-                    cute.copy(
-                        tiled_copy_r2s,
-                        r_p_store,
-                        t_rs_p_xchg_tile,
-                    )
+                assert t_rs_p_publish_tile.shape == r_p_store.shape
+                cute.copy(
+                    tiled_copy_r2s,
+                    r_p_store,
+                    t_rs_p_publish_tile,
+                )
                 cute.arch.fence_view_async_shared()
                 # kq2 (e12): warp-level close -- sync the warp so all
                 # its stores/fence retire, then one elected local
@@ -6554,7 +6539,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_ds_local_tile.shape == r_ds_store.shape
                 assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
-                if n_owner == cute.arch.make_warp_uniform(
+                if cute.arch.make_warp_uniform(
+                    mtx // Int32(self.H_TILE_CTA)
+                ) == cute.arch.make_warp_uniform(
                     cute.arch.block_idx_in_cluster()
                 ):
                     cute.copy(

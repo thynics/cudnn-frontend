@@ -36,6 +36,7 @@ The four-stage K32 round ring streams stationary dO/Q panels to dV/dK.
 | H8 | Reshape reducer issue from the H1 `150 ns / no cohort skew` pattern to four CTA/WG cohorts with `100 ns` inter-chunk pacing and `90 ns` cohort spacing; then split-screen pure pacing and pure dephase variants. | The exact H1 SMART trace shows the preceding tile's R1 atomic envelope covers essentially the complete next-tile P/relay wait, while the two reducer warpgroups start within a few ns. Test whether lowering instantaneous REDG concentration shortens P publication and peer landing without reducer lag. | rejected | The combination wins the TopK=128 canary (H8/H1 0.988834) but regresses at TopK=2048: 1.005992, CI [1.005535, 1.006064]. Exact-H1 class-override screens explain the reversal: pace 125/150 is 1.031037 (strong regression), pace 175/150 is 0.999903 with CI crossing 1, and pace150 plus 40 ns cohort spacing is 0.999912 with CI crossing 1. Thus H1's 150 ns pacing is already on the long-shape plateau; neither more pacing nor cohort dephase improves the critical path. Release and trace sources were reverted byte-for-byte to H1. |
 | H9 | Split P readiness without a new barrier: rank 1 opens relay 0 as soon as CTA0's block 0 lands, W16 issues both `p_fragment_0` passes, then waits for rank 1's block 1 landing before the remaining dV passes. | Hide the measured rank-1 P/publication tail and about 0.267 us of peer landing behind the first two dV passes. Require a barrier/phase proof, release/trace parity, no-cache spill audit, TopK=128 canary, and same-process TopK=2048 ABBA. | rejected | Static barrier/phase audit and release/trace parity pass; exact-shape crosschecks pass. No-cache codegen stays REG=96/STACK=8 but local traffic rises from H1's 37 to 38 instructions (`STL=16`, `LDL=22`), with rank-dependent W18 relay control replacing the old straight-line spill sites. TopK=128 is neutral (H9/H1 0.999663, CI crosses 1). At TopK=2048 H1 is 9.274960 ms and H9 is 9.352368 ms: H9/H1 1.008226, first half 1.008248, second half 1.008221, CI [1.008119, 1.008558]. The repeated split-gate/control cost is larger than the overlap it exposes. Revert to H1; do not spend a SMART capture on the losing build. |
 | H10 | Move the S T2R `fence_view_async_tmem_load` plus score-stage consumer release from immediately after the load to after P publication and `p_ready` arrival. | Let relay 0 observe P before retiring the S view, hiding any T2R completion latency in the following dP wait. Require a TMEM anti-dependency proof, unchanged spill totals, and TopK=128/2048 paired tests. | rejected | The move is legal: register true dependencies protect P math and the wait still precedes the S-stage release. No-cache codegen remains REG=96/STACK=8 with 37 local instructions (`STL=16`, `LDL=21`), and the S consumer-release SASS moves after `p_ready`; however the original wait was not an exposed fence instruction, so the change primarily delays score-stage credit. TopK=128 is H10/H1 1.000440, CI [1.000130, 1.000505]. TopK=2048 is H1 9.272160 ms versus H10 9.280816 ms: ratio 1.000937, halves 1.000843/1.000987, CI [1.000821, 1.001085]. Exact-shape crosscheck passes. Reverted to H1. |
+| H11 | Select the warp's local/xchg P publication address once before the KV loop, build one partitioned P destination, and make every per-tile P publication an unconditional `stmatrix`; keep the dS ownership test late. | Remove the CTA-rank reload and ownership branch from the exposed P T2R-to-relay chain without changing P bytes, destination mapping, barriers, or pipeline order. Gate on release/trace parity, exact no-cache SASS, TopK=128, and same-process TopK=2048 ABBA. | accepted as structural cleanup | The exact SASS establishes that H1's hot `[R1+4]` value is CTA rank, not `n_owner`. H11 removes its dependent `LDL.LU` and `ISETP` completely from the P `LDTM -> STSM` interval; the remaining reload occurs only after dP T2R. Local traffic falls from 37 to 36 instructions (`LDL 21 -> 20`, `STL=16`, REG=96, STACK=8). TopK=128 is 1.236880 ms H1 versus 1.235312 ms H11, ratio 0.998304, halves agree, CI [0.997735, 0.998720]. TopK=2048 is 9.271648 ms H1 versus 9.260480 ms H11, ratio 0.998866, halves 0.998849/0.998909, CI [0.998680, 0.998951]. Both exact-shape crosschecks pass. The gain is below 2%, but the predeclared structural exception applies because SASS proves removal of the measured critical dependency; retain H11 as the new anchor. |
 
 ## Historical suffix audit
 
@@ -59,7 +60,11 @@ The four-stage K32 round ring streams stationary dO/Q panels to dV/dK.
 
 ## Current decision anchor
 
-- Retained source is H1, SHA256
+- Retained source is H11, SHA256
+  `afbf536ccb4b55785165b63c9ec29c787544e18612f1d3ba622579c704516f06`.
+  Its trace twin is
+  `a4b75e422fb7f2a4eb35be018c13082f02a13a27d1d666c32576fe7a2d27ce4d`.
+- H11's parent H1 remains the exact SMART comparison anchor, SHA256
   `90610120873cebb9177e892e9cecf34df1adab52919961b5d65cdf7b1d8d708e`.
 - H1/H3 adjudication used one B200 process, shared tensors/output/workspaces,
   32 warm-up pairs, and 48 ABBA/BAAB measured pairs. Accumulator resets were
@@ -101,6 +106,14 @@ The four-stage K32 round ring streams stationary dO/Q panels to dV/dK.
   `a92f129d7427bf682d206226a56734bf0ac6704c781d9d541601f327a832c5f2`,
   and the TopK=2048 adjudication SHA256 is
   `9f5d7ec0eba6b6b66565b0f799b357afec51f2edc7f0f49b4cd35c39c32c293d`.
+- H11 preselected-P artifacts:
+  `outputs/final_ser_kq6q_h11_owner_remat_20260815/`. The no-cache spill
+  product SHA256 is
+  `df98582668f73ea5c47b020e19d952ed4df736d85d782731e87cc5114364c35b`,
+  the TopK=128 canary SHA256 is
+  `77050990ff6ee878d335223f0941a1760d399535529385c8067f1aa88e5311b7`,
+  and the TopK=2048 adjudication SHA256 is
+  `1f982845f823c07fd897d7d35358c8ab2a665b5e1cb7a1cdc9bca511f34cd9d6`.
 - The existing H1 SMART capture remains exact after the revert: release SHA256
   `90610120873cebb9177e892e9cecf34df1adab52919961b5d65cdf7b1d8d708e`,
   trace-twin SHA256
