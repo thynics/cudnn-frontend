@@ -175,6 +175,11 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
 
+# H2 reducer concentration knife: all eight reducer warps rejoin after four
+# FP32x4 atomics.  No sleep is inserted; the barrier reshapes the burst only.
+REDUCE_PACE_EVERY = 4
+
+
 @dsl_user_op
 def _nanosleep_u32(
     ns: Int32,
@@ -4312,6 +4317,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             barrier_id=7,
             num_threads=(self.GATHER_WARPS + 1) * 32,
         )
+        self.reduce_pace_barrier = pipeline.NamedBarrier(
+            barrier_id=9,
+            num_threads=self.REDUCE_THREADS,
+        )
 
     def _make_score_tmem_load(self, score_cta_shape, score_epi_tile):
         """v9.3: force the 16-DP/256-bit T2R atom for S/dP.
@@ -7702,8 +7711,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_0.iterator.llvm_ptr,
                     rdkv_frg_0.load(),
                 )
-            # kq6q: pace the burst (concentration knife).
-            _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
+            if cutlass.const_expr(
+                (i + 1) % REDUCE_PACE_EVERY == 0 and i != 7
+            ):
+                self.reduce_pace_barrier.arrive_and_wait()
+        # Keep the two slots phase-aligned; this also prevents one warp from
+        # immediately starting slot 1 while peers are finishing slot 0.
+        self.reduce_pace_barrier.arrive_and_wait()
 
         # --- slot 1: tail-committed generation.
         done_pipeline.consumer_wait(wait_state)
@@ -7739,8 +7753,11 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_1.iterator.llvm_ptr,
                     rdkv_frg_1.load(),
                 )
-            # kq6q: pace the burst (concentration knife).
-            _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
+            if cutlass.const_expr(
+                (i + 1) % REDUCE_PACE_EVERY == 0 and i != 7
+            ):
+                self.reduce_pace_barrier.arrive_and_wait()
+        self.reduce_pace_barrier.arrive_and_wait()
         return wait_state, release_state
 
 
