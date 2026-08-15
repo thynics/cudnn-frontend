@@ -392,6 +392,7 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
             )
         return round_acq
 
+    @cute.jit
     def __call__(
         self,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
