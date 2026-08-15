@@ -54,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-label", default="h3")
     parser.add_argument("--left-expected-sha256", default=None)
     parser.add_argument("--right-expected-sha256", default=None)
+    parser.add_argument("--left-reduce-pace-ns", type=int, default=None)
+    parser.add_argument("--right-reduce-pace-ns", type=int, default=None)
+    parser.add_argument("--left-reduce-dephase-ns", type=int, default=None)
+    parser.add_argument("--right-reduce-dephase-ns", type=int, default=None)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--warmup-pairs", type=int, default=32)
     parser.add_argument("--paired-samples", type=int, default=48)
@@ -211,6 +215,24 @@ def main() -> int:
     _, right_cls, right_sha256 = load_source(
         args.right_source, right_label, args.right_expected_sha256
     )
+
+    class_overrides = {
+        left_label: {
+            "REDUCE_PACE_NS": args.left_reduce_pace_ns,
+            "REDUCE_DEPHASE_NS": args.left_reduce_dephase_ns,
+        },
+        right_label: {
+            "REDUCE_PACE_NS": args.right_reduce_pace_ns,
+            "REDUCE_DEPHASE_NS": args.right_reduce_dephase_ns,
+        },
+    }
+    for label, impl_cls in ((left_label, left_cls), (right_label, right_cls)):
+        for name, value in class_overrides[label].items():
+            if value is None:
+                continue
+            if value < 0:
+                raise ValueError(f"{label} {name} must be non-negative")
+            setattr(impl_cls, name, value)
 
     seqlen = args.seqlen
     nheads = args.nheads
@@ -449,6 +471,7 @@ def main() -> int:
                 "sha256": right_sha256,
             },
         },
+        "class_overrides": class_overrides,
         "fairness_contract": {
             "same_process": True,
             "same_inputs": True,
