@@ -6838,13 +6838,25 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
                 cute.copy(
                     tma_atom_q,
-                    t_q_gmem[None, rank, 0],
+                    t_q_gmem[
+                        None,
+                        cute.arch.make_warp_uniform(
+                            cute.arch.block_idx_in_cluster()
+                        ),
+                        0,
+                    ],
                     t_q_smem[None, 0],
                     tma_bar_ptr=stationary_tma_mbars,
                 )
                 cute.copy(
                     tma_atom_do,
-                    t_do_gmem[None, rank, 0],
+                    t_do_gmem[
+                        None,
+                        cute.arch.make_warp_uniform(
+                            cute.arch.block_idx_in_cluster()
+                        ),
+                        0,
+                    ],
                     t_do_smem[None, 0],
                     tma_bar_ptr=stationary_tma_mbars + 1,
                 )
@@ -6918,7 +6930,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             )
                             if cutlass.const_expr(tensor_kind == 0):
                                 if cutlass.const_expr(self.OWN_HALF_BULK):
-                                    if rank == Int32(h_half):
+                                    # H5: do not carry CTA rank through the
+                                    # fully unrolled 16-generation loader.
+                                    # In the true arm, rank is proven equal to
+                                    # the constexpr h_half, so both the branch
+                                    # and destination-CTA operand can be
+                                    # rematerialized.
+                                    if cute.arch.make_warp_uniform(
+                                        cute.arch.block_idx_in_cluster()
+                                    ) == Int32(h_half):
                                         with cute.arch.elect_one():
                                             _cpasync_bulk_s2cluster(
                                                 stationary_do_raw
@@ -6926,7 +6946,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 round_dst_raw,
                                                 round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
-                                                rank,
+                                                Int32(h_half),
                                             )
                                             _cpasync_bulk_s2cluster(
                                                 stationary_do_raw
@@ -6936,7 +6956,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 + self.ROUND_STAGE_ELEMENTS // 2,
                                                 round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
-                                                rank,
+                                                Int32(h_half),
                                             )
                                     else:
                                         cute.copy(
@@ -6969,7 +6989,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     )
                             else:
                                 if cutlass.const_expr(self.OWN_HALF_BULK):
-                                    if rank == Int32(h_half):
+                                    if cute.arch.make_warp_uniform(
+                                        cute.arch.block_idx_in_cluster()
+                                    ) == Int32(h_half):
                                         with cute.arch.elect_one():
                                             _cpasync_bulk_s2cluster(
                                                 stationary_q_raw
@@ -6977,7 +6999,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 round_dst_raw,
                                                 round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
-                                                rank,
+                                                Int32(h_half),
                                             )
                                             _cpasync_bulk_s2cluster(
                                                 stationary_q_raw
@@ -6987,7 +7009,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 + self.ROUND_STAGE_ELEMENTS // 2,
                                                 round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
-                                                rank,
+                                                Int32(h_half),
                                             )
                                     else:
                                         cute.copy(
