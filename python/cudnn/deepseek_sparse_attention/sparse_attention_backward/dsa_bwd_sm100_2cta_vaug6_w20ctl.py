@@ -3997,16 +3997,15 @@ def _store_shared_bf16_at_v2(
 class FlashAttentionDSABackwardSm100TwoCTAV2(
     FlashAttentionDSABackwardSm100TwoCTA
 ):
-    """Two-CTA production kernel: 24 warps per CTA, five CG2 GEMMs per KV tile.
+    """Matched W20 control: 24 warps per CTA, five CG2 GEMMs per KV tile.
 
     Per-CTA roles: warps 0-3 gather the sparse K tile and the dQ-A
     images; warps 4-7 run the softmax backward and publish P/dS; warps
     8-15 drain the fused dV+dK partial sums to the f32 workspace; warp
-    16 issues S/dP and dV/dK and manages their pipeline credits; warp
-    17 feeds the round ring from the stationary panels; warp 18 relays
-    P/dS across the cluster; warp 19 relays ring TMA completions; warp
-    20 independently issues dQ; warps 21-23 pad W20's register-allocation
-    warpgroup and otherwise remain idle.
+    16 issues every GEMM and manages pipeline credits; warp 17 feeds
+    the round ring from the stationary panels; warp 18 relays P/dS
+    across the cluster; warp 19 relays ring TMA completions.  Warps
+    20-23 are idle padding, while dQ deliberately remains on warp 16.
 
     Steady-state schedule per KV tile (rotated): S(t) and dP(t) issue
     first, then tile t-1's gradients (two dQ rounds, eight dV/dK
@@ -4029,7 +4028,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
     LOAD_WARP = 17
     RELAY_WARP = 18
     COMMIT_WARP = 19
-    DQ_WARP = 20
+    PAD_WARP_BEGIN = 20
 
     GATHER_THREADS = GATHER_WARPS * 32
     MATH_THREAD_BEGIN = MATH_WARP_BEGIN * 32
@@ -5431,14 +5430,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        ds_dual_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread,
-            2,
-        )
         pipe_ds = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
             producer_group=pds_commit_group,
-            consumer_group=ds_dual_consumer_group,
+            consumer_group=leader_group,
             barrier_storage=storage.pds_mbars_b.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
@@ -5573,19 +5568,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             self.N_TILE
         )
 
-        # W20 A/B allocation: 48/128/104/64/32 across the six WGs.
+        # Matched W20 A/B allocation: 48/128/104/64/32 across six WGs.
         # Leaders get 64 so ptxas stops live-range-splitting the rank value
         # to local memory at the S->dP / dQ phase boundaries (STACK:24,
-        # STL@0x148e0 / dead LDL@0x156e0 in the candidate build).
-        # W20 starts a sixth warpgroup.  setmaxnreg is warpgroup-synchronous,
-        # so W21-W23 are present as idle padding and the whole group is
-        # capped at 32.  Both reducer WGs donate 16 each (120->104), making
-        # every SMSP exactly 480 registers/lane and the CTA exactly equal
-        # to its 768*80 = 61,440-register launch pool.  The matched control
-        # uses the identical allocation, isolating the dQ handoff itself.
+        # STL@0x148e0 / dead LDL@0x156e0 in the candidate build).  W20-W23
+        # form a complete idle WG capped at 32; both reducer WGs donate 16
+        # each (120->104).  Every SMSP is then 480 registers/lane and the
+        # CTA exactly matches its 768*80 = 61,440-register launch pool.
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(48)
-        elif warp_idx >= Int32(self.DQ_WARP):
+        elif warp_idx >= Int32(self.PAD_WARP_BEGIN):
             cute.arch.setmaxregister_decrease(32)
         elif warp_idx >= Int32(self.MMA_WARP):
             cute.arch.setmaxregister_decrease(64)
@@ -6280,10 +6272,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Consumer,
                     self.ROUND_STAGES,
                 )
-                # W20 owns g0/g1 (the two dQ rounds).  W16 starts each
-                # tile at g2 and consumes only the six dV/dK generations.
-                round_cons.advance()
-                round_cons.advance()
                 p_cons = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer,
                     1,
@@ -6296,11 +6284,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Producer,
                     self.MMA_DONE_STAGES,
                 )
+                dq_done_prod = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer,
+                    1,
+                )
                 if tile_count > Int32(0):
                     _mbarrier_wait_acquire_cluster(
                         stationary_ready_mbar,
                         Int32(0),
                     )
+                pipe_dq_done.producer_acquire(dq_done_prod)
 
                 relay_phase = Int32(0)
                 for loop_iter in cutlass.range(tile_count):
@@ -6348,16 +6341,24 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     kscore_cons.advance()
 
                     if has_prev:
+                        dq_acc = loop_iter != Int32(1)
                         (
                             round_cons,
                             kscore_cons,
                             dkv_prod,
                             p_cons,
                             ds_cons,
+                            dq_done_prod,
                         ) = (
-                            self._issue_prev_dkv_head_v3(
+                            self._issue_prev_grads_head_v2(
+                                dq_tiled_mma,
                                 dkv_tiled_mma,
+                                t_dq[0],
+                                t_dq[1],
                                 t_dkv[0],
+                                dq_kd_fragment_a,
+                                dq_kd_fragment_b,
+                                dq_ds_fragment,
                                 quad_fragment_a,
                                 quad_fragment_b,
                                 loan_quad_fragment_a,
@@ -6366,6 +6367,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 p_fragments[1],
                                 ds_fragments[0],
                                 ds_fragments[1],
+                                dq_acc,
                                 relay_phase,
                                 relay_mbars,
                                 pipe_round,
@@ -6378,6 +6380,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 ds_cons,
                                 pipe_dkv_done,
                                 dkv_prod,
+                                pipe_dq_done,
+                                dq_done_prod,
+                                False,
                                 loop_iter - Int32(1),
                             )
                         )
@@ -6406,23 +6411,27 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         ds_cons.advance()
                         p_cons.advance()
                         relay_phase = Int32(1) - relay_phase
-                        # The six real consumes ended at next tile's g0;
-                        # skip W20's g0/g1 ownership and land on g2.
-                        round_cons.advance()
-                        round_cons.advance()
 
                 # Drain the final tile's gradients.
                 if tile_count > Int32(0):
+                    dq_acc = tile_count != Int32(1)
                     (
                         round_cons,
                         kscore_cons,
                         dkv_prod,
                         p_cons,
                         ds_cons,
+                        dq_done_prod,
                     ) = (
-                        self._issue_prev_dkv_head_v3(
+                        self._issue_prev_grads_head_v2(
+                            dq_tiled_mma,
                             dkv_tiled_mma,
+                            t_dq[0],
+                            t_dq[1],
                             t_dkv[0],
+                            dq_kd_fragment_a,
+                            dq_kd_fragment_b,
+                            dq_ds_fragment,
                             quad_fragment_a,
                             quad_fragment_b,
                             loan_quad_fragment_a,
@@ -6431,6 +6440,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             p_fragments[1],
                             ds_fragments[0],
                             ds_fragments[1],
+                            dq_acc,
                             relay_phase,
                             relay_mbars,
                             pipe_round,
@@ -6443,6 +6453,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             ds_cons,
                             pipe_dkv_done,
                             dkv_prod,
+                            pipe_dq_done,
+                            dq_done_prod,
+                            True,
                             tile_count - Int32(1),
                         )
                     )
@@ -6473,6 +6486,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_s_done.producer_tail(sdp_prod)
                     pipe_dp_done.producer_tail(dp_tail_prod)
                     pipe_dkv_done.producer_tail(dkv_prod)
+                    pipe_dq_done.producer_tail(dq_done_prod)
 
         elif warp_idx == Int32(self.LOAD_WARP):
             lane_idx = tidx % Int32(32)
@@ -6851,60 +6865,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         pipe_round.producer_commit(commit_com)
                     commit_com.advance()
 
-        elif warp_idx == Int32(self.DQ_WARP):
-            # Dedicated dQ issuer.  Only the leader CTA drives 2CTA UMMA
-            # and its concentrated pipeline endpoints; the peer's W20 is
-            # intentionally idle until the common cluster tail.
-            if is_leader_cta:
-                if tile_count > Int32(0):
-                    dq_round_cons = pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        self.ROUND_STAGES,
-                    )
-                    dq_ds_cons = pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer,
-                        1,
-                    )
-                    dq_done_prod = pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Producer,
-                        1,
-                    )
-                    pipe_dq_done.producer_acquire(dq_done_prod)
-
-                    for issue_seq in cutlass.range(tile_count):
-                        # dQ reads the CTA-local ds_image.  Its FULL is a
-                        # complete dP -> math -> dS publication dependency.
-                        pipe_ds.consumer_wait(dq_ds_cons)
-                        dq_round_cons = self._issue_dq_rounds_v2(
-                            dq_tiled_mma,
-                            t_dq[0],
-                            t_dq[1],
-                            dq_kd_fragment_a,
-                            dq_kd_fragment_b,
-                            dq_ds_fragment,
-                            issue_seq != Int32(0),
-                            pipe_round,
-                            dq_round_cons,
-                            issue_seq,
-                        )
-                        # This tcgen05.commit is the first of pipe_ds's two
-                        # consumers; W16 contributes the second after dK.
-                        pipe_ds.consumer_release(dq_ds_cons)
-                        dq_ds_cons.advance()
-
-                        # W16 owns g2..g7.  Advance only software state so
-                        # W20's next real wait lands on the next tile's g0.
-                        for _ in cutlass.range_constexpr(
-                            self.ROUND_GENS_PER_TILE - self.D_ROUNDS
-                        ):
-                            dq_round_cons.advance()
-
-                    # The math epilogue consumes this only after every dQ
-                    # update issued by W20 is visible in TMEM.
-                    pipe_dq_done.producer_commit(dq_done_prod)
-                    dq_done_prod.advance()
-                    pipe_dq_done.producer_tail(dq_done_prod)
-
         # ==================================================================
         # Common tail: full-cluster rendezvous, then TMEM release.
         # ==================================================================
@@ -6991,10 +6951,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
-    def _issue_prev_dkv_head_v3(
+    def _issue_prev_grads_head_v2(
         self,
+        dq_tiled_mma: cute.TiledMma,
         dkv_tiled_mma: cute.TiledMma,
+        t_dq_0: cute.Tensor,
+        t_dq_1: cute.Tensor,
         t_dkv_0: cute.Tensor,
+        dq_kd_fragment_a: cute.Tensor,
+        dq_kd_fragment_b: cute.Tensor,
+        dq_ds_fragment: cute.Tensor,
         quad_fragment_a: cute.Tensor,
         quad_fragment_b: cute.Tensor,
         loan_quad_fragment_a: cute.Tensor,
@@ -7003,6 +6969,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         p_fragment_1: cute.Tensor,
         ds_fragment_0: cute.Tensor,
         ds_fragment_1: cute.Tensor,
+        dq_accumulate: cutlass.Boolean,
         relay_phase: Int32,
         relay_mbars: cute.Pointer,
         round_pipeline,
@@ -7015,20 +6982,45 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         ds_consumer_state: pipeline.PipelineState,
         dkv_done_pipeline,
         dkv_producer_state: pipeline.PipelineState,
+        dq_done_pipeline,
+        dq_done_state: pipeline.PipelineState,
+        commit_dq: cutlass.Constexpr[bool],
         issue_seq: Int32,
     ):
-        """Gradient block, first half: round-0 dV/dK passes.
+        """Gradient block, first half: dQ rounds + round-0 dV/dK passes.
 
-        W20 owns dQ and g0/g1.  W16 enters here at g2, while the separate
-        loan_epi_safe barrier still protects score_kv from the dQ epilogue
-        until both borrowed dV source reads have truly completed.
+        The tail keeps v12's early dQ completion commit.  A separate
+        loan_epi_safe barrier, published after the final kscore producer
+        tail, protects score_kv from the dQ epilogue until both borrowed
+        dV source reads have truly completed.
         """
 
         # P/dS images, blocks, and xchg staging of the previous tile are
         # published (and its DSM sends issued): invariant I1's only gate.
-        # F1 split: both FULLs are committed back-to-back by the relay.
+        # F1 split: both FULLs are committed back-to-back by the relay,
+        # so waiting both here adds no latency (dQ reads ds_image ->
+        # dS-full; dV reads p_blocks -> P-full).
         ds_pipeline.consumer_wait(ds_consumer_state)
         p_pipeline.consumer_wait(p_consumer_state)
+
+        # dQ both rounds back-to-back; releases free the round buffers for
+        # the quadrant refills.
+        round_consumer_state = self._issue_dq_rounds_v2(
+            dq_tiled_mma,
+            t_dq_0,
+            t_dq_1,
+            dq_kd_fragment_a,
+            dq_kd_fragment_b,
+            dq_ds_fragment,
+            dq_accumulate,
+            round_pipeline,
+            round_consumer_state,
+            issue_seq,
+        )
+
+        if cutlass.const_expr(commit_dq):
+            dq_done_pipeline.producer_commit(dq_done_state)
+            dq_done_state.advance()
 
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
 
@@ -7086,6 +7078,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dkv_producer_state,
             p_consumer_state,
             ds_consumer_state,
+            dq_done_state,
         )
 
     @cute.jit
