@@ -33,6 +33,7 @@ The four-stage K32 round ring streams stationary dO/Q panels to dV/dK.
 | H5 | Rematerialize CTA rank at every W17 loader use and substitute the proven-equal constexpr `h_half` as the bulk-copy destination CTA. | Eliminate the rank live range across the fully unrolled 16-generation loader without changing slot, phase, barrier, or copy ownership. Require all four W17 rank-stack accesses to disappear in no-cache line-info SASS before timing. | rejected at codegen gate | Semantics review passes, but the compiler CSEs the rank reads. Exact SASS remains 37 local instructions and retains the same `LDL.LU + STL + STL + LDL` W17 stack sequence. No wall-time or SMART run was performed; reverted to H1. |
 | H6 | Replace W17's hoisted rank with side-effecting `%cluster_ctarank` reads at its stationary-load and owner-copy uses. | Force short-lived special-register values after H5's ordinary rematerialization was CSE'd. Require the W17 stack sequence to disappear without increasing total local traffic before timing. | rejected at codegen gate | The no-cache build rises from H1's 37 local instructions to 57 (`STL=16`, `LDL=41`). The two unrolled owner tests each gain eight attributed LDLs, for a net increase of 20 local loads. No performance run was performed; reverted to H1. |
 | H7 | Split P and dS storage ownership, release P after dV-r1 source-read completion, and reuse its aligned 8 KiB allocation for late round generation G12. Preserve all 16 normal round generations with a data-free G12 phase token and protect the alias with a one-stage late pipeline. | Remove G12 from the contended four-slot round ring without increasing SMEM or changing dV/dQ/dK order. Require release/trace parity, a barrier happens-before proof, no-cache line-info SASS, a TopK=128 canary, and same-process H1/H7 ABBA. | rejected | Static barrier/phase audit and normalized release/trace parity pass. H7 remains REG=96, STACK=8 and 37 local instructions (`STL=16`, `LDL=21`, unattributed=0), exactly H1's total; the 19th source location is only the existing W16 STL being re-attributed from the generic JIT entry to fragment setup, with no hot-role increase. TopK=128 crosscheck/deadlock canary passes and gives H7/H1 0.998487. At TopK=2048, however, H1 is 9.260080 ms and H7 is 9.316224 ms: H7/H1 1.005928, first half 1.005839, second half 1.005968, block-bootstrap 95% CI [1.005796, 1.006147]. The extra alias-side coordination costs more than relieving one ring generation; reverted to H1 without SMART capture. |
+| H8 | Reshape reducer issue from the H1 `150 ns / no cohort skew` pattern to four CTA/WG cohorts with `100 ns` inter-chunk pacing and `90 ns` cohort spacing; then split-screen pure pacing and pure dephase variants. | The exact H1 SMART trace shows the preceding tile's R1 atomic envelope covers essentially the complete next-tile P/relay wait, while the two reducer warpgroups start within a few ns. Test whether lowering instantaneous REDG concentration shortens P publication and peer landing without reducer lag. | rejected | The combination wins the TopK=128 canary (H8/H1 0.988834) but regresses at TopK=2048: 1.005992, CI [1.005535, 1.006064]. Exact-H1 class-override screens explain the reversal: pace 125/150 is 1.031037 (strong regression), pace 175/150 is 0.999903 with CI crossing 1, and pace150 plus 40 ns cohort spacing is 0.999912 with CI crossing 1. Thus H1's 150 ns pacing is already on the long-shape plateau; neither more pacing nor cohort dephase improves the critical path. Release and trace sources were reverted byte-for-byte to H1. |
 
 ## Historical suffix audit
 
@@ -76,7 +77,27 @@ The four-stage K32 round ring streams stationary dO/Q panels to dV/dK.
 - H7 TopK=2048 adjudication:
   `outputs/final_ser_kq6q_h7_palias_20260815/topk2048_abba/final_ser_h1_h7_abba_topk2048.json`,
   SHA256 `0c4b836da6ea08f3f4c4c03259d3fa7e8f4137f39077bf7db588752a8e2fbf31`.
+- H8 reduce-phase screen:
+  `outputs/final_ser_kq6q_h8_reduce_phase_20260815/`; the TopK=2048
+  combination artifact SHA256 is
+  `c796983a39e7cc0ec4a137450a9f4099e2dcb52bf37b530b9b8cfb40d545c0b6`,
+  and the pure-dephase artifact SHA256 is
+  `4cdbf3b0d3d8bdaca32ba1396a821fd4313c8e9ee733013330d10b5201725dcf`.
 - The existing H1 SMART capture remains exact after the revert: release SHA256
   `90610120873cebb9177e892e9cecf34df1adab52919961b5d65cdf7b1d8d708e`,
   trace-twin SHA256
   `adcbf184f9d558a7f84d6ffbeb80b42d1e11ea01b33d2d6bb2bcf6398fe815b4`.
+
+## Exact H1 P-relay decomposition
+
+- Steady tiles 1..30: W16 `WAIT_P_RELAY` median is 0.8498 us. About
+  0.5409 us elapses before the latest cluster P publication completes.
+- After that P end, relay remains exposed for about 0.2960 us. The dominant
+  component is rank 0/W18 waiting for the peer P landing: 0.2670 us median;
+  relay-open bookkeeping is 0.0260 us and W16 wake-up is only 0.0051 us.
+- CTA1 is the systematic P straggler: its P-publish end trails CTA0 by
+  0.2864 us median. This is a real exact-native cross-CTA skew, not a role
+  aggregation artifact.
+- Therefore the next structural target is the CTA-asymmetric P producer and
+  peer-landing path. H8 proves that globally retuning atomic pacing does not
+  remove that asymmetry at TopK=2048.
