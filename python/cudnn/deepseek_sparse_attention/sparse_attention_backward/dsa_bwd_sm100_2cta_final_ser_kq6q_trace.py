@@ -167,11 +167,6 @@ class _IketProxy:
 _iket = _IketProxy()
 
 
-# H2b reducer concentration knife: split each 8-op burst into two groups with
-# one short sleep per group, but do not synchronize the eight reducer warps.
-REDUCE_PACE_EVERY = 4
-
-
 @dsl_user_op
 def _nanosleep_u32(
     ns: Int32,
@@ -8117,10 +8112,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_0.iterator.llvm_ptr,
                     rdkv_frg_0.load(),
                 )
-            if cutlass.const_expr(
-                (i + 1) % REDUCE_PACE_EVERY == 0
-            ):
-                _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
+            # kq6q: pace the burst (concentration knife).
+            _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
         _iket.range_end(
             reduce_atomic_token,
             packed_issue,
@@ -8180,10 +8173,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     target_frg_1.iterator.llvm_ptr,
                     rdkv_frg_1.load(),
                 )
-            if cutlass.const_expr(
-                (i + 1) % REDUCE_PACE_EVERY == 0
-            ):
-                _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
+            # kq6q: pace the burst (concentration knife).
+            _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
         _iket.range_end(
             reduce_atomic_token_1,
             packed_issue + Int32(1),
