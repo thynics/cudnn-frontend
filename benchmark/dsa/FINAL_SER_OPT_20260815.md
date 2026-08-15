@@ -28,7 +28,7 @@ The four-stage K32 round ring streams stationary dO/Q panels to dV/dK.
 | H1 | Spill containment only: specialize `pipe_s_done`/`pipe_dp_done` `consumer_mask=Int32(0)` and rematerialize the publication rank test next to P and dS stores. | Remove the known `[R1]` and `[R1+4]` stack live ranges without changing pipeline order, barriers, register budgets, or SMEM. Gate on line-info SASS totals and every remaining LDL/STL site, then paired B200. | accepted as structural cleanup | 9.519888 ms vs 8.134352 ms baseline; ratio 1.164844. Candidate absolute time is +0.19% vs M0, but exact line-info SASS drops 39 to 37 local instructions (LDL 23 to 21; STL remains 16) and removes the two hot loop reloads. |
 | H2 | Candidate-derived N=4 named-barrier pacing, zero sleep. | Preserve atomic volume and rejoin all eight reducer warps after four atomics. | rejected | 9.756656 ms vs 8.065568 ms baseline; ratio 1.206043; +2.49% candidate wall time vs H1. The collective tail is harmful in the serial pipeline. |
 | H2b | Sleep-only grouping: 150 ns after each group of four atomics, no cross-warp barrier. | Keep two quiet cuts per 8-op burst while reducing pacing overhead from 16 sleeps/tile to 4 and avoiding collective tail latency. | rejected | 9.652112 ms vs 8.029952 ms baseline; ratio 1.197703; +1.39% candidate wall time vs H1. Original per-atomic 150 ns pacing remains best. |
-| H3 | SMEM lifetime/time-sharing change, one loan at a time. | Use SMART to identify an exposed leader wait first. Change only the owning generation/release boundary; reject ring additions that serialize TMA or increase exposed round waits. | pending | pending |
+| H3 | Stream the two P publication groups into the tail of P math while retaining one final fence/sync/arrive. | Shorten the P compute-to-publish tail without adding hot-region local traffic. Gate on exact line-info SASS, exact-shape crosscheck, and a same-process H1/H3 ABBA comparison. | rejected | H3 has 36 local instructions versus H1's 37 and no new P hot-region spill, but the decision-grade B200 comparison is H1 9.259136 ms versus H3 9.260848 ms. H3/H1 is 1.000211; first half 1.000225, second half 1.000197, block-bootstrap 95% CI [1.000048, 1.000368]. The exact-shape crosscheck passes. Reverted to H1. |
 
 ## Evidence boundary
 
@@ -36,3 +36,18 @@ The four-stage K32 round ring streams stationary dO/Q panels to dV/dK.
   register locations, and span durations are not evidence for a changed build.
 - Every accepted source gets a fresh source hash, line-info SASS/spill report,
   paired B200 result, and (when trace is used) source/SASS/PFM identity manifest.
+
+## Current decision anchor
+
+- Retained source is H1, SHA256
+  `90610120873cebb9177e892e9cecf34df1adab52919961b5d65cdf7b1d8d708e`.
+- H1/H3 adjudication used one B200 process, shared tensors/output/workspaces,
+  32 warm-up pairs, and 48 ABBA/BAAB measured pairs. Accumulator resets were
+  outside the CUDA event interval.
+- Result artifact:
+  `outputs/final_ser_kq6q_h1_h3_sameprocess_20260815/final_ser_h1_h3_abba.json`,
+  SHA256 `f47fd2673261474d8ce695507d1278a7861038ba58fb55300b93c3fe38bfd98b`.
+- The existing H1 SMART capture remains exact after the revert: release SHA256
+  `90610120873cebb9177e892e9cecf34df1adab52919961b5d65cdf7b1d8d708e`,
+  trace-twin SHA256
+  `adcbf184f9d558a7f84d6ffbeb80b42d1e11ea01b33d2d6bb2bcf6398fe815b4`.
