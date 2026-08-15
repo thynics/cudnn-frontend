@@ -6404,10 +6404,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         score_source_pp,
                         r_score,
                     )
-                cute.arch.fence_view_async_tmem_load()
-                pipe_s_done.consumer_release(s_state)
-                s_state.advance()
-
                 assert cute.size(r_score) == self.N_TILE_CTA
                 if cutlass.const_expr(self.SOFTMAX_GROUPED_STATS):
                     for h_group in cutlass.range_constexpr(4):
@@ -6497,6 +6493,16 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     cute.arch.mbarrier_arrive(
                         p_ready_mbars,
                     )
+
+                # H10: r_score has been fully consumed into P and P has
+                # already been published.  Retire the asynchronous S T2R
+                # view only now, so its completion wait cannot hold the
+                # P-ready relay on the critical path.  The S slot remains
+                # protected until this release and is not reused before
+                # the serial leader completes the rest of this tile.
+                cute.arch.fence_view_async_tmem_load()
+                pipe_s_done.consumer_release(s_state)
+                s_state.advance()
 
                 # ---- dS phase: T2R dP, dS math, publish dS + image.
                 pipe_dp_done.consumer_wait(dp_state)

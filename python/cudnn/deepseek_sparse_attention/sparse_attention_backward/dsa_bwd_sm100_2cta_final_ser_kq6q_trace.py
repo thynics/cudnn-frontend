@@ -6437,9 +6437,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         score_source_pp,
                         r_score,
                     )
-                cute.arch.fence_view_async_tmem_load()
-                pipe_s_done.consumer_release(s_state)
-                s_state.advance()
                 _iket.range_end(t2r_s_token, loop_iter)
 
                 p_math_token = _iket.range_start(
@@ -6540,6 +6537,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         p_ready_mbars,
                     )
                 _iket.range_end(p_publish_token, loop_iter)
+
+                s_retire_token = _iket.range_start(
+                    "S_RETIRE(i)",
+                    loop_iter,
+                )
+                cute.arch.fence_view_async_tmem_load()
+                pipe_s_done.consumer_release(s_state)
+                s_state.advance()
+                _iket.range_end(s_retire_token, loop_iter)
 
                 # ---- dS phase: T2R dP, dS math, publish dS + image.
                 wait_dp_token = _iket.range_start(
