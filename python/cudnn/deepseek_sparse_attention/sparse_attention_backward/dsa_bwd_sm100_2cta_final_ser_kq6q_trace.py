@@ -1,10 +1,5 @@
 """IKET-only derivative of final_ser_kq6q.
 
-H7 trace twin: split P/dS ownership and reuse the released 8 KiB P allocation
-for Q-r1/h0/k0 (round G12).  The late sidecar pipeline and the normal ring's
-data-free G12 phase token exactly mirror the release source; IKET ranges are
-diagnostic annotations only.
-
 final_ser_kq6q = final_ser_kq6f(r1) + B-plan true-K32 four-slot ring only
 (single variable): four self-contained 8 KiB K32 stages replace the two
 16 KiB K64 stages; all compute, accumulation, and publication order stays
@@ -4366,9 +4361,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             round_mbars: cute.struct.MemRange[cutlass.Int64, 8]
-            p_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            ds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            late_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             # Raw single-phase-per-tile barriers.
@@ -4377,7 +4370,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             round_tma_mbars: cute.struct.MemRange[cutlass.Int64, 4]
-            late_tma_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             loan_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             loan_epi_safe_mbar: cutlass.Int64
             pds_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
@@ -5277,7 +5269,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         p_ready_mbars = storage.p_ready_mbars.data_ptr()
         ds_local_ready_mbar = storage.ds_local_ready_mbar.data_ptr()
         round_tma_mbars = storage.round_tma_mbars.data_ptr()
-        late_tma_mbar = storage.late_tma_mbar.data_ptr()
         loan_tma_mbars = storage.loan_tma_mbars.data_ptr()
         loan_epi_safe_mbar = storage.loan_epi_safe_mbar.ptr
         kdq_ready_mbar = storage.kdq_ready_mbar.data_ptr()
@@ -5405,14 +5396,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 round_a_layout_staged.outer,
                 swizzle=round_a_layout_staged.inner,
             ),
-        )
-        # H7: once dV-r1 has source-read-completed P, reinterpret its exact
-        # 8 KiB allocation as one true-K32 A stage for the late G12 load.
-        # The allocation is 1024-byte aligned and the A view has the same
-        # 4096-bf16 physical bound; P's B fragments remain separate views.
-        late_round_slot = storage.p_blocks.get_tensor(
-            round_a_layout_staged.outer,
-            swizzle=round_a_layout_staged.inner,
         )
         p_blocks_raw = storage.p_blocks.data_ptr()
         ds_blocks_raw = storage.ds_blocks.data_ptr()
@@ -5696,13 +5679,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cute.group_modes(round_slots[3], 0, 3),
             cute.group_modes(rank_g_qt_round, 0, 3),
         )
-        t_qt_late_smem, _ = cpasync.tma_partition(
-            round_tma_atom_qt,
-            block_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(late_round_slot, 0, 3),
-            cute.group_modes(rank_g_qt_round, 0, 3),
-        )
         t_dot_round_smem_0, t_dot_round_gmem = cpasync.tma_partition(
             round_tma_atom_dot,
             block_coord_vmnk[2],
@@ -5774,11 +5750,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dkv_tiled_mma.make_fragment_A(round_slots[2]),
             dkv_tiled_mma.make_fragment_A(round_slots[3]),
         )
-        late_round_fragment = dkv_tiled_mma.make_fragment_A(
-            late_round_slot
-        )
-        assert cute.cosize(late_round_slot.layout) == self.ROUND_STAGE_ELEMENTS
-        assert cute.size(late_round_fragment, mode=[2]) == 2
         for round_slot in cutlass.range_constexpr(self.ROUND_STAGES):
             round_slot_tensor = round_slots[round_slot]
             round_fragment = round_fragments[round_slot]
@@ -5910,31 +5881,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        relay_commit_group = pipeline.CooperativeGroup(
+        pds_commit_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             atom_thr_size,
         )
-        pipe_p = pipeline.PipelineAsyncUmma.create(
+        pipe_pds = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
-            producer_group=relay_commit_group,
+            producer_group=pds_commit_group,
             consumer_group=leader_group,
-            barrier_storage=storage.p_mbars.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        )
-        pipe_ds = pipeline.PipelineAsyncUmma.create(
-            num_stages=1,
-            producer_group=relay_commit_group,
-            consumer_group=leader_group,
-            barrier_storage=storage.ds_mbars.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        )
-        pipe_late = pipeline.PipelineAsyncUmma.create(
-            num_stages=1,
-            producer_group=load_elect_group,
-            consumer_group=leader_group,
-            barrier_storage=storage.late_mbars.data_ptr(),
+            barrier_storage=storage.pds_mbars.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
@@ -5982,7 +5937,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     round_tma_mbars + round_slot,
                     1,
                 )
-            cute.arch.mbarrier_init(late_tma_mbar, 1)
             cute.arch.mbarrier_init(loan_tma_mbars, 1)
             cute.arch.mbarrier_init(loan_tma_mbars + 1, 1)
             cute.arch.mbarrier_init(
@@ -6248,15 +6202,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 pipeline.PipelineUserType.Consumer,
                 self.SCORE_DONE_STAGES,
             )
-            p_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer,
-                1,
-            )
-            ds_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer,
-                1,
-            )
-            late_prev_state = pipeline.make_pipeline_state(
+            pds_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 1,
             )
@@ -6551,14 +6497,14 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         r_p[local_n] = self.element_dtype(p_value)
                 _iket.range_end(p_math_token, loop_iter)
 
+                # Buffer backpressure: the previous tile's dQ issue
+                # releases pds, and S(t) only issues after that in the
+                # serial leader order, so this acquire is quiet.
                 pds_acq_token = _iket.range_start(
                     "MATH_PDS_ACQ(i)",
                     loop_iter,
                 )
-                pipe_p.producer_acquire(p_state)
-                p_state.advance()
-                pipe_late.producer_acquire(late_prev_state)
-                late_prev_state.advance()
+                pipe_pds.producer_acquire(pds_state)
                 _iket.range_end(pds_acq_token, loop_iter)
 
                 # Publish P with stmatrix. Each pair of warps owns one
@@ -6666,8 +6612,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     "DS_PUBLISH(i)",
                     loop_iter,
                 )
-                pipe_ds.producer_acquire(ds_state)
-                ds_state.advance()
                 r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_ds_local_tile.shape == r_ds_store.shape
                 assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
@@ -6702,6 +6646,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         pds_ready_mbars,
                     )
                 _iket.range_end(ds_publish_token, loop_iter)
+                pds_state.advance()
 
             # dQ epilogue: wait for the last dQ generation, then store both
             # rank-owned [D128, H128] slices (disjoint across CTAs/rounds).
@@ -6812,15 +6757,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipeline.PipelineUserType.Consumer,
                     self.ROUND_STAGES,
                 )
-                p_cons = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    1,
-                )
-                ds_cons = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer,
-                    1,
-                )
-                late_cons = pipeline.make_pipeline_state(
+                pds_cons = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer,
                     1,
                 )
@@ -6908,9 +6845,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         kscore_cons,
                         dkv_acq,
                         dkv_com,
-                        p_cons,
-                        ds_cons,
-                        late_cons,
+                        pds_cons,
                     ) = self._issue_grads_kq_v1(
                         dq_tiled_mma,
                         dkv_tiled_mma,
@@ -6925,7 +6860,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         round_fragments[1],
                         round_fragments[2],
                         round_fragments[3],
-                        late_round_fragment,
                         p_fragments[0],
                         p_fragments[1],
                         ds_fragments[0],
@@ -6938,19 +6872,15 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         round_cons,
                         pipe_kscore,
                         kscore_cons,
-                        pipe_p,
-                        p_cons,
-                        pipe_ds,
-                        ds_cons,
-                        pipe_late,
-                        late_cons,
+                        pipe_pds,
+                        pds_cons,
                         pipe_dkv_done,
                         dkv_acq,
                         dkv_com,
                         loop_iter,
                     )
-                    pipe_ds.consumer_release(ds_cons)
-                    ds_cons.advance()
+                    pipe_pds.consumer_release(pds_cons)
+                    pds_cons.advance()
                     relay_phase = Int32(1) - relay_phase
 
                 if tile_count > Int32(0):
@@ -6976,15 +6906,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             round_com = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.ROUND_STAGES,
-            )
-            p_alias_wait = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer,
-                1,
-            )
-            p_alias_wait.advance()
-            late_acq = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer,
-                1,
             )
             if tile_count > Int32(0):
                 with cute.arch.elect_one():
@@ -7066,6 +6987,22 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 loop_iter * Int32(self.ROUND_GENS_PER_TILE)
                                 + Int32(micro_gen)
                             )
+                            round_empty_token = _iket.range_start(
+                                "WAIT_ROUND_EMPTY(i,g)",
+                                packed_generation,
+                            )
+                            pipe_round.producer_acquire(round_acq)
+                            _iket.range_end(
+                                round_empty_token,
+                                packed_generation,
+                            )
+                            round_acq.advance()
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(
+                                    round_tma_mbars + round_slot,
+                                    round_stage_bytes,
+                                )
+                            round_dst_raw = round_slot_raw[round_slot]
                             # Each old K64 panel is two adjacent 4096-element
                             # score-image strips.  Its H32 half occupies 2048
                             # elements in each strip, not one contiguous 4096-
@@ -7076,128 +7013,27 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                 * (2 * grad_round + h_half)
                                 + (self.ROUND_STAGE_ELEMENTS // 2) * k_half
                             )
-                            if cutlass.const_expr(micro_gen == 12):
-                                pipe_p.producer_acquire(p_alias_wait)
-                                p_alias_wait.advance()
-                                pipe_late.producer_acquire(late_acq)
-                                late_acq.advance()
-                                with cute.arch.elect_one():
-                                    cute.arch.mbarrier_arrive_and_expect_tx(
-                                        late_tma_mbar,
-                                        round_stage_bytes,
-                                    )
+                            if cutlass.const_expr(tensor_kind == 0):
                                 if cutlass.const_expr(self.OWN_HALF_BULK):
                                     if rank == Int32(h_half):
                                         with cute.arch.elect_one():
                                             _cpasync_bulk_s2cluster(
-                                                stationary_q_raw
+                                                stationary_do_raw
                                                 + local_src_offset,
-                                                p_blocks_raw,
-                                                late_tma_mbar,
+                                                round_dst_raw,
+                                                round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
                                                 rank,
                                             )
                                             _cpasync_bulk_s2cluster(
-                                                stationary_q_raw
+                                                stationary_do_raw
                                                 + local_src_offset
                                                 + self.ROUND_STAGE_ELEMENTS,
-                                                p_blocks_raw
+                                                round_dst_raw
                                                 + self.ROUND_STAGE_ELEMENTS // 2,
-                                                late_tma_mbar,
+                                                round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
                                                 rank,
-                                            )
-                                    else:
-                                        cute.copy(
-                                            round_tma_atom_qt,
-                                            t_qt_round_gmem[
-                                                None,
-                                                grad_round,
-                                                source_h32,
-                                            ],
-                                            t_qt_late_smem[None, 0],
-                                            tma_bar_ptr=late_tma_mbar,
-                                        )
-                                else:
-                                    cute.copy(
-                                        round_tma_atom_qt,
-                                        t_qt_round_gmem[
-                                            None,
-                                            grad_round,
-                                            source_h32,
-                                        ],
-                                        t_qt_late_smem[None, 0],
-                                        tma_bar_ptr=late_tma_mbar,
-                                    )
-
-                                round_empty_token = _iket.range_start(
-                                    "WAIT_ROUND_EMPTY(i,g)",
-                                    packed_generation,
-                                )
-                                pipe_round.producer_acquire(round_acq)
-                                _iket.range_end(
-                                    round_empty_token,
-                                    packed_generation,
-                                )
-                                round_acq.advance()
-                                with cute.arch.elect_one():
-                                    cute.arch.mbarrier_arrive(
-                                        round_tma_mbars + round_slot
-                                    )
-                            else:
-                                round_empty_token = _iket.range_start(
-                                    "WAIT_ROUND_EMPTY(i,g)",
-                                    packed_generation,
-                                )
-                                pipe_round.producer_acquire(round_acq)
-                                _iket.range_end(
-                                    round_empty_token,
-                                    packed_generation,
-                                )
-                                round_acq.advance()
-                                with cute.arch.elect_one():
-                                    cute.arch.mbarrier_arrive_and_expect_tx(
-                                        round_tma_mbars + round_slot,
-                                        round_stage_bytes,
-                                    )
-                                round_dst_raw = round_slot_raw[round_slot]
-                                if cutlass.const_expr(tensor_kind == 0):
-                                    if cutlass.const_expr(self.OWN_HALF_BULK):
-                                        if rank == Int32(h_half):
-                                            with cute.arch.elect_one():
-                                                _cpasync_bulk_s2cluster(
-                                                    stationary_do_raw
-                                                    + local_src_offset,
-                                                    round_dst_raw,
-                                                    round_tma_mbars + round_slot,
-                                                    round_stage_bytes // 2,
-                                                    rank,
-                                                )
-                                                _cpasync_bulk_s2cluster(
-                                                    stationary_do_raw
-                                                    + local_src_offset
-                                                    + self.ROUND_STAGE_ELEMENTS,
-                                                    round_dst_raw
-                                                    + self.ROUND_STAGE_ELEMENTS // 2,
-                                                    round_tma_mbars + round_slot,
-                                                    round_stage_bytes // 2,
-                                                    rank,
-                                                )
-                                        else:
-                                            cute.copy(
-                                                round_tma_atom_dot,
-                                                t_dot_round_gmem[
-                                                    None,
-                                                    grad_round,
-                                                    source_h32,
-                                                ],
-                                                t_dot_round_smem[round_slot][
-                                                    None,
-                                                    0,
-                                                ],
-                                                tma_bar_ptr=(
-                                                    round_tma_mbars + round_slot
-                                                ),
                                             )
                                     else:
                                         cute.copy(
@@ -7207,48 +7043,48 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 grad_round,
                                                 source_h32,
                                             ],
-                                            t_dot_round_smem[round_slot][None, 0],
+                                            t_dot_round_smem[round_slot][
+                                                None,
+                                                0,
+                                            ],
                                             tma_bar_ptr=(
                                                 round_tma_mbars + round_slot
                                             ),
                                         )
                                 else:
-                                    if cutlass.const_expr(self.OWN_HALF_BULK):
-                                        if rank == Int32(h_half):
-                                            with cute.arch.elect_one():
-                                                _cpasync_bulk_s2cluster(
-                                                    stationary_q_raw
-                                                    + local_src_offset,
-                                                    round_dst_raw,
-                                                    round_tma_mbars + round_slot,
-                                                    round_stage_bytes // 2,
-                                                    rank,
-                                                )
-                                                _cpasync_bulk_s2cluster(
-                                                    stationary_q_raw
-                                                    + local_src_offset
-                                                    + self.ROUND_STAGE_ELEMENTS,
-                                                    round_dst_raw
-                                                    + self.ROUND_STAGE_ELEMENTS // 2,
-                                                    round_tma_mbars + round_slot,
-                                                    round_stage_bytes // 2,
-                                                    rank,
-                                                )
-                                        else:
-                                            cute.copy(
-                                                round_tma_atom_qt,
-                                                t_qt_round_gmem[
-                                                    None,
-                                                    grad_round,
-                                                    source_h32,
-                                                ],
-                                                t_qt_round_smem[round_slot][
-                                                    None,
-                                                    0,
-                                                ],
-                                                tma_bar_ptr=(
-                                                    round_tma_mbars + round_slot
-                                                ),
+                                    cute.copy(
+                                        round_tma_atom_dot,
+                                        t_dot_round_gmem[
+                                            None,
+                                            grad_round,
+                                            source_h32,
+                                        ],
+                                        t_dot_round_smem[round_slot][None, 0],
+                                        tma_bar_ptr=(
+                                            round_tma_mbars + round_slot
+                                        ),
+                                    )
+                            else:
+                                if cutlass.const_expr(self.OWN_HALF_BULK):
+                                    if rank == Int32(h_half):
+                                        with cute.arch.elect_one():
+                                            _cpasync_bulk_s2cluster(
+                                                stationary_q_raw
+                                                + local_src_offset,
+                                                round_dst_raw,
+                                                round_tma_mbars + round_slot,
+                                                round_stage_bytes // 2,
+                                                rank,
+                                            )
+                                            _cpasync_bulk_s2cluster(
+                                                stationary_q_raw
+                                                + local_src_offset
+                                                + self.ROUND_STAGE_ELEMENTS,
+                                                round_dst_raw
+                                                + self.ROUND_STAGE_ELEMENTS // 2,
+                                                round_tma_mbars + round_slot,
+                                                round_stage_bytes // 2,
+                                                rank,
                                             )
                                     else:
                                         cute.copy(
@@ -7258,11 +7094,27 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 grad_round,
                                                 source_h32,
                                             ],
-                                            t_qt_round_smem[round_slot][None, 0],
+                                            t_qt_round_smem[round_slot][
+                                                None,
+                                                0,
+                                            ],
                                             tma_bar_ptr=(
                                                 round_tma_mbars + round_slot
                                             ),
                                         )
+                                else:
+                                    cute.copy(
+                                        round_tma_atom_qt,
+                                        t_qt_round_gmem[
+                                            None,
+                                            grad_round,
+                                            source_h32,
+                                        ],
+                                        t_qt_round_smem[round_slot][None, 0],
+                                        tma_bar_ptr=(
+                                            round_tma_mbars + round_slot
+                                        ),
+                                    )
                     # kq: no kdq ring generations -- the K_dQ pair
                     # rides a kscore generation in score_kv, filled by
                     # the gather warps.  The ring is 16 H32 micro-gens
@@ -7276,7 +7128,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         loop_iter,
                     )
                 pipe_round.producer_tail(round_acq)
-                pipe_late.producer_tail(late_acq)
 
         elif warp_idx == Int32(self.RELAY_WARP):
             # kq: DUAL-LANE relay -- lane 0 runs the P leg, lane 1 the
@@ -7302,11 +7153,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 p_ready_phase = Int32(0)
                 ds_landing_phase = Int32(0)
                 ready_phase = Int32(0)
-                p_com = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer,
-                    1,
-                )
-                ds_com = pipeline.make_pipeline_state(
+                pds_com = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer,
                     1,
                 )
@@ -7344,8 +7191,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         p_landing_phase,
                     )
                     p_landing_phase = Int32(1) - p_landing_phase
-                    pipe_p.producer_commit(p_com)
-                    p_com.advance()
                     cute.arch.mbarrier_arrive(
                         relay_mbars,
                         Int32(0),
@@ -7381,8 +7226,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             self.PDS_BLOCK_BYTES,
                             peer_rank,
                         )
-                    pipe_ds.producer_commit(ds_com)
-                    ds_com.advance()
+                    pipe_pds.producer_commit(pds_com)
+                    pds_com.advance()
                     _mbarrier_wait_acquire_cluster(
                         landing_mbars + 1,
                         ds_landing_phase,
@@ -7393,33 +7238,18 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         Int32(0),
                     )
                 if tile_count > Int32(0):
-                    pipe_p.producer_tail(p_com)
-                    pipe_ds.producer_tail(ds_com)
+                    pipe_pds.producer_tail(pds_com)
 
         elif warp_idx == Int32(self.COMMIT_WARP):
             commit_com = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.ROUND_STAGES,
             )
-            late_com = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer,
-                1,
-            )
             w19_phase = [Int32(0), Int32(0), Int32(0), Int32(0)]
-            late_phase = Int32(0)
             for loop_iter in cutlass.range(tile_count):
                 for micro_gen in cutlass.range_constexpr(
                     self.ROUND_GENS_PER_TILE
                 ):
-                    if cutlass.const_expr(micro_gen == 12):
-                        cute.arch.mbarrier_wait(
-                            late_tma_mbar,
-                            late_phase,
-                        )
-                        late_phase = Int32(1) - late_phase
-                        with cute.arch.elect_one():
-                            pipe_late.producer_commit(late_com)
-                        late_com.advance()
                     round_slot = micro_gen % self.ROUND_STAGES
                     cute.arch.mbarrier_wait(
                         round_tma_mbars + round_slot,
@@ -7573,7 +7403,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         round_fragment_1: cute.Tensor,
         round_fragment_2: cute.Tensor,
         round_fragment_3: cute.Tensor,
-        late_round_fragment: cute.Tensor,
         p_fragment_0: cute.Tensor,
         p_fragment_1: cute.Tensor,
         ds_fragment_0: cute.Tensor,
@@ -7586,12 +7415,8 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         round_consumer_state: pipeline.PipelineState,
         kscore_pipeline,
         kscore_consumer_state: pipeline.PipelineState,
-        p_pipeline,
-        p_consumer_state: pipeline.PipelineState,
-        ds_pipeline,
-        ds_consumer_state: pipeline.PipelineState,
-        late_pipeline,
-        late_consumer_state: pipeline.PipelineState,
+        pds_pipeline,
+        pds_consumer_state: pipeline.PipelineState,
         dkv_done_pipeline,
         dkv_acquire_state: pipeline.PipelineState,
         dkv_commit_state: pipeline.PipelineState,
@@ -7603,12 +7428,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         micro-generations (two per original K64 panel); the K_dQ
         pair rides a kscore generation in score_kv (filled under the
         dV window, released to the next tile's score-K gather by dQ).
-        Independent P and dS pipelines now encode their storage lifetimes.
-        P full plus relay 0 opens dV; the G7 tcgen05 release proves P's
-        CG2 source reads complete and lets G12 alias its 8 KiB allocation.
-        ds_local_ready opens dQ on the local dS image, relay 1 opens dK
-        after the peer block lands, and dS is released only after dK-r1.
-        A separate late pipeline protects the aliased G12 write/read.
+        Gates: relay 0 (P published + exchanged cluster-wide) opens
+        dV; ds_local_ready (both CTAs' relay lanes observed their
+        local dS publish close) opens dQ -- dQ's B is the LOCAL dS
+        image per CTA, so it does not wait the dS DSM landing; relay 1
+        (dS exchanged) opens dK, now additionally covered by dQ's
+        execution window.  The pds consumer handshake sits before dQ
+        as buffer backpressure.
 
         dkv_done uses split acquire/commit producer states so slot 1's
         acquire (before dV r1) can precede slot 0's commit (after
@@ -7625,7 +7451,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             issue_seq * Int32(2),
         )
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
-        p_pipeline.consumer_wait(p_consumer_state)
         _iket.range_end(
             relay_wait_token,
             issue_seq * Int32(2),
@@ -7836,8 +7661,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             round_wait_token,
             packed_issue + Int32(3),
         )
-        p_pipeline.consumer_release(p_consumer_state)
-        p_consumer_state.advance()
 
         # dQ both rounds off the kscore kdq generation (both K_dQ
         # panels live in score_kv simultaneously); gated by pds
@@ -7848,7 +7671,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             "WAIT_dQ_GATE(i)",
             issue_seq,
         )
-        ds_pipeline.consumer_wait(ds_consumer_state)
+        pds_pipeline.consumer_wait(pds_consumer_state)
         _mbarrier_wait_acquire_cluster(
             ds_local_ready_mbar,
             relay_phase,
@@ -7981,13 +7804,12 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
 
-        # dK r1: G12 uses the P-allocation sidecar; normal state 12 is a
-        # data-free phase token, then G13..G15 retain slots 1..3.
+        # dK r1: ring Q2/Q3 quadrants x dS blocks -> slot 1.
         round_wait_token = _iket.range_start(
             "WAIT_ROUND(i,g)",
             packed_issue + Int32(6),
         )
-        late_pipeline.consumer_wait(late_consumer_state)
+        round_pipeline.consumer_wait(round_consumer_state)
         dkv_issue_token = _iket.range_start(
             "dVdK_ISSUE(i,r,p)",
             packed_issue + Int32(6),
@@ -7995,7 +7817,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         self._issue_dkv_pass_v2(
             dkv_tiled_mma,
             t_dkv_1,
-            late_round_fragment,
+            round_fragment_0,
             ds_fragment_0,
             0,
             True,
@@ -8004,10 +7826,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             dkv_issue_token,
             packed_issue + Int32(6),
         )
-        late_pipeline.consumer_release(late_consumer_state)
-        late_consumer_state.advance()
-        # Consume/release the normal ring's G12 dummy generation.
-        round_pipeline.consumer_wait(round_consumer_state)
         round_pipeline.consumer_release(round_consumer_state)
         round_consumer_state.advance()
         round_pipeline.consumer_wait(round_consumer_state)
@@ -8088,9 +7906,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             kscore_consumer_state,
             dkv_acquire_state,
             dkv_commit_state,
-            p_consumer_state,
-            ds_consumer_state,
-            late_consumer_state,
+            pds_consumer_state,
         )
 
     @cute.kernel
