@@ -6409,101 +6409,37 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 s_state.advance()
 
                 assert cute.size(r_score) == self.N_TILE_CTA
-                r_p_store = thread_copy_r2s.retile(r_p)
-                assert t_rs_p_local_tile.shape == r_p_store.shape
-                assert t_rs_p_xchg_tile.shape == r_p_store.shape
-                # Each (stsm_slice, p_half) view is one eight-BF16
-                # STSM.16.MT88.4 operand.  Keeping both indices constexpr
-                # avoids dynamically indexing the register fragment.
-                assert cute.size(r_p_store, mode=[0, 0]) == 8
-                assert cute.size(r_p_store, mode=[0, 1]) == 2
-                assert cute.size(r_p_store, mode=[1]) == 2
-                assert cute.size(r_p_store, mode=[2]) == 1
-                assert cute.size(r_p_store, mode=[3]) == 1
-
                 if cutlass.const_expr(self.SOFTMAX_GROUPED_STATS):
-                    # Groups 0/1 produce r_p[0:16], so drain their two
-                    # STSM slices before computing groups 2/3.  The sole
-                    # p_ready close remains after all four stores.
-                    for p_half in cutlass.range_constexpr(2):
-                        for h_in_half in cutlass.range_constexpr(2):
-                            h_group = 2 * p_half + h_in_half
-                            lse = hoist_lse[h_group]
-                            for pair in cutlass.range_constexpr(4):
-                                i0 = hoist_band_indices[h_group][2 * pair]
-                                i1 = hoist_band_indices[h_group][
-                                    2 * pair + 1
-                                ]
-                                v0, v1 = cute.arch.fma_packed_f32x2(
-                                    (r_score[i0], r_score[i1]),
-                                    (
-                                        softmax_scale_log2_e,
-                                        softmax_scale_log2_e,
-                                    ),
-                                    (lse, lse),
-                                )
-                                v0 = cute.math.exp2(v0, fastmath=True)
-                                v1 = cute.math.exp2(v1, fastmath=True)
-                                r_score[i0] = v0
-                                r_score[i1] = v1
-                                r_p[i0] = self.element_dtype(v0)
-                                r_p[i1] = self.element_dtype(v1)
-
-                        # The serial leader releases pds(t-1) before S(t),
-                        # so the one acquire remains quiet and can precede
-                        # the first partial store.
-                        if cutlass.const_expr(p_half == 0):
-                            pipe_pds.producer_acquire(pds_state)
-
-                        # H1: rematerialize the uniform CTA rank at each
-                        # half instead of spanning the remaining P math.
-                        if n_owner == cute.arch.make_warp_uniform(
-                            cute.arch.block_idx_in_cluster()
-                        ):
-                            for stsm_slice in cutlass.range_constexpr(2):
-                                p_src_slice = r_p_store[
-                                    (None, stsm_slice),
-                                    p_half,
-                                    None,
-                                    None,
-                                ]
-                                p_dst_slice = t_rs_p_local_tile[
-                                    (None, stsm_slice),
-                                    p_half,
-                                    None,
-                                    None,
-                                ]
-                                assert p_src_slice.shape == p_dst_slice.shape
-                                assert cute.size(p_src_slice) == 8
-                                cute.copy(
-                                    tiled_copy_r2s,
-                                    p_src_slice,
-                                    p_dst_slice,
-                                )
-                        else:
-                            for stsm_slice in cutlass.range_constexpr(2):
-                                p_src_slice = r_p_store[
-                                    (None, stsm_slice),
-                                    p_half,
-                                    None,
-                                    None,
-                                ]
-                                p_dst_slice = t_rs_p_xchg_tile[
-                                    (None, stsm_slice),
-                                    p_half,
-                                    None,
-                                    None,
-                                ]
-                                assert p_src_slice.shape == p_dst_slice.shape
-                                assert cute.size(p_src_slice) == 8
-                                cute.copy(
-                                    tiled_copy_r2s,
-                                    p_src_slice,
-                                    p_dst_slice,
-                                )
+                    for h_group in cutlass.range_constexpr(4):
+                        # kq6a: register-resident stat (hoisted above);
+                        # the per-tile LDS -> R2UR head is gone.
+                        lse = hoist_lse[h_group]
+                        # kq4c (e2 port, baseline idiom): adjacent
+                        # band pairs share the h-group's lse, so
+                        # scale+bias fuses into one packed-f32x2 FMA.
+                        for pair in cutlass.range_constexpr(4):
+                            i0 = hoist_band_indices[h_group][2 * pair]
+                            i1 = hoist_band_indices[h_group][
+                                2 * pair + 1
+                            ]
+                            v0, v1 = cute.arch.fma_packed_f32x2(
+                                (r_score[i0], r_score[i1]),
+                                (
+                                    softmax_scale_log2_e,
+                                    softmax_scale_log2_e,
+                                ),
+                                (lse, lse),
+                            )
+                            v0 = cute.math.exp2(v0, fastmath=True)
+                            v1 = cute.math.exp2(v1, fastmath=True)
+                            r_score[i0] = v0
+                            r_score[i1] = v1
+                            r_p[i0] = self.element_dtype(v0)
+                            r_p[i1] = self.element_dtype(v1)
                 else:
-                    # Preserve the assumption-free fallback as one complete
-                    # compute followed by one acquire/full publication.
+                    # Assumption-free fallback: per-value coordinate
+                    # lookup (32 stats loads/thread).  Flip the class
+                    # flag if the grouped arithmetic is ever suspect.
                     for local_n in cutlass.range_constexpr(
                         self.N_TILE_CTA
                     ):
@@ -6524,27 +6460,43 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         )
                         r_score[local_n] = p_value
                         r_p[local_n] = self.element_dtype(p_value)
-                    pipe_pds.producer_acquire(pds_state)
-                    if n_owner == cute.arch.make_warp_uniform(
-                        cute.arch.block_idx_in_cluster()
-                    ):
-                        cute.copy(
-                            tiled_copy_r2s,
-                            r_p_store,
-                            t_rs_p_local_tile,
-                        )
-                    else:
-                        cute.copy(
-                            tiled_copy_r2s,
-                            r_p_store,
-                            t_rs_p_xchg_tile,
-                        )
 
-                # One publication close covers all four earlier STSMs.
+                # Buffer backpressure: the previous tile's dQ issue
+                # releases pds, and S(t) only issues after that in the
+                # serial leader order, so this acquire is quiet.
+                pipe_pds.producer_acquire(pds_state)
+
+                # Publish P with stmatrix. Each pair of warps owns one
+                # N32 half, so this branch is warp-uniform.
+                r_p_store = thread_copy_r2s.retile(r_p)
+                assert t_rs_p_local_tile.shape == r_p_store.shape
+                assert t_rs_p_xchg_tile.shape == r_p_store.shape
+                # H1: rematerialize the uniform CTA rank at the use instead
+                # of keeping owns_n live across the P and dS math phases.
+                if n_owner == cute.arch.make_warp_uniform(
+                    cute.arch.block_idx_in_cluster()
+                ):
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_p_store,
+                        t_rs_p_local_tile,
+                    )
+                else:
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_p_store,
+                        t_rs_p_xchg_tile,
+                    )
                 cute.arch.fence_view_async_shared()
+                # kq2 (e12): warp-level close -- sync the warp so all
+                # its stores/fence retire, then one elected local
+                # arrive; the mbar counts 4 warps instead of 128
+                # threads.
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(p_ready_mbars)
+                    cute.arch.mbarrier_arrive(
+                        p_ready_mbars,
+                    )
 
                 # ---- dS phase: T2R dP, dS math, publish dS + image.
                 pipe_dp_done.consumer_wait(dp_state)
