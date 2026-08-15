@@ -167,8 +167,8 @@ class _IketProxy:
 _iket = _IketProxy()
 
 
-# H2 reducer concentration knife: all eight reducer warps rejoin after four
-# FP32x4 atomics.  No sleep is inserted; the barrier reshapes the burst only.
+# H2b reducer concentration knife: split each 8-op burst into two groups with
+# one short sleep per group, but do not synchronize the eight reducer warps.
 REDUCE_PACE_EVERY = 4
 
 
@@ -4309,10 +4309,6 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
             barrier_id=7,
             num_threads=(self.GATHER_WARPS + 1) * 32,
         )
-        self.reduce_pace_barrier = pipeline.NamedBarrier(
-            barrier_id=9,
-            num_threads=self.REDUCE_THREADS,
-        )
 
     def _make_score_tmem_load(self, score_cta_shape, score_epi_tile):
         """v9.3: force the 16-DP/256-bit T2R atom for S/dP.
@@ -8122,12 +8118,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     rdkv_frg_0.load(),
                 )
             if cutlass.const_expr(
-                (i + 1) % REDUCE_PACE_EVERY == 0 and i != 7
+                (i + 1) % REDUCE_PACE_EVERY == 0
             ):
-                self.reduce_pace_barrier.arrive_and_wait()
-        # Keep the two slots phase-aligned; this also prevents one warp from
-        # immediately starting slot 1 while peers are finishing slot 0.
-        self.reduce_pace_barrier.arrive_and_wait()
+                _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
         _iket.range_end(
             reduce_atomic_token,
             packed_issue,
@@ -8188,10 +8181,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     rdkv_frg_1.load(),
                 )
             if cutlass.const_expr(
-                (i + 1) % REDUCE_PACE_EVERY == 0 and i != 7
+                (i + 1) % REDUCE_PACE_EVERY == 0
             ):
-                self.reduce_pace_barrier.arrive_and_wait()
-        self.reduce_pace_barrier.arrive_and_wait()
+                _nanosleep_u32(Int32(self.REDUCE_PACE_NS))
         _iket.range_end(
             reduce_atomic_token_1,
             packed_issue + Int32(1),
