@@ -190,28 +190,6 @@ def _nanosleep_u32(
 
 
 @dsl_user_op
-def _read_cluster_cta_rank_volatile(*, loc=None, ip=None) -> Int32:
-    """Read cluster CTA rank without allowing loop-wide CSE.
-
-    W17's fully unrolled K32 loader otherwise keeps one hoisted rank value
-    across all 16 generations and spills it to local memory. This helper is
-    intentionally side-effecting so each short-lived use stays local.
-    """
-
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [],
-            "mov.u32 $0, %cluster_ctarank;",
-            "=r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def _map_smem_to_cluster_rank(
     smem_ptr: cute.Pointer,
     peer_rank: Int32,
@@ -6919,7 +6897,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     pipe_dq_done.producer_tail(dq_done_prod)
 
         elif warp_idx == Int32(self.LOAD_WARP):
-            _iket.mark("ROLE_KV_LOAD", _read_cluster_cta_rank_volatile())
+            _iket.mark("ROLE_KV_LOAD", rank)
             lane_idx = tidx % Int32(32)
             round_acq = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
@@ -6941,21 +6919,13 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                     )
                 cute.copy(
                     tma_atom_q,
-                    t_q_gmem[
-                        None,
-                        _read_cluster_cta_rank_volatile(),
-                        0,
-                    ],
+                    t_q_gmem[None, rank, 0],
                     t_q_smem[None, 0],
                     tma_bar_ptr=stationary_tma_mbars,
                 )
                 cute.copy(
                     tma_atom_do,
-                    t_do_gmem[
-                        None,
-                        _read_cluster_cta_rank_volatile(),
-                        0,
-                    ],
+                    t_do_gmem[None, rank, 0],
                     t_do_smem[None, 0],
                     tma_bar_ptr=stationary_tma_mbars + 1,
                 )
@@ -7045,13 +7015,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                             )
                             if cutlass.const_expr(tensor_kind == 0):
                                 if cutlass.const_expr(self.OWN_HALF_BULK):
-                                    # H6: volatile rank rematerialization
-                                    # prevents CSE across the unrolled loader.
-                                    # The true arm proves destination rank is
-                                    # the constexpr h_half.
-                                    if _read_cluster_cta_rank_volatile() == Int32(
-                                        h_half
-                                    ):
+                                    if rank == Int32(h_half):
                                         with cute.arch.elect_one():
                                             _cpasync_bulk_s2cluster(
                                                 stationary_do_raw
@@ -7059,7 +7023,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 round_dst_raw,
                                                 round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
-                                                Int32(h_half),
+                                                rank,
                                             )
                                             _cpasync_bulk_s2cluster(
                                                 stationary_do_raw
@@ -7069,7 +7033,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 + self.ROUND_STAGE_ELEMENTS // 2,
                                                 round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
-                                                Int32(h_half),
+                                                rank,
                                             )
                                     else:
                                         cute.copy(
@@ -7102,9 +7066,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                     )
                             else:
                                 if cutlass.const_expr(self.OWN_HALF_BULK):
-                                    if _read_cluster_cta_rank_volatile() == Int32(
-                                        h_half
-                                    ):
+                                    if rank == Int32(h_half):
                                         with cute.arch.elect_one():
                                             _cpasync_bulk_s2cluster(
                                                 stationary_q_raw
@@ -7112,7 +7074,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 round_dst_raw,
                                                 round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
-                                                Int32(h_half),
+                                                rank,
                                             )
                                             _cpasync_bulk_s2cluster(
                                                 stationary_q_raw
@@ -7122,7 +7084,7 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                                                 + self.ROUND_STAGE_ELEMENTS // 2,
                                                 round_tma_mbars + round_slot,
                                                 round_stage_bytes // 2,
-                                                Int32(h_half),
+                                                rank,
                                             )
                                     else:
                                         cute.copy(
