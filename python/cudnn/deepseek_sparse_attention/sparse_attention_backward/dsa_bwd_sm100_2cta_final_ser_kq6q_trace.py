@@ -122,9 +122,13 @@ _LEAN_SPANS = (
     # math chain
     "WAIT_S(",
     "T2R_S(",
-    "P_MATH(",
     "MATH_PDS_ACQ(",
-    "P_PUBLISH(",
+    "P_COMPUTE_STORE(",
+    "P_MATH_HEAD(",
+    "P_STSM_EARLY(",
+    "P_MATH_TAIL(",
+    "P_STSM_TAIL(",
+    "P_CLOSE(",
     "WAIT_dP(",
     "T2R_dP(",
     "DS_MATH(",
@@ -6442,39 +6446,118 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                 s_state.advance()
                 _iket.range_end(t2r_s_token, loop_iter)
 
-                p_math_token = _iket.range_start(
-                    "P_MATH(i)",
-                    loop_iter,
+                p_total_token = _iket.range_start(
+                    "P_COMPUTE_STORE(i)", loop_iter
                 )
                 assert cute.size(r_score) == self.N_TILE_CTA
+                r_p_store = thread_copy_r2s.retile(r_p)
+                assert t_rs_p_local_tile.shape == r_p_store.shape
+                assert t_rs_p_xchg_tile.shape == r_p_store.shape
+                assert cute.size(r_p_store, mode=[0, 0]) == 8
+                assert cute.size(r_p_store, mode=[0, 1]) == 2
+                assert cute.size(r_p_store, mode=[1]) == 2
+                assert cute.size(r_p_store, mode=[2]) == 1
+                assert cute.size(r_p_store, mode=[3]) == 1
+
                 if cutlass.const_expr(self.SOFTMAX_GROUPED_STATS):
-                    for h_group in cutlass.range_constexpr(4):
-                        # kq6a: register-resident stat (hoisted).
-                        lse = hoist_lse[h_group]
-                        # kq4c: packed-f32x2 P math.
-                        for pair in cutlass.range_constexpr(4):
-                            i0 = hoist_band_indices[h_group][2 * pair]
-                            i1 = hoist_band_indices[h_group][
-                                2 * pair + 1
-                            ]
-                            v0, v1 = cute.arch.fma_packed_f32x2(
-                                (r_score[i0], r_score[i1]),
-                                (
-                                    softmax_scale_log2_e,
-                                    softmax_scale_log2_e,
-                                ),
-                                (lse, lse),
+                    for p_half in cutlass.range_constexpr(2):
+                        if cutlass.const_expr(p_half == 0):
+                            p_math_half_token = _iket.range_start(
+                                "P_MATH_HEAD(i)", loop_iter
                             )
-                            v0 = cute.math.exp2(v0, fastmath=True)
-                            v1 = cute.math.exp2(v1, fastmath=True)
-                            r_score[i0] = v0
-                            r_score[i1] = v1
-                            r_p[i0] = self.element_dtype(v0)
-                            r_p[i1] = self.element_dtype(v1)
+                        else:
+                            p_math_half_token = _iket.range_start(
+                                "P_MATH_TAIL(i)", loop_iter
+                            )
+
+                        for h_in_half in cutlass.range_constexpr(2):
+                            h_group = 2 * p_half + h_in_half
+                            lse = hoist_lse[h_group]
+                            for pair in cutlass.range_constexpr(4):
+                                i0 = hoist_band_indices[h_group][2 * pair]
+                                i1 = hoist_band_indices[h_group][
+                                    2 * pair + 1
+                                ]
+                                v0, v1 = cute.arch.fma_packed_f32x2(
+                                    (r_score[i0], r_score[i1]),
+                                    (
+                                        softmax_scale_log2_e,
+                                        softmax_scale_log2_e,
+                                    ),
+                                    (lse, lse),
+                                )
+                                v0 = cute.math.exp2(v0, fastmath=True)
+                                v1 = cute.math.exp2(v1, fastmath=True)
+                                r_score[i0] = v0
+                                r_score[i1] = v1
+                                r_p[i0] = self.element_dtype(v0)
+                                r_p[i1] = self.element_dtype(v1)
+
+                        _iket.range_end(p_math_half_token, loop_iter)
+                        if cutlass.const_expr(p_half == 0):
+                            pds_acq_token = _iket.range_start(
+                                "MATH_PDS_ACQ(i)", loop_iter
+                            )
+                            pipe_pds.producer_acquire(pds_state)
+                            _iket.range_end(pds_acq_token, loop_iter)
+                            p_stsm_token = _iket.range_start(
+                                "P_STSM_EARLY(i)", loop_iter
+                            )
+                        else:
+                            p_stsm_token = _iket.range_start(
+                                "P_STSM_TAIL(i)", loop_iter
+                            )
+
+                        if n_owner == cute.arch.make_warp_uniform(
+                            cute.arch.block_idx_in_cluster()
+                        ):
+                            for stsm_slice in cutlass.range_constexpr(2):
+                                p_src_slice = r_p_store[
+                                    (None, stsm_slice),
+                                    p_half,
+                                    None,
+                                    None,
+                                ]
+                                p_dst_slice = t_rs_p_local_tile[
+                                    (None, stsm_slice),
+                                    p_half,
+                                    None,
+                                    None,
+                                ]
+                                assert p_src_slice.shape == p_dst_slice.shape
+                                assert cute.size(p_src_slice) == 8
+                                cute.copy(
+                                    tiled_copy_r2s,
+                                    p_src_slice,
+                                    p_dst_slice,
+                                )
+                        else:
+                            for stsm_slice in cutlass.range_constexpr(2):
+                                p_src_slice = r_p_store[
+                                    (None, stsm_slice),
+                                    p_half,
+                                    None,
+                                    None,
+                                ]
+                                p_dst_slice = t_rs_p_xchg_tile[
+                                    (None, stsm_slice),
+                                    p_half,
+                                    None,
+                                    None,
+                                ]
+                                assert p_src_slice.shape == p_dst_slice.shape
+                                assert cute.size(p_src_slice) == 8
+                                cute.copy(
+                                    tiled_copy_r2s,
+                                    p_src_slice,
+                                    p_dst_slice,
+                                )
+
+                        _iket.range_end(p_stsm_token, loop_iter)
                 else:
-                    # Assumption-free fallback: per-value coordinate
-                    # lookup (32 stats loads/thread).  Flip the class
-                    # flag if the grouped arithmetic is ever suspect.
+                    p_math_half_token = _iket.range_start(
+                        "P_MATH_HEAD(i)", loop_iter
+                    )
                     for local_n in cutlass.range_constexpr(
                         self.N_TILE_CTA
                     ):
@@ -6495,51 +6578,40 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
                         )
                         r_score[local_n] = p_value
                         r_p[local_n] = self.element_dtype(p_value)
-                _iket.range_end(p_math_token, loop_iter)
-
-                # Buffer backpressure: the previous tile's dQ issue
-                # releases pds, and S(t) only issues after that in the
-                # serial leader order, so this acquire is quiet.
-                pds_acq_token = _iket.range_start(
-                    "MATH_PDS_ACQ(i)",
-                    loop_iter,
-                )
-                pipe_pds.producer_acquire(pds_state)
-                _iket.range_end(pds_acq_token, loop_iter)
-
-                # Publish P with stmatrix. Each pair of warps owns one
-                # N32 half, so this branch is warp-uniform.
-                p_publish_token = _iket.range_start(
-                    "P_PUBLISH(i)",
-                    loop_iter,
-                )
-                r_p_store = thread_copy_r2s.retile(r_p)
-                assert t_rs_p_local_tile.shape == r_p_store.shape
-                assert t_rs_p_xchg_tile.shape == r_p_store.shape
-                # H1: rematerialize the uniform CTA rank at the use instead
-                # of keeping owns_n live across the P and dS math phases.
-                if n_owner == cute.arch.make_warp_uniform(
-                    cute.arch.block_idx_in_cluster()
-                ):
-                    cute.copy(
-                        tiled_copy_r2s,
-                        r_p_store,
-                        t_rs_p_local_tile,
+                    _iket.range_end(p_math_half_token, loop_iter)
+                    pds_acq_token = _iket.range_start(
+                        "MATH_PDS_ACQ(i)", loop_iter
                     )
-                else:
-                    cute.copy(
-                        tiled_copy_r2s,
-                        r_p_store,
-                        t_rs_p_xchg_tile,
+                    pipe_pds.producer_acquire(pds_state)
+                    _iket.range_end(pds_acq_token, loop_iter)
+                    p_stsm_token = _iket.range_start(
+                        "P_STSM_TAIL(i)", loop_iter
                     )
+                    if n_owner == cute.arch.make_warp_uniform(
+                        cute.arch.block_idx_in_cluster()
+                    ):
+                        cute.copy(
+                            tiled_copy_r2s,
+                            r_p_store,
+                            t_rs_p_local_tile,
+                        )
+                    else:
+                        cute.copy(
+                            tiled_copy_r2s,
+                            r_p_store,
+                            t_rs_p_xchg_tile,
+                        )
+                    _iket.range_end(p_stsm_token, loop_iter)
+
+                p_close_token = _iket.range_start(
+                    "P_CLOSE(i)", loop_iter
+                )
                 cute.arch.fence_view_async_shared()
-                # kq2: warp-level close.
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(
-                        p_ready_mbars,
-                    )
-                _iket.range_end(p_publish_token, loop_iter)
+                    cute.arch.mbarrier_arrive(p_ready_mbars)
+                _iket.range_end(p_close_token, loop_iter)
+                _iket.range_end(p_total_token, loop_iter)
 
                 # ---- dS phase: T2R dP, dS math, publish dS + image.
                 wait_dp_token = _iket.range_start(
