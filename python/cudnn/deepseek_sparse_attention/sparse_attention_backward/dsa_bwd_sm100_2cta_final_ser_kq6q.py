@@ -321,11 +321,11 @@ class FlashAttentionDSABackwardSm100TwoCTA(FlashAttentionDSABackwardSm100):
     KV_GROUP_SIZE = 8
     KV_NUM_GROUPS = KV_LOAD_THREADS // KV_GROUP_SIZE
     TMEM_COLUMNS = 512
-    # kq6q: inter-chunk pacing (ns) for the reducer atomic bursts.
-    # 8 chunks x ~(pace+issue) stretches one burst ~0.3us -> ~1.6us,
-    # cutting in-flight REDG ~5x.  Budget: 2 bursts x 8 x ~190ns +
-    # T2R/waits ~= 4.0us < 5.6us period -- the reducer keeps up.
-    REDUCE_PACE_NS = 150
+    # H8: keep four reducer cohorts from rebuilding a synchronized REDG
+    # spike after each slot wait. Prior B200 tuning selected 100 ns between
+    # chunks and 90 ns between cohort starts.
+    REDUCE_PACE_NS = 100
+    REDUCE_DEPHASE_NS = 90
     MAX_SMEM_BYTES = 232_448
     QUADRANT_ELEMENTS = H_TILE_CTA * N_TILE_CTA
     QUADRANT_BYTES = QUADRANT_ELEMENTS * (BFloat16.width // 8)
@@ -7674,6 +7674,10 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         release_state.advance()
 
         assert cute.size(thread_values_0) == self.N_TILE // 2
+        reduce_cohort = rank * Int32(2) + wg_idx
+        _nanosleep_u32(
+            reduce_cohort * Int32(self.REDUCE_DEPHASE_NS)
+        )
         sub_tile_idx_0 = rank
         sub_tile_idx_1 = Int32(2) + rank
         for i in cutlass.range_constexpr(8):
@@ -7713,6 +7717,9 @@ class FlashAttentionDSABackwardSm100TwoCTAV2(
         done_pipeline.consumer_release(release_state)
         release_state.advance()
 
+        _nanosleep_u32(
+            reduce_cohort * Int32(self.REDUCE_DEPHASE_NS)
+        )
         for i in cutlass.range_constexpr(8):
             coord_base = i * 2 - i % 2
             rdkv_frg_1 = cute.make_rmem_tensor(
