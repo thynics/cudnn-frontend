@@ -1,0 +1,1154 @@
+{
+  "baseline_sha256": "a86b353a2349962bd4404818a906ea2d4df4ca5cb88b22d15ea234fc4e8ff3d7",
+  "baseline_source": "/home/scratch.longcheng_gpu/.dsa-rubin/rubin-feature-explore/runs/dq-role-move-correctness-20260816T131431Z/worktree/python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_baseline.py",
+  "candidate_class": "FlashAttentionDSABackwardSm100TwoCTAV2",
+  "candidate_sha256": "190cc27f7ddde3a712c319a2aaa7717301c29403bf85ec3332470659fe40d13c",
+  "candidate_source": "/home/scratch.longcheng_gpu/.dsa-rubin/rubin-feature-explore/kernel_exp_dq_role_move.py",
+  "compute_capability": [
+    10,
+    7
+  ],
+  "contract": {
+    "baseline_metadata": "positive runtime lengths use the frozen baseline's real length-tensor specialization; only cases containing a zero-length token are canonicalized to the equivalent None + -1-tail representation to avoid its unsafe tile_index=-1 path",
+    "cases": {
+      "all_zero": {
+        "description": "zero-length liveness and zero-gradient contract",
+        "topk_length": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "full_length_dynamic": {
+        "description": "the benchmark's full-length runtime mTopkLength specialization",
+        "topk_length": [
+          2048,
+          2048,
+          2048,
+          2048,
+          2048,
+          2048
+        ]
+      },
+      "full_valid_none": {
+        "description": "mTopkLength=None with all 2048 sparse indices valid in a 4096-row KV",
+        "topk_length": null
+      },
+      "none_holes": {
+        "description": "mTopkLength=None with one full 64-slot hole and scattered -1 holes",
+        "topk_length": null
+      },
+      "ragged_lengths": {
+        "description": "one distinct runtime length per token; valid indices remain after each length so the length gate, rather than -1 padding, must exclude them",
+        "topk_length": [
+          0,
+          1,
+          63,
+          65,
+          127,
+          2047
+        ]
+      },
+      "tile_boundary_lengths": {
+        "description": "positive runtime lengths spanning the 64/128 tile boundaries and the full 2048 extent",
+        "topk_length": [
+          1,
+          63,
+          64,
+          128,
+          2047,
+          2048
+        ]
+      }
+    },
+    "comparisons": [
+      "exact_one_cta_baseline_vs_torch",
+      "candidate_vs_torch",
+      "candidate_vs_exact_one_cta_baseline"
+    ],
+    "external_timeout_required": true,
+    "outputs": [
+      "dq",
+      "dkv",
+      "d_sink"
+    ],
+    "shape": {
+      "dtype": "bfloat16",
+      "head_dim": 512,
+      "max_topk": 2048,
+      "nheads": 128,
+      "seqlen_kv": 4096,
+      "seqlen_q": 6
+    },
+    "target": "Rubin SM107a",
+    "tolerance": {
+      "atol": 0.05,
+      "rtol": 0.05
+    },
+    "zero_length_contract": "allowed by the current SM100 implementation and exercised by the repository all_empty correctness gate; the public wrapper does not reject zero"
+  },
+  "cutlass_dsl_version": "0.3.0+20260803235612.d88cc85",
+  "duration_s": 11.278307317988947,
+  "gpu": "NVIDIA Graphics Device",
+  "native_main_symbols": {
+    "baseline_lengths": [
+      "kernel_cutlass_bwd_cudnndeepseek_sparse_attentionsparse_attention_backwarddsa_bwd_sm100_baselineFlashAttentionDSABackwardSm100_object_at_____Int32_Int32_TiledMMA_ThrLayoutVMNK11110000_Per_1"
+    ],
+    "baseline_none": [
+      "kernel_cutlass_bwd_cudnndeepseek_sparse_attentionsparse_attention_backwarddsa_bwd_sm100_baselineFlashAttentionDSABackwardSm100_object_at_____Int32_Int32_TiledMMA_ThrLayoutVMNK11110000_Per_1"
+    ],
+    "candidate_lengths": [
+      "kernel_cutlass_kernel_cudnndeepseek_sparse_attentionsparse_attention_backward_rubin_correctness_190cc27f7ddde3a7FlashAttentionDSABackwardSm100TwoCTAV2_object_at_____Int32_Int32_CopyAtom_T_1"
+    ],
+    "candidate_none": [
+      "kernel_cutlass_kernel_cudnndeepseek_sparse_attentionsparse_attention_backward_rubin_correctness_190cc27f7ddde3a7FlashAttentionDSABackwardSm100TwoCTAV2_object_at_____Int32_Int32_CopyAtom_T_1"
+    ]
+  },
+  "records": [
+    {
+      "baseline_representation": "none",
+      "baseline_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 1.2876465916633606e-05,
+            "max_abs_index": [
+              108
+            ],
+            "max_rel": 2.9352121353149414,
+            "rel_p50": 0.0016987933777272701,
+            "rel_p95": 0.03304015100002289,
+            "rel_p99": 0.18295025825500488,
+            "rmse": 3.1959502848621923e-06
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0010141432285308838,
+            "max_abs_index": [
+              2544,
+              26
+            ],
+            "max_rel": 1656.829833984375,
+            "rel_p50": 0.002280421555042267,
+            "rel_p95": 0.02060062251985073,
+            "rel_p99": 0.10242771357297897,
+            "rmse": 5.280959885567427e-05
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0010275840759277344,
+            "max_abs_index": [
+              5,
+              38,
+              315
+            ],
+            "max_rel": 267.48675537109375,
+            "rel_p50": 0.0018956915009766817,
+            "rel_p95": 0.013576336205005646,
+            "rel_p99": 0.06625374406576157,
+            "rmse": 0.00011314347648294643
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_baseline": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.00048828125,
+            "max_abs_index": [
+              345,
+              4
+            ],
+            "max_rel": 3.0875000953674316,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 3.5315351851750165e-06
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0009765625,
+            "max_abs_index": [
+              0,
+              40,
+              434
+            ],
+            "max_rel": 4.0186333656311035,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 7.4825215961027425e-06
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 1.2876465916633606e-05,
+            "max_abs_index": [
+              108
+            ],
+            "max_rel": 2.9352121353149414,
+            "rel_p50": 0.0016987933777272701,
+            "rel_p95": 0.03304015100002289,
+            "rel_p99": 0.18295025825500488,
+            "rmse": 3.1959502848621923e-06
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0010141432285308838,
+            "max_abs_index": [
+              2544,
+              26
+            ],
+            "max_rel": 1656.829833984375,
+            "rel_p50": 0.0022804555483162403,
+            "rel_p95": 0.020598676055669785,
+            "rel_p99": 0.10243891179561615,
+            "rmse": 5.280990444589406e-05
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0010275840759277344,
+            "max_abs_index": [
+              5,
+              38,
+              315
+            ],
+            "max_rel": 267.48675537109375,
+            "rel_p50": 0.0018955747364088893,
+            "rel_p95": 0.013576056808233261,
+            "rel_p99": 0.06623824685811996,
+            "rmse": 0.00011313705908833072
+          }
+        },
+        "within_tolerance": true
+      },
+      "case": "full_valid_none",
+      "description": "mTopkLength=None with all 2048 sparse indices valid in a 4096-row KV",
+      "duration_s": 0.3143871130014304,
+      "status": "pass",
+      "topk_length": null
+    },
+    {
+      "baseline_representation": "direct_lengths",
+      "baseline_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 1.2876465916633606e-05,
+            "max_abs_index": [
+              108
+            ],
+            "max_rel": 2.9352121353149414,
+            "rel_p50": 0.0016987933777272701,
+            "rel_p95": 0.03304015100002289,
+            "rel_p99": 0.18295025825500488,
+            "rmse": 3.1959502848621923e-06
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0010141432285308838,
+            "max_abs_index": [
+              2544,
+              26
+            ],
+            "max_rel": 1656.829833984375,
+            "rel_p50": 0.0022804150357842445,
+            "rel_p95": 0.02060062251985073,
+            "rel_p99": 0.10242771357297897,
+            "rmse": 5.280971163301729e-05
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0010275840759277344,
+            "max_abs_index": [
+              5,
+              38,
+              315
+            ],
+            "max_rel": 267.48675537109375,
+            "rel_p50": 0.0018956915009766817,
+            "rel_p95": 0.013576336205005646,
+            "rel_p99": 0.06625374406576157,
+            "rmse": 0.00011314347648294643
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_baseline": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.00048828125,
+            "max_abs_index": [
+              345,
+              4
+            ],
+            "max_rel": 3.0875000953674316,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 3.538297050909023e-06
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0009765625,
+            "max_abs_index": [
+              0,
+              40,
+              434
+            ],
+            "max_rel": 4.0186333656311035,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 7.4825215961027425e-06
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 1.2876465916633606e-05,
+            "max_abs_index": [
+              108
+            ],
+            "max_rel": 2.9352121353149414,
+            "rel_p50": 0.0016987933777272701,
+            "rel_p95": 0.03304015100002289,
+            "rel_p99": 0.18295025825500488,
+            "rmse": 3.1959502848621923e-06
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0010141432285308838,
+            "max_abs_index": [
+              2544,
+              26
+            ],
+            "max_rel": 1656.829833984375,
+            "rel_p50": 0.0022804555483162403,
+            "rel_p95": 0.020598676055669785,
+            "rel_p99": 0.10243891179561615,
+            "rmse": 5.280990444589406e-05
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0010275840759277344,
+            "max_abs_index": [
+              5,
+              38,
+              315
+            ],
+            "max_rel": 267.48675537109375,
+            "rel_p50": 0.0018955747364088893,
+            "rel_p95": 0.013576056808233261,
+            "rel_p99": 0.06623824685811996,
+            "rmse": 0.00011313705908833072
+          }
+        },
+        "within_tolerance": true
+      },
+      "case": "full_length_dynamic",
+      "description": "the benchmark's full-length runtime mTopkLength specialization",
+      "duration_s": 0.008103833999484777,
+      "status": "pass",
+      "topk_length": [
+        2048,
+        2048,
+        2048,
+        2048,
+        2048,
+        2048
+      ]
+    },
+    {
+      "baseline_representation": "none",
+      "baseline_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 2.0235544070601463e-05,
+            "max_abs_index": [
+              123
+            ],
+            "max_rel": 0.13449840247631073,
+            "rel_p50": 0.001845925347879529,
+            "rel_p95": 0.024900078773498535,
+            "rel_p99": 0.11679577827453613,
+            "rmse": 3.897266651620157e-06
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0007492303848266602,
+            "max_abs_index": [
+              2544,
+              338
+            ],
+            "max_rel": 3982.521728515625,
+            "rel_p50": 0.0022543231025338173,
+            "rel_p95": 0.020344171673059464,
+            "rel_p99": 0.10166169703006744,
+            "rmse": 5.5191481806105e-05
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0008809268474578857,
+            "max_abs_index": [
+              5,
+              117,
+              13
+            ],
+            "max_rel": 250.68284606933594,
+            "rel_p50": 0.0019145961850881577,
+            "rel_p95": 0.013864216394722462,
+            "rel_p99": 0.06980681419372559,
+            "rmse": 0.00011616309348028153
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_baseline": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.00048828125,
+            "max_abs_index": [
+              395,
+              36
+            ],
+            "max_rel": 9.16058349609375,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 3.199300863343524e-06
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.00048828125,
+            "max_abs_index": [
+              0,
+              18,
+              470
+            ],
+            "max_rel": 11.92173957824707,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 6.33401214145124e-06
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 2.0235544070601463e-05,
+            "max_abs_index": [
+              123
+            ],
+            "max_rel": 0.13449840247631073,
+            "rel_p50": 0.001845925347879529,
+            "rel_p95": 0.024900078773498535,
+            "rel_p99": 0.11679577827453613,
+            "rmse": 3.897266651620157e-06
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0007492303848266602,
+            "max_abs_index": [
+              2544,
+              338
+            ],
+            "max_rel": 3982.521728515625,
+            "rel_p50": 0.002254527062177658,
+            "rel_p95": 0.020344585180282593,
+            "rel_p99": 0.10171061754226685,
+            "rmse": 5.5195418099174276e-05
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0008809268474578857,
+            "max_abs_index": [
+              5,
+              117,
+              13
+            ],
+            "max_rel": 250.68284606933594,
+            "rel_p50": 0.0019145631231367588,
+            "rel_p95": 0.013851737603545189,
+            "rel_p99": 0.06980681419372559,
+            "rmse": 0.0001161639011115767
+          }
+        },
+        "within_tolerance": true
+      },
+      "case": "none_holes",
+      "description": "mTopkLength=None with one full 64-slot hole and scattered -1 holes",
+      "duration_s": 0.007499349987483583,
+      "status": "pass",
+      "topk_length": null
+    },
+    {
+      "baseline_representation": "canonicalized_none_negative_one_tail",
+      "baseline_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.03190268576145172,
+            "max_abs_index": [
+              31
+            ],
+            "max_rel": 0.1535702794790268,
+            "rel_p50": 0.0014120574342086911,
+            "rel_p95": 0.01280704140663147,
+            "rel_p99": 0.03845561295747757,
+            "rmse": 0.007460857275873423
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.06352996826171875,
+            "max_abs_index": [
+              3069,
+              139
+            ],
+            "max_rel": 535.8826904296875,
+            "rel_p50": 0.00021842987916897982,
+            "rel_p95": 0.01100547332316637,
+            "rel_p99": 0.05374880135059357,
+            "rmse": 0.0003244105901103467
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.00950169563293457,
+            "max_abs_index": [
+              1,
+              37,
+              436
+            ],
+            "max_rel": 9757.1171875,
+            "rel_p50": 0.001761072315275669,
+            "rel_p95": 0.01730257272720337,
+            "rel_p99": 0.08806118369102478,
+            "rmse": 0.0004425132356118411
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_baseline": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0078125,
+            "max_abs_index": [
+              1977,
+              93
+            ],
+            "max_rel": 2.183206081390381,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 1.8328577425563708e-05
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.00390625,
+            "max_abs_index": [
+              2,
+              104,
+              180
+            ],
+            "max_rel": 2.176744222640991,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 2.6458632419235073e-05
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.03190268576145172,
+            "max_abs_index": [
+              31
+            ],
+            "max_rel": 0.1535702794790268,
+            "rel_p50": 0.0014120574342086911,
+            "rel_p95": 0.01280704140663147,
+            "rel_p99": 0.03845561295747757,
+            "rmse": 0.007460857275873423
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.06352996826171875,
+            "max_abs_index": [
+              3069,
+              139
+            ],
+            "max_rel": 535.8826904296875,
+            "rel_p50": 0.00021842439309693873,
+            "rel_p95": 0.011004761792719364,
+            "rel_p99": 0.05374579876661301,
+            "rmse": 0.00032433748128823936
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.00950169563293457,
+            "max_abs_index": [
+              1,
+              37,
+              436
+            ],
+            "max_rel": 9757.1171875,
+            "rel_p50": 0.0017612648662179708,
+            "rel_p95": 0.01730257272720337,
+            "rel_p99": 0.08806118369102478,
+            "rmse": 0.00044253532541915774
+          }
+        },
+        "within_tolerance": true
+      },
+      "case": "ragged_lengths",
+      "description": "one distinct runtime length per token; valid indices remain after each length so the length gate, rather than -1 padding, must exclude them",
+      "duration_s": 0.007569519002572633,
+      "status": "pass",
+      "topk_length": [
+        0,
+        1,
+        63,
+        65,
+        127,
+        2047
+      ]
+    },
+    {
+      "baseline_representation": "direct_lengths",
+      "baseline_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.01999145746231079,
+            "max_abs_index": [
+              87
+            ],
+            "max_rel": 0.26352429389953613,
+            "rel_p50": 0.0016552333254367113,
+            "rel_p95": 0.009077834896743298,
+            "rel_p99": 0.037762559950351715,
+            "rmse": 0.0068244487047195435
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.05414009094238281,
+            "max_abs_index": [
+              2952,
+              123
+            ],
+            "max_rel": 420.7314453125,
+            "rel_p50": 0.0015135748544707894,
+            "rel_p95": 0.0156879685819149,
+            "rel_p99": 0.07780629396438599,
+            "rmse": 0.00030622835038229823
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.01145792007446289,
+            "max_abs_index": [
+              0,
+              13,
+              208
+            ],
+            "max_rel": 84.82427215576172,
+            "rel_p50": 0.0021881358698010445,
+            "rel_p95": 0.019829189404845238,
+            "rel_p99": 0.11411743611097336,
+            "rmse": 0.00047225001617334783
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_baseline": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.001953125,
+            "max_abs_index": [
+              2472,
+              212
+            ],
+            "max_rel": 3.857142925262451,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 4.573252226691693e-06
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.00048828125,
+            "max_abs_index": [
+              4,
+              9,
+              345
+            ],
+            "max_rel": 0.20744681358337402,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 3.663927373054321e-06
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.01999145746231079,
+            "max_abs_index": [
+              87
+            ],
+            "max_rel": 0.26352429389953613,
+            "rel_p50": 0.0016552333254367113,
+            "rel_p95": 0.009077834896743298,
+            "rel_p99": 0.037762559950351715,
+            "rmse": 0.0068244487047195435
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.05414009094238281,
+            "max_abs_index": [
+              2952,
+              123
+            ],
+            "max_rel": 420.7314453125,
+            "rel_p50": 0.0015134953428059816,
+            "rel_p95": 0.015686914324760437,
+            "rel_p99": 0.07779702544212341,
+            "rmse": 0.00030623513157479465
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.01145792007446289,
+            "max_abs_index": [
+              0,
+              13,
+              208
+            ],
+            "max_rel": 84.82427215576172,
+            "rel_p50": 0.002188000362366438,
+            "rel_p95": 0.019822949543595314,
+            "rel_p99": 0.11425285786390305,
+            "rmse": 0.0004722492303699255
+          }
+        },
+        "within_tolerance": true
+      },
+      "case": "tile_boundary_lengths",
+      "description": "positive runtime lengths spanning the 64/128 tile boundaries and the full 2048 extent",
+      "duration_s": 0.007459578991984017,
+      "status": "pass",
+      "topk_length": [
+        1,
+        63,
+        64,
+        128,
+        2047,
+        2048
+      ]
+    },
+    {
+      "baseline_representation": "canonicalized_none_negative_one_tail",
+      "baseline_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0,
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0,
+              0,
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_baseline": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0,
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0,
+              0,
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          }
+        },
+        "within_tolerance": true
+      },
+      "candidate_vs_torch": {
+        "outputs": {
+          "d_sink": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dkv": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0,
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          },
+          "dq": {
+            "actual_inf": 0,
+            "actual_nan": 0,
+            "expected_inf": 0,
+            "expected_nan": 0,
+            "max_abs": 0.0,
+            "max_abs_index": [
+              0,
+              0,
+              0
+            ],
+            "max_rel": 0.0,
+            "rel_p50": 0.0,
+            "rel_p95": 0.0,
+            "rel_p99": 0.0,
+            "rmse": 0.0
+          }
+        },
+        "within_tolerance": true
+      },
+      "case": "all_zero",
+      "description": "zero-length liveness and zero-gradient contract",
+      "duration_s": 0.007366064004600048,
+      "status": "pass",
+      "topk_length": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "repo": "/home/scratch.longcheng_gpu/.dsa-rubin/rubin-feature-explore/runs/dq-role-move-correctness-20260816T131431Z/worktree",
+  "selected_cases": [
+    "full_valid_none",
+    "full_length_dynamic",
+    "none_holes",
+    "ragged_lengths",
+    "tile_boundary_lengths",
+    "all_zero"
+  ],
+  "status": "pass",
+  "torch_cuda_version": "13.3",
+  "torch_version": "2.13.0a0+9186a08b2c.nv26.07"
+}
