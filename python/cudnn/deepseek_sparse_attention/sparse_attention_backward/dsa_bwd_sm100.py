@@ -139,12 +139,8 @@ class FlashAttentionDSABackwardSm100:
         # SMEM.  Env knobs deepen the two gather-load pipelines (the
         # long_scoreboard wall in the k18 profile); defaults preserve the
         # shipped configuration bit-for-bit.
-        self.load_mma_QdO_stage = int(
-            os.environ.get("DSA_BL_QDO_STAGE", "1")
-        )
-        self.load_mma_K_stage = int(
-            os.environ.get("DSA_BL_K_STAGE", "1")
-        )
+        self.load_mma_QdO_stage = int(os.environ.get("DSA_BL_QDO_STAGE", "1"))
+        self.load_mma_K_stage = int(os.environ.get("DSA_BL_K_STAGE", "1"))
         # k21 (GR100): DSA_BL_HALFK=1 splits the K/V SMEM staging along D
         # into two 256-wide half tiles (2 x 32KB per K stage instead of
         # 1 x 64KB, same bytes), doubling the gather pipeline depth without
@@ -155,15 +151,13 @@ class FlashAttentionDSABackwardSm100:
         # early.  Default "0" preserves the shipped configuration
         # bit-for-bit.
         self.load_mma_K_halfk = os.environ.get("DSA_BL_HALFK", "0") == "1"
-        if self.load_mma_K_halfk:
+        if cutlass.const_expr(self.load_mma_K_halfk):
             # The byte-alias argument (half-D staging == first/second 32KB
             # of the full-D stage, for both the K-major sK view and the
             # MN-major sK_2 view) relies on SW128 atoms with 64-wide
             # D-tiles outermost, and the dQ path is hard-wired to 4x128
             # M-blocks: both require the 512/512 same-hdim configuration.
-            assert self.same_hdim_kv and self.head_dim == 512, (
-                "DSA_BL_HALFK=1 requires head_dim == head_dim_v == 512"
-            )
+            assert self.same_hdim_kv and self.head_dim == 512, "DSA_BL_HALFK=1 requires head_dim == head_dim_v == 512"
         # k22 A-S1 (GR100): DSA_BL_KSTAGE2=1 revives the k19 stage=2 arm.
         # The k19 death sentence conflated the two arms' receipts: blk3
         # (stage=3) compiled to 346,112B, but blk2 (stage=2) compiled to
@@ -175,15 +169,11 @@ class FlashAttentionDSABackwardSm100:
         # arms are the on-silicon oversized precedent).  Default "0"
         # preserves the shipped configuration bit-for-bit.
         self.load_mma_K_kstage2 = os.environ.get("DSA_BL_KSTAGE2", "0") == "1"
-        if self.load_mma_K_kstage2:
-            assert not self.load_mma_K_halfk, (
-                "DSA_BL_KSTAGE2=1 is mutually exclusive with DSA_BL_HALFK=1"
-            )
+        if cutlass.const_expr(self.load_mma_K_kstage2):
+            assert not self.load_mma_K_halfk, "DSA_BL_KSTAGE2=1 is mutually exclusive with DSA_BL_HALFK=1"
             # The 280,576B account and the per-stage byte bijection of
             # the sK/sK_2/sV views are argued for the 512/512 shape only.
-            assert self.same_hdim_kv and self.head_dim == 512, (
-                "DSA_BL_KSTAGE2=1 requires head_dim == head_dim_v == 512"
-            )
+            assert self.same_hdim_kv and self.head_dim == 512, "DSA_BL_KSTAGE2=1 requires head_dim == head_dim_v == 512"
             self.load_mma_K_stage = 2
         # k22 blo1 arm: DSA_BL_OVPAD=1 prices the oversized-launch cliff
         # tax in isolation -- stage=1 protocol and SharedStorage stay
@@ -193,18 +183,14 @@ class FlashAttentionDSABackwardSm100:
         # (rubin_1 E3PAD precedent, minus the dead struct field: the
         # allocator only requires allocated <= dynamic size).
         self.smem_ovpad = os.environ.get("DSA_BL_OVPAD", "0") == "1"
-        if self.smem_ovpad:
-            assert not (self.load_mma_K_halfk or self.load_mma_K_kstage2), (
-                "DSA_BL_OVPAD=1 is mutually exclusive with DSA_BL_HALFK/DSA_BL_KSTAGE2"
-            )
-            assert self.same_hdim_kv and self.head_dim == 512, (
-                "DSA_BL_OVPAD=1 requires head_dim == head_dim_v == 512"
-            )
+        if cutlass.const_expr(self.smem_ovpad):
+            assert not (self.load_mma_K_halfk or self.load_mma_K_kstage2), "DSA_BL_OVPAD=1 is mutually exclusive with DSA_BL_HALFK/DSA_BL_KSTAGE2"
+            assert self.same_hdim_kv and self.head_dim == 512, "DSA_BL_OVPAD=1 requires head_dim == head_dim_v == 512"
         # Dynamic SMEM bytes requested by the KSTAGE2/OVPAD oversized arms.
         self.oversized_smem_bytes = 280_576
         # Physical stage count of the load_mma_K pipeline (each D-half is
         # its own stage under HALFK).
-        self.load_mma_K_pipe_stage = self.load_mma_K_stage * (2 if self.load_mma_K_halfk else 1)
+        self.load_mma_K_pipe_stage = self.load_mma_K_stage * (2 if cutlass.const_expr(self.load_mma_K_halfk) else 1)
         # self.load_mma_dO_stage = 1
         self.load_compute_LSE_stage = 1
         self.load_compute_sum_OdO_stage = 1
@@ -423,13 +409,10 @@ class FlashAttentionDSABackwardSm100:
         dOT_smem_layout_staged = sm100_utils.make_smem_layout_a(dOP_tiled_mma, self.dOP_cta_tiler, self.element_dtype, self.load_mma_QdO_stage)
         P_smem_layout_staged = sm100_utils.make_smem_layout_b(dOP_tiled_mma, self.dOP_mma_tiler, self.element_dtype, self.compute_mma_P_stage)
         # The P/dS store views live in the compute->mma P/dS buffers and
-        # are indexed by those pipelines' states; under KSTAGE2 they must
-        # not inherit the deepened K stage count (at the shipped stage=1
-        # the two keys coincide, so the default layout is unchanged).
-        P_store_stage = self.compute_mma_P_stage if self.load_mma_K_kstage2 else self.load_mma_K_stage
-        P_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.QK_mma_tiler[:2], P_store_stage
-        )
+        # are indexed by those pipelines' states, so their stage dimensions
+        # must follow the producer pipelines rather than the K-load pipeline.
+        P_store_stage = self.compute_mma_P_stage
+        P_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.QK_mma_tiler[:2], P_store_stage)
         if cutlass.const_expr(self.load_mma_K_halfk):
             # k21 HALFK: half-D A-operand view of the same bytes.  The
             # MN-major SW128 layout also orders N-atoms inner / 64-wide
@@ -459,11 +442,9 @@ class FlashAttentionDSABackwardSm100:
         else:
             QT_tail_smem_layout_staged = None
         dS_smem_layout_staged = sm100_utils.make_smem_layout_b(QdS_tiled_mma, self.QdS_mma_tiler, self.element_dtype, self.compute_mma_dS_stage)
-        # Same K-stage decoupling as P_smem_layout_store_staged above.
-        dS_store_stage = self.compute_mma_dS_stage if self.load_mma_K_kstage2 else self.load_mma_K_stage
-        dS_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.dOV_mma_tiler[:2], dS_store_stage
-        )
+        # Same producer-stage rule as P_smem_layout_store_staged above.
+        dS_store_stage = self.compute_mma_dS_stage
+        dS_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.dOV_mma_tiler[:2], dS_store_stage)
 
         dQ_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.element_dtype, utils.LayoutEnum.from_tensor(mdQ), (self.KdS_mma_tiler[0], self.KdS_mma_tiler[1]), self.mma_compute_dQ_stage
@@ -520,7 +501,7 @@ class FlashAttentionDSABackwardSm100:
         # KSTAGE2 must clear the 227KB compat line; cap at the GR100
         # per-CTA physical limit instead (requests above 232,448B enter
         # the oversized launch mode, priced by the k22 blo1 arm).
-        _max_smem_bytes = 334_848 if self.load_mma_K_kstage2 else 227 * 1024
+        _max_smem_bytes = 334_848 if cutlass.const_expr(self.load_mma_K_kstage2) else 227 * 1024
 
         @cute.struct
         class SharedStorage:
@@ -546,27 +527,19 @@ class FlashAttentionDSABackwardSm100:
             sLSE: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(LSE_smem_layout)], self.non_tma_align_bytes]
             sSum_OdO: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(sum_OdO_smem_layout)], self.non_tma_align_bytes]
 
-        assert (
-            SharedStorage.size_in_bytes() <= _max_smem_bytes
-        ), f"SharedStorage ({SharedStorage.size_in_bytes()} bytes) exceeds {_max_smem_bytes} bytes"
-        if self.load_mma_K_kstage2:
+        assert SharedStorage.size_in_bytes() <= _max_smem_bytes, f"SharedStorage ({SharedStorage.size_in_bytes()} bytes) exceeds {_max_smem_bytes} bytes"
+        if cutlass.const_expr(self.load_mma_K_kstage2):
             # G0 alias gate (DATAFLOW_REDESIGN_20260811 §1.2/§3.3): the
             # stage=2 struct must land exactly on the aliases-preserved
             # account (base 215,040 + one 65,536B K stage = 280,576;
             # 296,960 is the tolerated fallback with the sP/sdS store
             # buffers doubled).  Anything else means a zero-byte view
             # materialized -- stop and re-audit before burning a window.
-            assert SharedStorage.size_in_bytes() in (280_576, 296_960), (
-                f"KSTAGE2 alias audit failed: SharedStorage "
-                f"{SharedStorage.size_in_bytes()}B not in {{280576, 296960}}"
-            )
-        if self.smem_ovpad:
+            assert SharedStorage.size_in_bytes() == 280_576, f"KSTAGE2 alias audit failed: SharedStorage {SharedStorage.size_in_bytes()}B != 280576B"
+        if cutlass.const_expr(self.smem_ovpad):
             # OVPAD leaves the struct bit-identical to the shipped
             # stage=1 layout; only the launch request grows.
-            assert SharedStorage.size_in_bytes() == 215_040, (
-                f"OVPAD expects the shipped 215,040B struct, got "
-                f"{SharedStorage.size_in_bytes()}B"
-            )
+            assert SharedStorage.size_in_bytes() == 215_040, f"OVPAD expects the shipped 215,040B struct, got " f"{SharedStorage.size_in_bytes()}B"
         self.shared_storage = SharedStorage
 
         sum_OdO, scaled_LSE, mdKV_acc = self.get_workspace_tensor(
@@ -659,7 +632,7 @@ class FlashAttentionDSABackwardSm100:
             # struct (dead tail bytes stay unallocated); the DSL already
             # opts every kernel into max dynamic SMEM, so no further
             # launch-attribute plumbing is needed for the oversized mode.
-            smem=(self.oversized_smem_bytes if self.smem_ovpad else self.shared_storage.size_in_bytes()),
+            smem=(self.oversized_smem_bytes if cutlass.const_expr(self.smem_ovpad) else self.shared_storage.size_in_bytes()),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -686,25 +659,24 @@ class FlashAttentionDSABackwardSm100:
             stream=stream,
         )
 
-        if cutlass.const_expr(self.same_hdim_kv):
-            dSink_grid = (
-                cute.ceil_div(problem_shape[0], self.dSink_block_q),
-                problem_shape[3][0],
-                problem_shape[3][1],
-            )
-            self.sum_dSink(
-                sum_OdO,
-                scaled_LSE,
-                mAttnSink,
-                mdSink,
-                problem_shape,
-            ).launch(
-                grid=dSink_grid,
-                block=[self.dSink_num_threads, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                min_blocks_per_mp=1,
-            )
+        dSink_grid = (
+            cute.ceil_div(problem_shape[0], self.dSink_block_q),
+            problem_shape[3][0],
+            problem_shape[3][1],
+        )
+        self.sum_dSink(
+            sum_OdO,
+            scaled_LSE,
+            mAttnSink,
+            mdSink,
+            problem_shape,
+        ).launch(
+            grid=dSink_grid,
+            block=[self.dSink_num_threads, 1, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
 
     @cute.kernel
     def convert(
@@ -787,21 +759,18 @@ class FlashAttentionDSABackwardSm100:
                     lse_bhq = lse[bidy, (idx_q + offset, bidz)]
                     sum_OdO_bhq = sum_OdO_scale * acc
 
-                    if cutlass.const_expr(self.same_hdim_kv):
-                        attn_sink_bh = attn_sink[bidy, (0, bidz)]
+                    attn_sink_bh = attn_sink[bidy, (0, bidz)]
 
-                        log2_e = -lse_scale
-                        lse_log2 = lse_bhq * log2_e
-                        sink_log2 = attn_sink_bh * log2_e
-                        lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                        sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
-                        lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                        scaled_lse_bhq = -lse_with_sink_log2
+                    log2_e = -lse_scale
+                    lse_log2 = lse_bhq * log2_e
+                    sink_log2 = attn_sink_bh * log2_e
+                    lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
+                    sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
+                    lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
+                    scaled_lse_bhq = -lse_with_sink_log2
 
-                        if lse_bhq == Float32(float("inf")):
-                            scaled_lse_bhq = Float32(float("-inf"))
-                    else:
-                        scaled_lse_bhq = lse_scale * lse_bhq
+                    if lse_bhq == Float32(float("inf")):
+                        scaled_lse_bhq = Float32(float("-inf"))
 
                     sum_OdO[bidy, (idx_q + offset, bidz)] = sum_OdO_bhq
                     scaled_lse[bidy, (idx_q + offset, bidz)] = scaled_lse_bhq
@@ -2162,6 +2131,12 @@ class FlashAttentionDSABackwardSm100:
             mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
             compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
 
+            # The producer state rotates when this pipeline has multiple
+            # stages. Repartition the destination for the current slot;
+            # retaining the pre-loop slice would overwrite slot 0 forever.
+            sP_store_slice = sP_store[None, None, compute_mma_P_producer_state.index]
+            tRS_sP = thr_smem_store_p.partition_D(sP_store_slice)
+
             cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
 
             for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
@@ -2202,6 +2177,9 @@ class FlashAttentionDSABackwardSm100:
 
             mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state)
             compute_mma_dS_pipeline.producer_acquire(compute_mma_dS_producer_state)
+
+            sdS_store_slice = sdS_store[None, None, compute_mma_dS_producer_state.index]
+            tRS_sdS = thr_smem_store_ds.partition_D(sdS_store_slice)
 
             cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
 

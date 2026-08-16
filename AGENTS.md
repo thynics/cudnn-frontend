@@ -88,33 +88,12 @@ First invocation builds the hook environments and can take >5 minutes; later run
 Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
 
 - `skills/cutedsl-kernel-integration/` — integrating a CuTeDSL kernel as a frontend-only Python API end to end (API class, wrapper, exports, docs, tests).
-- `skills/validate-dsa-b200/` — mandatory one-command B200 correctness,
-  release-performance, baseline/candidate IKET, and span-table validation
-  after changing a registered SM100 DSA backward v0, v1, or v... experiment.
-- `skills/fork-dsa-v1-variant/` — create an exact, isolated, user-named copy
-  of the current SM100 DSA backward v1 before experimental development.
-- `skills/merge-dsa-canonical-locked/` — promote an experiment into canonical
-  DSA backward v0 or v1 while holding the target's exclusive lock through
-  edit, commit, push, and mandatory B200 validation.
 
-After completing any SM100 DSA backward implementation change, the agent must
-read `skills/validate-dsa-b200/SKILL.md` and invoke its repository command with
-the exact implementation token. Do not replace it with manual source
-synchronization, allocation, Docker, correctness, benchmark, trace, or
-aggregation commands, and do not copy an experiment over v1 merely to test it.
-
-When a user asks to explore a named `v...` candidate from current v1, read
-`skills/fork-dsa-v1-variant/SKILL.md` before touching kernel code. Create the
-candidate with its bundled script, then keep all experimental changes in that
-copy. The untouched byte-identical fork is setup and does not itself require a
-B200 run.
-
-When a user asks to merge or promote an experiment into canonical SM100 DSA
-backward v0 or v1, read `skills/merge-dsa-canonical-locked/SKILL.md` and
-acquire that target's lock with its bundled script before reading or changing
-the canonical file for the merge. Hold the lock through commit, push, and the
-mandatory B200 validation; release it before blocking on user input or ending
-the task.
+DSA kernel changes must preserve architecture fallback and run the matching
+tests under `test/python/fe_api/dsa/` on every affected architecture. Keep
+experimental variants and performance artifacts outside the production package;
+the historical SM100/Rubin exploration is retained on
+`archive/dsa_bwd_rubin_experiments_20260816`.
 
 ## Links
 

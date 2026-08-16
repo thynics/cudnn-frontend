@@ -1,4 +1,0 @@
-interface:
-  display_name: "Fork DSA v1 Variant"
-  short_description: "Create an isolated DSA experiment from current v1"
-  default_prompt: "Use $fork-dsa-v1-variant to create a named experimental copy of the current DSA v1."

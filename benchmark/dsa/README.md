@@ -1,160 +1,46 @@
-# DSA Sparse Attention Backward Benchmark
+# DSA sparse-attention backward benchmark
 
-Microbenchmark for the DeepSeek Sparse Attention (DSA) backward kernel in the
-cuDNN Frontend CuTe DSL package, driven through the public
-`cudnn.DSA.sparse_attention_backward_wrapper` API. The wrapper dispatches to
-the Hopper (SM90) or Blackwell (SM100) implementation based on the active
-CUDA device.
+This benchmark drives the public
+`cudnn.DSA.sparse_attention_backward_wrapper` API. Dispatch is automatic:
 
-## What is measured
+- SM90 uses the Hopper implementation.
+- SM100/SM103 use the Blackwell implementation.
+- SM107 uses the Rubin implementation only for its validated performance
+  envelope; every other shape falls back to the SM100 implementation.
 
-Inputs are flat FlashMLA-shaped tensors: `q (S_q, H, d_qk)`, a shared
-`kv (S_kv, d_qk)` buffer (K = V), and per-query global top-k indices
-`topk_idxs (S_q, topk)` with unique random indices per query row. The forward
-`out`/`lse` consumed by the backward kernel come from a chunked PyTorch
-reference, since the production forward (FlashMLA) is out of scope for this
-repository.
+The Rubin envelope is BF16, `H=128`, `Dqk=Dv=512`, `S_kv=4096`, block tile
+64, and `topk` 512, 1024, or 2048. Runtime `topk_length` remains fully
+supported. `topk` 128 and 256 deliberately use the fallback because the
+two-CTA kernel is slower at those sizes.
 
-Each timed iteration is one full wrapper call — gradient-buffer zeroing,
-workspace allocation, and the preprocess/backward/convert kernels — i.e. the
-cost a training step pays per backward invocation. Timing uses a single
-CUDA-event window around `--repeat` iterations and reports the average.
-
-Reported TFLOPS use the 5-matmul model of the backward pass (recompute S, dV,
-dP, dQ, dK):
-
-```
-FLOPs = 2 * S_q * H * topk * (3 * d_qk + 2 * d_v)
-```
-
-## Requirements
-
-- Hopper (SM90) or Blackwell (SM100) GPU
-- PyTorch with CUDA support
-- `pip install nvidia-cudnn-frontend[cutedsl]` (or a development install of
-  this repository's `python/` package with the `cutedsl` extra)
-
-## How to run
-
-### B200 correctness + performance + IKET
-
-The repository entry point below selects a registered self-contained
-implementation after synchronizing the fixed Computelab worktree with
-`git pull --ff-only`. Canonical `v0`/`v1` and experimental `v...` modules
-created by `skills/fork-dsa-v1-variant` use the same command. It pairs the
-selected implementation with
-`dsa_bwd_sm100_baseline.py`, serializes concurrent callers through the single
-global B200 manager, and runs the canonical correctness, uninstrumented
-performance, and two-trace IKET pipeline:
+## Run
 
 ```bash
-./benchmark/dsa/run_b200_pipeline.sh --impl v1
+python benchmark/dsa/benchmark_dsa_sparse_attention_backward.py
 ```
 
-For example, after creating, developing, committing, and pushing `vt2a`:
+For the Rubin path, use:
 
 ```bash
-./benchmark/dsa/run_b200_pipeline.sh --impl vt2a
+python benchmark/dsa/benchmark_dsa_sparse_attention_backward.py \
+  --seqlens 4096 \
+  --topks 512,1024,2048 \
+  --nheads 128 \
+  --head-dim 512
 ```
 
-This selects
-`dsa_bwd_sm100_2cta_vt2a.py` directly; it does not overwrite canonical v1.
-It streams every stage to the terminal. On success it downloads only compact
-JSON summaries and the two-table Markdown report, then prints that report.
-Raw baseline and candidate traces remain in Computelab scratch. On failure it
-returns the remote non-zero exit code and downloads stage status plus bounded
-log tails when those artifacts exist.
+Useful options include `--dtype`, `--no-topk-length`, `--warmup`, `--repeat`,
+and `--csv`. The first warmup iteration compiles the selected CuTe DSL
+specialization.
 
-Useful options:
+Inputs use the flat FlashMLA contract: `q (S_q,H,D)`, shared `kv (S_kv,D)`,
+and `topk_idxs (S_q,topk)`. Reference forward produces the `out` and KV-only
+`lse` consumed by backward. Reported FLOP/s uses the five-matmul model:
 
-```bash
-./benchmark/dsa/run_b200_pipeline.sh \
-  --impl v0 \
-  --note reducer-check \
-  --output-dir /path/to/lightweight-results
+```text
+FLOPs = 2 * S_q * H * topk * (3 * Dqk + 2 * Dv)
 ```
 
-The default local result directory is `.dsa_b200_results/<run-id>/`.
-The global manager keeps one `crun` allocation and one Docker container alive
-for reuse. If it has not been created yet, the same command blocks while the
-manager allocates a B200 and deploys the container. Callers never attach to or
-manage the allocation directly; lock release is automatic on every exit path.
-
-Default sweep (`seqlens 4096,8192 x topks 128,512,1024,2048`, bf16,
-`d_qk = d_v = 512`, 64 heads):
-
-```bash
-python benchmark_dsa_sparse_attention_backward.py
-```
-
-Custom shapes and CSV output:
-
-```bash
-python benchmark_dsa_sparse_attention_backward.py --seqlens 4096,8192,16384 --topks 512,2048 --csv results.csv
-python benchmark_dsa_sparse_attention_backward.py --head-dim 576   # 512 value dims + 64 RoPE dims
-```
-
-Options:
-
-- `--seqlens` — comma-separated total query lengths; `seqlen_kv = seqlen_q`
-  for every config. Configs with `topk > seqlen_kv` are skipped.
-- `--topks` — comma-separated top-k values.
-- `--nheads` — number of query heads (default 64).
-- `--head-dim` — QK head dim, `512` or `576`; `head_dim_v` is derived (512).
-- `--dtype` — `bfloat16` (default) or `float16`.
-- `--no-attn-sink` — disable the attention sink (passes `-inf` sink logits).
-- `--no-topk-length` — omit the `topk_length` tensor. Kernels with and
-  without `topk_length` are different compiled variants; the default
-  benchmarks the `topk_length` variant with every row at the full top-k
-  count.
-- `--warmup` / `--repeat` — iterations per config (defaults 10 / 50; the
-  first warmup iteration also triggers kernel compilation).
-- `--csv` — write results to a CSV file.
-
-## Results
-
-### B200
-
-Generated on an NVIDIA B200 with the default
-sweep settings (`nheads=64`, `d_qk = d_v = 512`, bf16, attention sink and
-`topk_length` enabled, `warmup=10`, `repeat=50`), using `torch 2.12.1`,
-`nvidia-cutlass-dsl 4.5.2`, and `nvidia-cudnn-frontend` built from this
-repository.
-
-| seqlen_q | seqlen_kv | topk | BWD ms | BWD TFLOPS |
-|---------:|----------:|-----:|-------:|-----------:|
-|     4096 |      4096 |  128 |  0.563 |     305.09 |
-|     4096 |      4096 |  512 |  1.243 |     552.87 |
-|     4096 |      4096 | 1024 |  2.198 |     625.35 |
-|     4096 |      4096 | 2048 |  4.168 |     659.46 |
-|     8192 |      8192 |  128 |  1.094 |     313.97 |
-|     8192 |      8192 |  512 |  2.489 |     552.16 |
-|     8192 |      8192 | 1024 |  4.538 |     605.76 |
-|     8192 |      8192 | 2048 |  8.562 |     642.06 |
-
-## Profiling
-
-`profile` mode runs a single warmed-up backward call (using the first value
-of `--seqlens` and the last value of `--topks`) wrapped in
-`cudaProfilerStart/Stop` and an NVTX range, so nsys/ncu capture only the
-kernels of interest:
-
-```bash
-nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi --capture-range-end=stop -o dsa_bwd \
-  python benchmark_dsa_sparse_attention_backward.py profile --seqlens 8192 --topks 2048
-
-ncu --profile-from-start off -o dsa_bwd \
-  python benchmark_dsa_sparse_attention_backward.py profile --seqlens 8192 --topks 2048
-```
-
-## B200 管线卡死处置口诀（2026-07-31 实战沉淀）
-
-1. **4h 服务额度到期**（`salloc ... exceeded its time limit` / `SERVICE_OWNER_EXIT rc=143`）：
-   直接原样重跑即可，新服务会冷启动（容器拉取 ~10-15 分钟）。
-2. **重跑后卡在 `B200_MANAGER_LOCK_WAIT` 超过 ~10 分钟**：额度到期的强杀会留下
-   stale `manager.lock`（computelab:/home/scratch.longcheng_gpu/dsa-b200-global-service/）。
-   处置：先 `cat` 锁文件核对持有者 pid 已死，再删除。
-   **注意**：删锁叫不醒已经在等的进程（flock 挂在旧 inode）——必须把卡住的
-   `run_b200_pipeline.sh` 进程一并 kill 掉重投，新进程才能拿到锁。
-3. 观察工具：haifa 上 `ps -eo pid,etime,cmd | grep run_b200_pipeline` 看运行时长；
-   `tail /tmp/dsa-b200-client.*.log` 看卡在哪个阶段（LOCK_WAIT/SERVICE/PHASE）。
+Historical kernels, trace tooling, and experiment-specific runners are kept
+on `archive/dsa_bwd_rubin_experiments_20260816`; they are intentionally not
+part of the production feature branch.

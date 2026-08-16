@@ -1,8 +1,8 @@
 """APIBase wrapper for DeepSeek Sparse Attention backward.
 
-The wrapper dispatches to the Hopper (SM90) or Blackwell (SM100) CuTe DSL
-implementation based on the active CUDA device. It consumes the ``out`` and
-``lse`` tensors produced by the DSA sparse-attention forward path.
+The wrapper dispatches to the Hopper (SM90), Blackwell (SM100), or a
+shape-specialized Rubin (SM107) CuTe DSL implementation. It consumes the
+``out`` and ``lse`` tensors produced by the DSA sparse-attention forward path.
 """
 
 from __future__ import annotations
@@ -15,6 +15,49 @@ import cuda.bindings.driver as cuda
 from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
+from ._dispatch import (
+    SM100_IMPLEMENTATION,
+    SM107_IMPLEMENTATION,
+    SM90_IMPLEMENTATION,
+    select_sparse_attention_backward_implementation,
+)
+
+
+def _device_capability(device: torch.device) -> Tuple[int, int]:
+    if device.type != "cuda":
+        return (-1, -1)
+    return tuple(torch.cuda.get_device_capability(device))
+
+
+def _select_implementation(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    block_tile: int,
+    capability: Tuple[int, int],
+) -> str:
+    inputs = (q, kv, out, dout, lse, attn_sink, topk_idxs)
+    return select_sparse_attention_backward_implementation(
+        capability=capability,
+        device_type=q.device.type,
+        all_inputs_same_device=all(tensor.device == q.device for tensor in inputs),
+        q_dtype=q.dtype,
+        kv_dtype=kv.dtype,
+        out_dtype=out.dtype,
+        dout_dtype=dout.dtype,
+        q_shape=q.shape,
+        kv_shape=kv.shape,
+        out_shape=out.shape,
+        dout_shape=dout.shape,
+        lse_shape=lse.shape,
+        attn_sink_shape=attn_sink.shape,
+        topk_idxs_shape=topk_idxs.shape,
+        block_tile=block_tile,
+    )
 
 
 class SparseAttentionBackward(APIBase):
@@ -46,7 +89,11 @@ class SparseAttentionBackward(APIBase):
         self.softmax_scale = softmax_scale
 
     def check_support(self) -> bool:
-        major, _ = torch.cuda.get_device_capability()
+        self._runtime_error_if(
+            self.q_desc.device.type != "cuda",
+            f"SparseAttentionBackward requires CUDA tensors, found {self.q_desc.device}",
+        )
+        major, _ = _device_capability(self.q_desc.device)
         self._runtime_error_if(
             major < 9,
             f"SparseAttentionBackward requires SM90+, found SM{major}",
@@ -94,9 +141,20 @@ class SparseAttentionBackward(APIBase):
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        major, _ = torch.cuda.get_device_capability()
+        capability = _device_capability(q.device)
+        implementation = _select_implementation(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            self.block_tile,
+            capability,
+        )
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
-        if major == 9:
+        if implementation == SM90_IMPLEMENTATION:
             from . import _interface_sm90 as _iface_sm90
 
             return _iface_sm90.flash_attn_bwd_sm90(
@@ -114,6 +172,24 @@ class SparseAttentionBackward(APIBase):
                 need_d_sink=True,
                 current_stream=current_stream,
             )
+        if implementation == SM107_IMPLEMENTATION:
+            from . import _interface_sm107 as _iface_sm107
+
+            return _iface_sm107.flash_attn_bwd_sm107(
+                q,
+                kv,
+                out,
+                dout,
+                lse,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=scale,
+                topk_length=topk_length,
+                dq=dq,
+                dkv=dkv,
+                current_stream=current_stream,
+            )
+        assert implementation == SM100_IMPLEMENTATION
         return _iface_sm100.flash_attn_bwd_sm100(
             q,
             kv,
@@ -150,10 +226,25 @@ def sparse_attention_backward_wrapper(
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
-    Dispatches to SM90 or SM100 based on the active CUDA device. The returned
-    ``d_sink`` is computed from ``attn_sink`` and ``dout``.
+    Dispatches to SM90, SM100, or the shape-specialized SM107 implementation.
+    The returned ``d_sink`` is computed from ``attn_sink`` and ``dout``.
     """
+    capability = _device_capability(q.device)
+    implementation = _select_implementation(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        int(block_tile),
+        capability,
+    )
     key = (
+        q.device.index,
+        capability,
+        implementation,
         q.dtype,
         q.shape,
         kv.shape,

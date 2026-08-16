@@ -1,4 +1,0 @@
-interface:
-  display_name: "Validate DSA on B200"
-  short_description: "Validate any registered DSA variant on B200"
-  default_prompt: "Use $validate-dsa-b200 to validate a registered DSA implementation on B200."

@@ -242,9 +242,9 @@ def test_DSA_sparse_attention_backward_staged_store():
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
-        pytest.skip("staged-store regression test targets the SM100 kernel")
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("staged-store regression test targets SM100/SM103")
 
     s_q = s_kv = 512
     h, d, topk = 64, 512, 256  # topk/64 = 4 tiles -> the pipelines really cycle

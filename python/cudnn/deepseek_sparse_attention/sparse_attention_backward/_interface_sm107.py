@@ -1,4 +1,7 @@
-# Copyright (c) 2026, Jerry Chen
+"""Internal Rubin interface for the fixed-shape DSA backward kernel."""
+
+from __future__ import annotations
+
 import math
 from typing import Optional, Tuple
 
@@ -10,16 +13,16 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
-from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
-
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
 
 
-def flash_attn_bwd_sm100(
+def _get_rubin_kernel():
+    # Keep Rubin-only DSL features outside every SM90/SM100 import path.
+    from .dsa_bwd_sm107 import FlashAttentionDSABackwardSm107
+
+    return FlashAttentionDSABackwardSm107
+
+
+def flash_attn_bwd_sm107(
     q: torch.Tensor,
     kv: torch.Tensor,
     out: torch.Tensor,
@@ -33,41 +36,29 @@ def flash_attn_bwd_sm100(
     dkv: Optional[torch.Tensor] = None,
     current_stream=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
-
-    Accepts flat (unbatched) tensors with global topk indices.
-    Internally wraps as batch=1 for the CuTe DSL kernel.
-
-    Args:
-        q: (total_S_q, nheads, headdim) bfloat16
-        kv: (total_S_kv, headdim) bfloat16  (K=V, MQA h_kv=1)
-        out: (total_S_q, nheads, headdim_v) bfloat16
-        dout: (total_S_q, nheads, headdim_v) bfloat16
-        lse: (total_S_q, nheads) float32, FlashMLA KV-only LSE excluding sink
-        attn_sink: (nheads,) float32
-        topk_idxs: (total_S_q, topk_max) int32, global indices
-        softmax_scale: float (default: 1/sqrt(headdim))
-        topk_length: (total_S_q,) int32, per-query valid count, optional
-        dq: pre-allocated (total_S_q, nheads, headdim), optional
-        dkv: pre-allocated (total_S_kv, headdim), optional
-
-    Returns:
-        (dq, dkv, d_sink) -- flat layout gradients
-    """
+    """Execute the shape-gated two-CTA Rubin DSA backward kernel."""
     total_S_q, num_head, head_dim = q.shape
     total_S_kv = kv.shape[0]
-    head_dim_v = 512 if head_dim == 576 else head_dim
+    head_dim_v = out.shape[2]
     device = q.device
 
-    assert q.dtype in [torch.float16, torch.bfloat16]
+    assert q.dtype == torch.bfloat16
     assert q.dtype == kv.dtype == out.dtype == dout.dtype
+    assert q.shape == out.shape == dout.shape == (total_S_q, 128, 512)
+    assert kv.shape == (4096, 512)
+    assert lse.shape == (total_S_q, 128)
+    assert attn_sink.shape == (128,)
+    assert topk_idxs.shape[0] == total_S_q
+    assert topk_idxs.shape[1] in (512, 1024, 2048)
     assert lse.dtype == torch.float32
     assert attn_sink.dtype == torch.float32
     assert topk_idxs.dtype == torch.int32
     tensors_to_check = [q, kv, out, dout, lse, attn_sink, topk_idxs]
     if topk_length is not None:
+        assert topk_length.shape == (total_S_q,)
+        assert topk_length.dtype == torch.int32
         tensors_to_check.append(topk_length)
-    assert all(t.is_cuda for t in tensors_to_check)
+    assert all(tensor.is_cuda and tensor.device == device for tensor in tensors_to_check)
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -76,17 +67,16 @@ def flash_attn_bwd_sm100(
     num_head_blocks = (num_head + block_tile - 1) // block_tile
     batch_size = 1
 
-    # Ensure contiguous
-    q, kv, out, dout = [t.contiguous() for t in (q, kv, out, dout)]
+    q, kv, out, dout = [tensor.contiguous() for tensor in (q, kv, out, dout)]
     lse = lse.contiguous()
 
-    # Allocate output tensors
     if dq is None:
         dq = torch.empty_like(q)
     else:
         assert dq.shape == q.shape, f"dq shape mismatch: expected {q.shape}, got {dq.shape}"
         assert dq.dtype == q.dtype, f"dq dtype mismatch: expected {q.dtype}, got {dq.dtype}"
         assert dq.device == device, f"dq device mismatch: expected {device}, got {dq.device}"
+
     if dkv is None:
         dkv = torch.zeros(total_S_kv, head_dim, dtype=kv.dtype, device=device)
     else:
@@ -97,10 +87,10 @@ def flash_attn_bwd_sm100(
         dkv.fill_(0)
     d_sink = torch.zeros_like(attn_sink)
 
-    # Allocate workspace tensors
+    kernel_class = _get_rubin_kernel()
     acc_dtype = cutlass.Float32
     workspace_LSE_OdO = torch.zeros(
-        *FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
+        *kernel_class._get_workspace_size_LSE_OdO(
             total_S_q,
             head_dim,
             num_head,
@@ -110,30 +100,35 @@ def flash_attn_bwd_sm100(
         dtype=torch.uint8,
         device=device,
     )
-
-    ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
-        total_S_kv,
-        head_dim,
-        batch_size,
-        acc_dtype,
-    )
     workspace_dKV = torch.zeros(
-        *ws_dkv_shape,
+        *kernel_class._get_workspace_size_dKV(
+            total_S_kv,
+            head_dim,
+            batch_size,
+            acc_dtype,
+        ),
         dtype=torch.uint8,
         device=device,
     )
 
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
-
-    dtype = torch2cute_dtype_map[q.dtype]
     current_stream = resolve_stream(current_stream)
-
     has_topk_length = topk_length is not None
     max_topk = topk_idxs.shape[1]
     capability = tuple(torch.cuda.get_device_capability(device))
-    compile_key = (device.index, capability, dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
+    compile_key = (
+        device.index,
+        capability,
+        cutlass.BFloat16,
+        head_dim,
+        head_dim_v,
+        num_head,
+        block_tile,
+        max_topk,
+        has_topk_length,
+    )
 
-    if compile_key not in flash_attn_bwd_sm100.compile_cache:
+    if compile_key not in flash_attn_bwd_sm107.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
         kv_tensor = to_cute_tensor(kv, divisibility=head_dim)
         out_tensor = to_cute_tensor(out, divisibility=head_dim_v)
@@ -148,15 +143,15 @@ def flash_attn_bwd_sm100(
         workspace_LSE_OdO_tensor = to_cute_tensor(workspace_LSE_OdO)
         workspace_dKV_tensor = to_cute_tensor(workspace_dKV)
 
-        kernel_obj = FlashAttentionDSABackwardSm100(
+        kernel_obj = kernel_class(
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             block_tile=block_tile,
             max_topk=max_topk,
         )
 
-        with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
-            flash_attn_bwd_sm100.compile_cache[compile_key] = cute.compile(
+        with torch.cuda.nvtx.range("flash_attn_bwd_sm107_compile"):
+            flash_attn_bwd_sm107.compile_cache[compile_key] = cute.compile(
                 kernel_obj,
                 problem_shape,
                 q_tensor,
@@ -177,8 +172,8 @@ def flash_attn_bwd_sm100(
                 options=compile_options(device=device, capability=capability),
             )
 
-    with torch.cuda.nvtx.range("flash_attn_bwd_sm100_kernel"):
-        flash_attn_bwd_sm100.compile_cache[compile_key](
+    with torch.cuda.nvtx.range("flash_attn_bwd_sm107_kernel"):
+        flash_attn_bwd_sm107.compile_cache[compile_key](
             problem_shape,
             q,
             kv,
@@ -200,4 +195,4 @@ def flash_attn_bwd_sm100(
     return dq, dkv, d_sink
 
 
-flash_attn_bwd_sm100.compile_cache = {}
+flash_attn_bwd_sm107.compile_cache = {}

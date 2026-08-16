@@ -17,6 +17,7 @@ DSA ``cute.compile`` call sites should route through it.
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Optional, Tuple
 
 import torch
 
@@ -33,24 +34,38 @@ _ARCH_MAP = {
 
 
 @lru_cache(maxsize=None)
-def gpu_arch_flag() -> str:
-    """Return the ``sm_XXX`` value for the current CUDA device.
-
-    Cached because torch.cuda.get_device_capability() is cheap but the
-    function gets called inside every cute.compile site.
-    """
-    if not torch.cuda.is_available():
-        raise RuntimeError("cute.compile requires CUDA; no GPU available")
-    cap = torch.cuda.get_device_capability()
-    arch = _ARCH_MAP.get(cap)
+def _gpu_arch_flag_for_capability(capability: Tuple[int, int]) -> str:
+    arch = _ARCH_MAP.get(capability)
     if arch is None:
         raise RuntimeError(
-            f"Unsupported GPU compute capability {cap} for DSA CuTe kernels. " f"Add it to deepseek_sparse_attention/utils/compiler.py::_ARCH_MAP."
+            f"Unsupported GPU compute capability {capability} for DSA CuTe kernels. " "Add it to deepseek_sparse_attention/utils/compiler.py::_ARCH_MAP."
         )
     return arch
 
 
-def compile_options(extra: str = "") -> str:
+def gpu_arch_flag(device: Optional[object] = None, capability: Optional[Tuple[int, int]] = None) -> str:
+    """Return the architecture flag for ``device`` or an explicit capability.
+
+    Capability-to-flag conversion is cached, while device resolution happens
+    on every call.  This avoids reusing the first active device's architecture
+    in a process that switches devices or contains mixed GPU generations.
+    """
+    if capability is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("cute.compile requires CUDA; no GPU available")
+        capability = torch.cuda.get_device_capability(device)
+    normalized_capability = tuple(int(value) for value in capability)
+    if len(normalized_capability) != 2:
+        raise ValueError(f"Invalid GPU compute capability: {capability}")
+    return _gpu_arch_flag_for_capability(normalized_capability)
+
+
+def compile_options(
+    extra: str = "",
+    *,
+    device: Optional[object] = None,
+    capability: Optional[Tuple[int, int]] = None,
+) -> str:
     """Build the ``options=`` string for ``cute.compile``.
 
     Always emits ``--enable-tvm-ffi`` and a runtime-chosen ``--gpu-arch``;
@@ -59,7 +74,7 @@ def compile_options(extra: str = "") -> str:
     Example:
         cute.compile(..., options=compile_options("--opt-level 3"))
     """
-    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch_flag()}"]
+    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch_flag(device=device, capability=capability)}"]
     if extra:
         parts.append(extra)
     return " ".join(parts)
