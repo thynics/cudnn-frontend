@@ -104,3 +104,46 @@ nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi --capture-range-end=st
 ncu --profile-from-start off -o dsa_bwd \
   python benchmark_dsa_sparse_attention_backward.py profile --seqlens 8192 --topks 2048
 ```
+
+## H128 two-CTA candidate A/B
+
+`benchmark_dsa_sparse_attention_backward_ab.py` compares the current H128
+two-CTA specialization with the canonical generic implementation loaded from
+the pinned upstream `606e16f9` interface blob. Both run through the public
+wrapper in one process with identical inputs. Four independent treatment arms
+use Williams-order balancing, private CUDA Graph pools, duplicate drift
+controls, raw samples, and paired bootstrap confidence intervals.
+
+The runner is fail-closed on a clean 148-SM B200, CuTe DSL 4.5.2, MIG disabled,
+and no foreign process on the selected GPU UUID. Inputs use the benchmark's
+canonical seeded per-row random ordering. Write each result to a new path
+outside the checkout so the clean-tree and immutable-evidence audits remain
+valid:
+
+```bash
+python benchmark_dsa_sparse_attention_backward_ab.py \
+  --output /path/to/results/dsa_bwd_h128_2cta_ab.json
+```
+
+Use reduced settings only as a smoke test; they are not publication evidence:
+
+```bash
+python benchmark_dsa_sparse_attention_backward_ab.py \
+  --seqlens 4096 --topks 128 --length-modes full \
+  --modes eager_hot --graph-calls 2 \
+  --warmup-windows 0 --measured-windows 1 \
+  --correctness-calls 2 --bootstrap-samples 100 \
+  --output /path/to/results/smoke.json
+```
+
+Run the separate strict precision audit before making a performance claim. It
+uses analytical FP32 references with TF32 disabled, three fixed seeds, both
+top-k-length paths, all four specialized widths, and 50 unsynchronized repeats
+per implementation. It also
+reports baseline/baseline and candidate/candidate jitter rather than treating
+the upstream `5e-2` tolerance as proof of equal precision:
+
+```bash
+NVIDIA_TF32_OVERRIDE=0 python check_dsa_sparse_attention_backward_precision_ab.py \
+  --output /path/to/results/dsa_bwd_h128_2cta_precision.json
+```
