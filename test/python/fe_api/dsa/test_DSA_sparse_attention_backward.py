@@ -77,6 +77,120 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_h128_two_cta_dispatch_is_fail_closed():
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    supported = {
+        "head_dim_v": 512,
+        "dtype": torch.bfloat16,
+        "max_topk": 512,
+        "device_capability": (10, 0),
+    }
+    for max_topk in (128, 512, 1024, 2048):
+        assert _select_sm100_backend(128, 512, **{**supported, "max_topk": max_topk}) == ("h128_2cta_m64", 64)
+
+    assert _select_sm100_backend(128, 512) == ("generic_m64", 64)
+
+    fallback_cases = [
+        {**supported, "head_dim_v": 256},
+        {**supported, "dtype": torch.float16},
+        {**supported, "max_topk": 0},
+        {**supported, "max_topk": 64},
+        {**supported, "max_topk": 513},
+        {**supported, "max_topk": 2112},
+        {**supported, "device_capability": (10, 3)},
+    ]
+    for kwargs in fallback_cases:
+        assert _select_sm100_backend(128, 512, **kwargs) == ("generic_m64", 64)
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
+@torch_fork_set_rng(seed=20260829)
+def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_oob_indices(has_topk_length):
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("B200/SM100 required for the H128 two-CTA specialization")
+
+    s_q, s_kv, num_heads, head_dim, topk = 4, 192, 128, 512, 128
+    device = "cuda"
+    dtype = torch.bfloat16
+    q = torch.randn(s_q, num_heads, head_dim, dtype=dtype, device=device)
+    kv = torch.randn(s_kv, head_dim, dtype=dtype, device=device)
+    dout = torch.randn_like(q)
+    attn_sink = torch.linspace(-1.5, 1.5, num_heads, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+
+    # Positive out-of-range entries are inactive under the public reference
+    # contract, exactly like -1 sentinels.  Keep at least one valid active
+    # entry in every row so this exercises the normal pipeline rather than the
+    # empty-row fast path.
+    topk_idxs[0, 1] = s_kv
+    topk_idxs[1, 7] = torch.iinfo(torch.int32).max
+    topk_idxs[2, 31] = s_kv + 17
+    topk_idxs[3, 127] = s_kv
+    topk_length = None
+    if has_topk_length:
+        topk_length = torch.tensor([2, 64, 65, 128], dtype=torch.int32, device=device)
+
+    softmax_scale = head_dim**-0.5
+    out, lse = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    dq = torch.full_like(q, float("nan"))
+    dkv = torch.full_like(kv, float("nan"))
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        dq=dq,
+        dkv=dkv,
+        stream=stream,
+    )
+
+    assert not torch.isnan(result["dq"]).any()
+    assert not torch.isnan(result["dkv"]).any()
+    assert not torch.isnan(result["d_sink"]).any()
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        result["dq"],
+        result["dkv"],
+        result["d_sink"],
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+    )
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_sparse_attention_backward_params
 def test_DSA_sparse_attention_backward_wrapper(
