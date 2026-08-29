@@ -4,44 +4,43 @@ This is a working evidence checklist for the H128/D512 two-CTA specialization.
 It is not an upstream PR description and should be updated only with results
 produced from the final integrated source.
 
-## 2026-08-29 strict B200 review outcome
+## 2026-08-29 hierarchical dSink repair outcome
 
-**Status: not ready for an upstream PR under the no-precision-regression
-policy.** The specialization has a clear, reproducible performance win, and
-all final regression tests pass, but its per-query dSink atomic reduction has
-measurable repeat jitter that the upstream hierarchical reduction does not.
+**Status: precision and performance gates pass; ready for final maintainer
+review in our fork.** No NVIDIA PR has been created. The main computation
+remains genuine two-CTA/CG2. dSink now uses the upstream-equivalent 256-query
+FP32 reduction tree instead of per-query atomics.
 
 Evidence source:
 
-- Product/evidence commit: `cc7808b2d81d306d948c49c006ca9e4d6d73c1a0`.
-- Final test-only commit: `85e08e97081e846da69810436b069bc9dfff68d8`.
-- The test-only commit scales the active-OOB test inputs by `1/10`; it does
-  not change the candidate kernel, interface, tolerance, or performance path.
-- Candidate kernel SHA256: `3aaf47fc340036208ad1c986dc1c56e5a4454d1579a16791dc3a7914002974e2`.
+- Product/evidence commit: `b6d003bb7fb41c0b7ed694743e48fa4f61c82536`.
+- Repair branch: `perf/dsa-bwd-sm100-2cta-hier-dsink`.
+- Candidate kernel SHA256: `19fbbd6b32a9b645c98f019be62a5696be1983938a4bd074cf56b648183d7d58`.
+- Candidate interface SHA256: `8473f9b021ba50a9c80be9bb80c6ff21bcb90fbf7ea2ca78e1f992e4b22981e9`.
 - Baseline: current upstream `develop` at
   `606e16f9786ea7a13e0462c8a63edf0d7f72ae85`.
 - Raw artifacts are retained outside the checkout under
-  `/home/longcheng/cudnn-frontend-dsa-bwd-results-20260829/`.
-- SHA256: precision `d9c79301...a079f`, Graph50/full
-  `8eaebcd0...7be7`, eager60 `7e6e37a5...60ef`, cold200
-  `a8334195...3cb8`.
+  `/home/longcheng/cudnn-frontend-dsa-bwd-hier-results-20260829/`.
+- SHA256: precision `63297000...ff07`, Graph50/full
+  `05df7b77...e659`, eager-hot200 `3bcea921...79f`.
 
 Environment:
 
 - NVIDIA B200, 148 SMs, UUID
-  `GPU-4cd39877-8085-3aa4-ae91-ec13810fa7a7`, MIG disabled.
-- Driver `595.58.03`; CUDA/NVCC `13.3`; PyTorch
+  `GPU-bede695e-f6aa-70af-f9e6-ae482b31a8b4`, MIG disabled.
+- Driver `610.57.04`; CUDA/NVCC `13.3`; PyTorch
   `2.13.0a0+9186a08b2c.nv26.07`; cuDNN backend `9.24.0`.
 - CuTe DSL exactly `4.5.2`; active `libs-cu13` IR/runtime hashes were checked
   against the pinned wheel (`73b760...f6d8` and `deb32d...0a1`).
 - The selected GPU UUID had no foreign compute process before or after each
   measured case.
 
-The first 4.5.2 smoke exposed a flattening-only integration bug:
+The original 4.5.2 smoke exposed a flattening-only integration bug:
 `from __future__ import annotations` stringified the local `@cute.struct`
 `MemRange` fields. CuTe DSL 4.5.2 intentionally consumes concrete annotation
 objects. Removing that future import restored the original AVO behavior; it
 does not alter arithmetic or the two-CTA topology. This was not a backend bug.
+The repaired run compiled and executed on the same pinned 4.5.2 backend.
 
 ### Performance versus current upstream
 
@@ -52,67 +51,65 @@ drift gate of +/-0.5%.
 
 | Mode | Equal-weight geomean speedup | 95% CI | Duplicate-drift validity |
 | --- | ---: | ---: | --- |
-| Graph50, 20 windows | `1.16222x` | `[1.16208, 1.16235]` | valid, 16/16 cases |
-| Eager hot, 60-window confirmation | `1.18395x` | `[1.18381, 1.18408]` | valid, 16/16 cases |
-| Eager cold-L2, 200-window confirmation | `1.18204x` | `[1.18179, 1.18242]` | invalid: 1/16 duplicate CI too wide |
+| Graph50, 20 windows | `1.15158x` | `[1.15146, 1.15170]` | valid, 16/16 cases |
+| Eager hot, 200-window confirmation | `1.18146x` | `[1.18135, 1.18157]` | valid, 16/16 cases |
+| Eager cold-L2, 20 windows | `1.17742x` | `[1.17712, 1.17771]` | invalid: 2/16 duplicate CIs too wide |
 
 Every per-shape point estimate and 95% speedup interval is above `1.0x`.
-Valid-mode per-shape speedups range from `1.03328x` to `1.43251x` for eager
-hot and from `1.03667x` to `1.33329x` for Graph50. The gain is much larger
-without `topk_length` (eager geomean `1.34370x`) than with a full-length
-tensor (`1.04318x`). The cold-L2 point estimate is retained as exploratory
-only: its one invalid case had a duplicate point ratio of `1.00438`, inside
-the bound, but a noise-broadened CI of `[0.99958, 1.01337]`.
+Valid-mode per-shape speedups range from `1.03261x` to `1.43897x` for eager
+hot and from `1.03307x` to `1.30955x` for Graph50. The gain remains much
+larger without `topk_length` (eager geomean `1.34164x`) than with a
+full-length tensor (`1.04042x`). Cold-L2 remains exploratory because its
+duplicate-arm validity gate did not pass.
+
+Relative to the rejected per-query-atomic candidate, the repair retains
+`99.79%` of eager speedup and `99.08%` of Graph50 speedup. The tested launch
+order swap changed the two critical-case geomean by less than `0.01%`; the
+historical `main -> dKV convert -> dSink reduce` order was retained.
 
 ### Strict precision result
 
 The audit covers three seeds, all four dispatched top-k widths, both
 topk-length paths, and 50 unsynchronized repeats of each implementation. TF32
-was disabled at process start and in PyTorch. All 24 cases pass the existing
-`atol=rtol=5e-2` upstream correctness gate, and dQ is bitwise repeatable.
+was disabled at process start and in PyTorch. The supplied-out/LSE dSink
+contract is evaluated in FP64. All 24 cases pass the hard precision gate and
+the existing `atol=rtol=5e-2` sanity gate.
 
 | Quantity | Candidate versus baseline |
 | --- | --- |
-| dQ RMS / rel-L2 | better in 24/24 cases; max-abs is worse in 4/24 cases |
-| dKV | identical max-abs; RMS/rel-L2 split 12 better / 12 worse; worst repeat jitter is higher (`0.001953125` vs `0.0009765625` max-abs) |
-| dSink, supplied-out/LSE contract oracle | better in 24/24; worst rel-L2 `6.80e-7` vs baseline `2.15e-3` |
-| dSink, mathematical FP32 oracle | RMS/rel-L2 better in 24/24; max-abs worse in 4/24 |
-| dSink repeat jitter | nonzero in 24/24 candidate cases, zero in 24/24 baseline cases; candidate worst max-abs `2.24e-8` |
+| dQ | bitwise stable; worst rel-L2 `2.2271e-3` vs baseline `2.2311e-3` |
+| dKV | same FP32-atomic/BF16-output path; worst rel-L2 `2.402776e-3` vs baseline `2.402836e-3` |
+| dSink, supplied-out/LSE FP64 contract | better in 24/24; worst rel-L2 `5.50e-7` vs baseline `2.153e-3` |
+| dSink repeatability at Q=257 | bitwise stable in 24/24 cases; zero hard jitter regressions |
+| Hard precision verdict | `complete`, `precision_claim_eligible=true` |
 
-At the real performance sequence lengths, candidate dSink is also much closer
-to the supplied BF16-out/FP32-LSE contract oracle: the worst single-call
-max-abs error is `4.02e-7` versus baseline `3.32e-4`. This improvement comes
-from promoting O and dO before the FP32 FMA. It does not remove the strict
-repeatability regression caused by changing the cross-query reduction tree.
+At Q=4096/8192, 50 interleaved repeats show the repaired candidate inside the
+baseline dSink jitter envelope. For top-k128, candidate spans are
+`4.47e-8/5.96e-8` versus baseline `4.47e-8/7.45e-8`; for top-k2048 both are
+about `1e-9`. Candidate FP64 max error is `3.8e-8--5.8e-8` for top-k128,
+versus baseline `1.6e-4--4.5e-4`.
 
-The upstream kernel first reduces each 256-query window in a fixed FP32 warp
-tree and issues 16/32 atomics per head for Q=4096/8192. The candidate issues
-4096/8192 per-query FP32 atomics per head. The dtype is unchanged, but the
-addition depth and ordering are not; therefore the current candidate cannot
-be described as having no precision regression.
-
-Recommended repair: keep the main CG2 kernel and its exact `(2,1,1)` cluster,
-write FP32 `sum_OdO` and `scaled_LSE` partials, then reuse the upstream
-256-query `sum_dSink` reduction. This adds one launch and `8*Q*H` bytes of
-workspace (4 MiB at Q=4096, 8 MiB at Q=8192) while restoring the established
-dSink reduction topology. The complete public-call performance comparison
-must then be rerun.
+The repair keeps candidate FP32 O*dO, publishes FP32 `sum_OdO` and
+`scaled_LSE`, and restores the upstream 256-query/32-thread warp tree. It
+issues 16/32 dSink atomics per head at Q=4096/8192, adds one launch, and uses
+`8*Q*H` workspace bytes (4/8 MiB). The core two-CTA computation is unchanged.
 
 ### Correctness and compatibility
 
 - Exact H128 gate: `13 passed`, zero skipped/deselected.
-- Whole DSA backward L0/L1 file: `39 passed`, one legitimate SM90-only skip.
+- Hierarchical dSink FP64/tail/repeatability regression: `1 passed`.
+- Whole DSA backward L0/L1 file: `40 passed`, one legitimate SM90-only skip.
 - A real H128/top-k513 call routed to and executed `generic_m64` successfully.
 - Two independent CUDA streams, each with 20 back-to-back candidate calls,
-  passed; dQ matched bitwise and dKV/dSink stayed within `1e-4` rel-L2 of the
-  serial controls.
+  passed; dQ matched bitwise, dSink matched exactly, and dKV stayed within
+  `1e-4` rel-L2 of the serial controls.
 - Direct poisoned outputs, 50-call bursts, and CUDA Graph checks before and
   after timing passed in all 16 performance cases.
 
 ## Source and target
 
 - Target repository base: `NVIDIA/cudnn-frontend` `develop` at `606e16f9`.
-- Preparation branch: `perf/dsa-bwd-sm100-2cta-g56`.
+- Preparation branch: `perf/dsa-bwd-sm100-2cta-hier-dsink`.
 - Source repository snapshot: `avo-sparse-attention` at `409b900a`.
 - Measured AVO source snapshot: `90cf2666`.
 - Candidate lineage recorded by the source repository: `cf63f86d`.
@@ -209,7 +206,8 @@ candidate is expected to show:
 - 640 threads per CTA;
 - five main tensor-core products using `CtaGroup.TWO`;
 - 512 TMEM columns and at most 232,448 bytes SMEM per CTA;
-- main kernel plus FP32-dKV conversion launch.
+- main kernel plus FP32-dKV conversion and hierarchical FP32-dSink launches;
+- dSink stats workspace is 4 MiB at Q=4096 and 8 MiB at Q=8192.
 
 ## Environment record
 

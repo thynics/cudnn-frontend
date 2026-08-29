@@ -147,3 +147,50 @@ treating the upstream `5e-2` tolerance as proof of equal precision:
 NVIDIA_TF32_OVERRIDE=0 python check_dsa_sparse_attention_backward_precision_ab.py \
   --output /path/to/results/dsa_bwd_h128_2cta_precision.json
 ```
+
+### Hierarchical dSink repair
+
+The H128 candidate now publishes two FP32 statistics planes from its genuine
+two-CTA main kernel and reduces dSink in a separate 256-query FP32 warp tree.
+This replaces the earlier per-query atomic path while retaining the optimized
+FP32 O-dot-dO calculation. On B200 with CuTe DSL 4.5.2, the strict 24-case
+precision audit reports `precision_claim_eligible=true`. The valid full-matrix
+results versus upstream `606e16f9` are `1.15158x` Graph50 (95% CI
+`[1.15146, 1.15170]`) and `1.18146x` eager-hot (95% CI
+`[1.18135, 1.18157]`). See `SM100_H128_2CTA_PR_PREP.md` for the complete
+protocol and artifact hashes.
+
+#### Final focused test_harness run
+
+```text
+===== cudnn-frontend conftest.py ====
+cuDNN Frontend Version: 1.28.0
+cuDNN Frontend Path: /home/scratch.longcheng_gpu/cudnn-frontend-dsa-bwd-2cta-g56/repo/python/cudnn/__init__.py
+cuDNN Backend Version: 92400
+PyTorch Version: 2.13.0a0+9186a08b2c.nv26.07
+PyTorch Path: /usr/local/lib/python3.12/dist-packages/torch/__init__.py
+PyTorch GPU Name: NVIDIA B200
+PyTorch SM Arch Version: (10, 0)
+PyTorch CUDA Version: 13.3
+PyTorch cuDNN Version: 92400
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /home/scratch.longcheng_gpu/cudnn-frontend-dsa-bwd-2cta-g56/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/scratch.longcheng_gpu/cudnn-frontend-dsa-bwd-2cta-g56/repo/test/python
+configfile: pytest.ini
+plugins: xdist-3.8.0, typeguard-4.5.2, anyio-4.14.2
+collecting ... collected 1 item
+
+test/python/fe_api/dsa/test_DSA_sparse_attention_backward.py::test_DSA_sparse_attention_backward_sm100_h128_hierarchical_dsink_repeatability PASSED [100%]
+
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:1488
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:1488
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+==================================== PASSES ====================================
+PASSED test/python/fe_api/dsa/test_DSA_sparse_attention_backward.py::test_DSA_sparse_attention_backward_sm100_h128_hierarchical_dsink_repeatability
+======================== 1 passed, 2 warnings in 16.50s ========================
+```

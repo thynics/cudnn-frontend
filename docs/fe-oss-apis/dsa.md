@@ -133,6 +133,12 @@ other top-k width retain the existing generic/H16 selection. SM103+ devices do
 not select the B200-only two-CTA path. No backend or tile-size argument is
 required. SM90 continues to use its Hopper-specific implementation.
 
+The H128 specialization keeps the five tensor-core products in one genuine
+two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to a
+temporary workspace, converts the FP32 dKV workspace to the public BF16
+output, and completes dSink with a 256-query FP32 warp-tree reduction. The
+helper launches do not change the two-CTA topology of the core computation.
+
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or SM100; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
 
