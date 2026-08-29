@@ -126,9 +126,13 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
     s_q, s_kv, num_heads, head_dim = 4, topk + 64, 128, 512
     device = "cuda"
     dtype = torch.bfloat16
-    q = torch.randn(s_q, num_heads, head_dim, dtype=dtype, device=device)
-    kv = torch.randn(s_kv, head_dim, dtype=dtype, device=device)
-    dout = torch.randn_like(q)
+    # Match the production-scale inputs used by the DSA benchmark and the
+    # other backward numerical tests while keeping the stricter 1e-2 oracle
+    # tolerance below. This test targets active-OOB masking, not stress-scale
+    # BF16 rounding.
+    q = torch.randn(s_q, num_heads, head_dim, dtype=dtype, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=dtype, device=device) / 10
+    dout = torch.randn_like(q) / 10
     attn_sink = torch.linspace(-1.5, 1.5, num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
 
