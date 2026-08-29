@@ -204,9 +204,9 @@ def flash_attn_bwd_sm100(
             acc_dtype,
         )
         if uses_h128_two_cta:
-            # This specialization fuses O*dO/LSE/dSink into its main kernel;
-            # retain the compile ABI with a never-dereferenced one-byte view.
-            workspace_LSE_OdO = d_sink.view(torch.uint8)[:1]
+            # The main kernel uniquely publishes both FP32 statistics planes;
+            # the hierarchical dSink helper never reads padded query rows.
+            workspace_LSE_OdO = torch.empty(*ws_lse_odo_shape, dtype=torch.uint8, device=device)
         else:
             workspace_LSE_OdO = torch.zeros(
                 *ws_lse_odo_shape,

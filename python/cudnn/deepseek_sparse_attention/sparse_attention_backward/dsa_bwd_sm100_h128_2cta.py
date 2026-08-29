@@ -543,44 +543,6 @@ def _s8_b16_b8_b4_owned(
 
 
 @dsl_user_op
-def _dsink_red_v4_l2_evict_last(
-    destination: cute.Pointer,
-    value0: Float32,
-    value1: Float32,
-    value2: Float32,
-    value3: Float32,
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    destination_i64 = destination.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [
-            destination_i64,
-            Float32(value0).ir_value(loc=loc, ip=ip),
-            Float32(value1).ir_value(loc=loc, ip=ip),
-            Float32(value2).ir_value(loc=loc, ip=ip),
-            Float32(value3).ir_value(loc=loc, ip=ip),
-        ],
-        """{
-        .reg .b64 policy;
-        .reg .v4 .f32 values;
-        createpolicy.fractional.L2::evict_last.b64 policy, 1.0;
-        mov.f32 values.x, $1;
-        mov.f32 values.y, $2;
-        mov.f32 values.z, $3;
-        mov.f32 values.w, $4;
-        red.global.add.L2::cache_hint.v4.f32 [$0], values, policy;
-        }""",
-        "l,f,f,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
 def _avo_cp_async_g2s_b128_index(
     destination: cute.Pointer,
     source: cute.Pointer,
@@ -690,6 +652,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
     TMEM_COLUMNS = 512
     MAX_SMEM_BYTES = 232_448
     QUADRANT_ELEMENTS = H_TILE_CTA * N_TILE_CTA
+    DSINK_BLOCK_Q = 256
+    DSINK_THREADS = 32
 
     THREADS_PER_CTA = 640
     GATHER_WARPS = 4
@@ -1255,15 +1219,30 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
 
     @staticmethod
     def _get_workspace_size_LSE_OdO(q, d, h, b, acc_dtype):
-        # The public compile signature retains a non-null dummy tensor, but
-        # the fused kernel no longer reads or writes statistics workspace.
-        return (1,)
+        q = (q + 7) // 8 * 8
+        # One FP32 plane each for -O*dO and the sink-folded negative LSE.
+        return (b, h, q, 2 * (acc_dtype.width // 8))
 
     @staticmethod
     def _get_workspace_size_dKV(k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
         d = (d + 7) // 8 * 8
         k = (k + 7) // 8 * 8
         return (b, 1, k, d * (acc_dtype.width // 8))
+
+    def _get_stats_workspace(self, workspace: cute.Tensor, total_q: Int32, num_heads: Int32):
+        total_q = cute.round_up(total_q, 8)
+        acc_bytes = self.acc_dtype.width // 8
+        plane_bytes = cute.assume(num_heads * total_q * acc_bytes, divby=acc_bytes * 64)
+        sum_odo_iter = cute.recast_ptr(workspace.iterator, dtype=self.acc_dtype)
+        scaled_lse_iter = cute.recast_ptr(workspace.iterator + plane_bytes, dtype=self.acc_dtype)
+        layout = cute.make_layout(
+            (num_heads, (total_q, 1)),
+            stride=(1, (cute.assume(num_heads, divby=64), 0)),
+        )
+        return (
+            cute.make_tensor(sum_odo_iter, layout),
+            cute.make_tensor(scaled_lse_iter, layout),
+        )
 
     @cute.jit
     def __call__(
@@ -1400,8 +1379,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         dq_cta_shape = (self.D_TILE_CTA, self.H_TILE_CLUSTER, self.N_TILE)
         dq_epi_tile = sm100_utils.compute_epilogue_tile_shape(dq_cta_shape, True, utils.LayoutEnum.ROW_MAJOR, self.acc_dtype)
         dq_tmem_load = sm100_utils.get_tmem_load_op(dq_cta_shape, utils.LayoutEnum.ROW_MAJOR, self.acc_dtype, self.acc_dtype, dq_epi_tile, True)
-        # The fused main kernel computes O*dO, folded LSE, and dSink itself.
-        # Only the FP32 dKV accumulation workspace remains live.
+        sum_odo, scaled_lse = self._get_stats_workspace(
+            workspace_LSE_OdO,
+            mQ.shape[2][0],
+            cute.size(problem_shape[3][0]),
+        )
         mdKV_acc = cute.make_tensor(
             cute.recast_ptr(workspace_dKV.iterator, dtype=self.acc_dtype),
             mdKV.layout,
@@ -1422,7 +1404,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             mTopkLength,
             mLSE,
             mAttnSink,
-            mdSink,
+            sum_odo,
+            scaled_lse,
             mOut,
             mdO,
             Float32(softmax_scale),
@@ -1461,7 +1444,13 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         self.convert_canonical(mdKV_acc, mdKV, mKV.shape[0]).launch(
             grid=[convert_grid_x, 1, 1], block=[self.num_threads_D_convert, self.num_threads_seq, 1], stream=stream
         )
-        # dSink is complete in the main reducer role; no post launch is needed.
+        self.sum_dSink(sum_odo, scaled_lse, mAttnSink, mdSink, problem_shape).launch(
+            grid=(cute.ceil_div(problem_shape[0], self.DSINK_BLOCK_Q), problem_shape[3][0], problem_shape[3][1]),
+            block=[self.DSINK_THREADS, 1, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
 
     @cute.jit
     def _store_dq_epi_scalar_direct(
@@ -2217,35 +2206,38 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             softmax_stats[owned_row, 1] = raw_neg_sum_odo
 
     @cute.jit
-    def _accumulate_dsink(
+    def _publish_dsink_stats(
         self,
-        mAttnSink: cute.Tensor,
-        mdSink: cute.Tensor,
+        sum_odo: cute.Tensor,
+        scaled_lse: cute.Tensor,
         softmax_stats: cute.Tensor,
+        token_idx: Int32,
         batch_idx: Int32,
         rank: Int32,
         reducer_tidx: Int32,
-        scale_softmax: Float32,
     ) -> None:
-        if reducer_tidx < Int32(16):
-            log2_e = Float32(math.log2(math.e))
-            row_base = reducer_tidx * Int32(4)
-            contributions = [None] * 4
-            for row_offset in cutlass.range_constexpr(4):
-                row = row_base + Int32(row_offset)
-                head = rank * Int32(self.H_TILE_CTA) + row
-                sink_log2 = Float32(mAttnSink[head, (0, batch_idx)]) * log2_e
-                p_sink = cute.math.exp2(sink_log2 + softmax_stats[row, 0])
-                contributions[row_offset] = Float32(p_sink) * softmax_stats[row, 1]
-            first_head = rank * Int32(self.H_TILE_CTA) + row_base
-            destination = mdSink.iterator + mdSink.layout((first_head, (0, batch_idx)))
-            _dsink_red_v4_l2_evict_last(
-                destination,
-                contributions[0],
-                contributions[1],
-                contributions[2],
-                contributions[3],
-            )
+        if reducer_tidx < Int32(self.H_TILE_CTA):
+            row = reducer_tidx
+            head = rank * Int32(self.H_TILE_CTA) + row
+            sum_odo[head, (token_idx, batch_idx)] = softmax_stats[row, 1]
+            scaled_lse[head, (token_idx, batch_idx)] = softmax_stats[row, 0]
+
+    @cute.kernel
+    def sum_dSink(self, sum_odo: cute.Tensor, scaled_lse: cute.Tensor, attn_sink: cute.Tensor, d_sink: cute.Tensor, problem_shape):
+        q_block_idx, head_idx, batch_idx = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        q_end = min(problem_shape[0], (q_block_idx + 1) * self.DSINK_BLOCK_Q)
+        q_idx = q_block_idx * self.DSINK_BLOCK_Q + tidx
+        sink_log2 = Float32(attn_sink[head_idx, (0, batch_idx)]) * Float32(math.log2(math.e))
+        acc = Float32(0.0)
+        while q_idx < q_end:
+            p_sink = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx, batch_idx)])
+            acc += p_sink * sum_odo[head_idx, (q_idx, batch_idx)]
+            q_idx += self.DSINK_THREADS
+        acc = cute.arch.warp_reduction_sum(acc, threads_in_group=self.DSINK_THREADS)
+        if tidx == 0:
+            ptr = d_sink.iterator + cute.crd2idx((head_idx, (0, batch_idx)), d_sink.layout)
+            cute.arch.atomic_add(ptr.llvm_ptr, acc)
 
     @cute.kernel
     def kernel(
@@ -2265,7 +2257,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         mTopkLength: Optional[cute.Tensor],
         mLSE: cute.Tensor,
         mAttnSink: cute.Tensor,
-        mdSink: cute.Tensor,
+        sum_odo: cute.Tensor,
+        scaled_lse: cute.Tensor,
         mOut: cute.Tensor,
         mdO: cute.Tensor,
         scale_softmax: Float32,
@@ -3028,14 +3021,14 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             if tile_count > Int32(0):
                 self.stats_odo_barrier.arrive_unaligned()
             self.dsink_reducer_barrier.arrive_and_wait()
-            self._accumulate_dsink(
-                mAttnSink,
-                mdSink,
+            self._publish_dsink_stats(
+                sum_odo,
+                scaled_lse,
                 softmax_stats,
+                token_idx,
                 batch_idx,
                 rank,
                 rtx,
-                scale_softmax,
             )
             dkv_wait = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.MMA_DONE_STAGES)
             dkv_rel = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.MMA_DONE_STAGES)
