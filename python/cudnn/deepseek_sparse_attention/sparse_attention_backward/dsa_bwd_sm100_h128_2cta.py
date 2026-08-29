@@ -762,6 +762,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA(FlashAttentionDSABackwardSm100):
             raise ValueError("two-CTA DSA backward requires head_dim=head_dim_v=512")
         if block_tile != 64:
             raise ValueError(f"two-CTA DSA backward requires block_tile=64, got {block_tile}")
+        if max_topk not in (128, 512, 1024, 2048):
+            raise ValueError("two-CTA DSA backward requires max_topk in " f"{{128, 512, 1024, 2048}}, got {max_topk}")
         super().__init__(element_dtype, head_dim, head_dim_v, block_tile, max_topk)
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1,
