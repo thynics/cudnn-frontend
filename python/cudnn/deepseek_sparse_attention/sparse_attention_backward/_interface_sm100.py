@@ -144,6 +144,7 @@ def flash_attn_bwd_sm100(
         device_capability=device_capability,
     )
     kernel_cls = _get_sm100_kernel_class(backend)
+    uses_h128_two_cta = backend == "h128_2cta_m64"
     batch_size = 1
 
     current_stream = resolve_stream(current_stream)
@@ -175,14 +176,22 @@ def flash_attn_bwd_sm100(
             # identity).
             assert dq.is_contiguous(), "dq must be contiguous"
         if dkv is None:
-            dkv = torch.zeros(total_S_kv, head_dim, dtype=kv.dtype, device=device)
+            dkv = (
+                torch.empty(total_S_kv, head_dim, dtype=kv.dtype, device=device)
+                if uses_h128_two_cta
+                else torch.zeros(total_S_kv, head_dim, dtype=kv.dtype, device=device)
+            )
         else:
             expected_dkv_shape = (total_S_kv, head_dim)
             assert dkv.shape == expected_dkv_shape, f"dkv shape mismatch: expected {expected_dkv_shape}, got {dkv.shape}"
             assert dkv.dtype == kv.dtype, f"dkv dtype mismatch: expected {kv.dtype}, got {dkv.dtype}"
             assert dkv.device == device, f"dkv device mismatch: expected {device}, got {dkv.device}"
             assert dkv.is_contiguous(), "dkv must be contiguous"
-            dkv.fill_(0)
+            # The H128 two-CTA kernel accumulates into a separate zeroed FP32
+            # workspace and its conversion kernel overwrites every public dKV
+            # element. Keep caller poison intact to enforce that contract.
+            if not uses_h128_two_cta:
+                dkv.fill_(0)
         d_sink = torch.zeros_like(attn_sink)
 
         # Allocate workspace tensors
@@ -194,11 +203,16 @@ def flash_attn_bwd_sm100(
             batch_size,
             acc_dtype,
         )
-        workspace_LSE_OdO = torch.zeros(
-            *ws_lse_odo_shape,
-            dtype=torch.uint8,
-            device=device,
-        )
+        if uses_h128_two_cta:
+            # This specialization fuses O*dO/LSE/dSink into its main kernel;
+            # retain the compile ABI with a never-dereferenced one-byte view.
+            workspace_LSE_OdO = d_sink.view(torch.uint8)[:1]
+        else:
+            workspace_LSE_OdO = torch.zeros(
+                *ws_lse_odo_shape,
+                dtype=torch.uint8,
+                device=device,
+            )
 
         ws_dkv_shape = kernel_cls._get_workspace_size_dKV(
             total_S_kv,
