@@ -24,8 +24,6 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05, warp
 from cutlass.cute.typing import BFloat16, Float32, Int32
 
-from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
-
 U64x4 = Tuple[cutlass.Uint64, cutlass.Uint64, cutlass.Uint64, cutlass.Uint64]
 F32x16 = Tuple[
     Float32,
@@ -662,7 +660,7 @@ def _store_bf16x4_ordinary(
     )
 
 
-class FlashAttentionDSABackwardSm100H128TwoCTA(FlashAttentionDSABackwardSm100):
+class FlashAttentionDSABackwardSm100H128TwoCTA:
     """Strict-FP32, genuine two-CTA specialization for BF16 H128 D512.
 
     One ``(2, 1, 1)`` cluster owns each query token.  The score, dP, dQ,
@@ -764,7 +762,14 @@ class FlashAttentionDSABackwardSm100H128TwoCTA(FlashAttentionDSABackwardSm100):
             raise ValueError(f"two-CTA DSA backward requires block_tile=64, got {block_tile}")
         if max_topk not in (128, 512, 1024, 2048):
             raise ValueError("two-CTA DSA backward requires max_topk in " f"{{128, 512, 1024, 2048}}, got {max_topk}")
-        super().__init__(element_dtype, head_dim, head_dim_v, block_tile, max_topk)
+        self.element_dtype = element_dtype
+        self.acc_dtype = Float32
+        self.head_dim = head_dim
+        self.head_dim_v = head_dim_v
+        self.head_dim_main = head_dim
+        self.same_hdim_kv = True
+        self.block_tile = block_tile
+        self.max_topk = max_topk
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=self.THREADS_PER_CTA,
@@ -1255,6 +1260,12 @@ class FlashAttentionDSABackwardSm100H128TwoCTA(FlashAttentionDSABackwardSm100):
         # The public compile signature retains a non-null dummy tensor, but
         # the fused kernel no longer reads or writes statistics workspace.
         return (1,)
+
+    @staticmethod
+    def _get_workspace_size_dKV(k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
+        d = (d + 7) // 8 * 8
+        k = (k + 7) // 8 * 8
+        return (b, 1, k, d * (acc_dtype.width // 8))
 
     @cute.jit
     def __call__(
