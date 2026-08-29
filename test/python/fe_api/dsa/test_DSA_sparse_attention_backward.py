@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from test_utils import torch_fork_set_rng
+from test_utils import bitwise_bits, torch_fork_set_rng
 
 from fe_api.dsa.dsa_utils import (
     _require_sm90,
@@ -193,6 +193,67 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
         softmax_scale=softmax_scale,
         topk_length=topk_length,
     )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@torch_fork_set_rng(seed=20260830)
+def test_DSA_sparse_attention_backward_sm100_h128_hierarchical_dsink_repeatability():
+    """The two 256-query partials must not regress to per-query atomics."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("B200/SM100 required for the H128 two-CTA specialization")
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    s_q, s_kv, num_heads, head_dim, topk = 257, 256, 128, 512, 128
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device="cuda") / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device="cuda") / 10
+    dout = torch.randn_like(q) / 10
+    attn_sink = torch.linspace(-2.0, 2.0, num_heads, dtype=torch.float32, device="cuda")
+    topk_idxs = torch.stack([torch.randperm(s_kv, device="cuda")[:topk] for _ in range(s_q)]).to(torch.int32)
+    pattern = torch.tensor([0, 1, 63, 64, 65, 127, 128, -3], dtype=torch.int32, device="cuda")
+    topk_length = pattern.repeat((s_q + pattern.numel() - 1) // pattern.numel())[:s_q]
+    topk_length[-1] = topk
+    softmax_scale = head_dim**-0.5
+    out, lse = ref_sparse_attention_forward(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
+    dq = torch.empty_like(q)
+    dkv = torch.empty_like(kv)
+    d_sink_runs = []
+    final_result = None
+    for _ in range(8):
+        final_result = DSA.sparse_attention_backward_wrapper(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=softmax_scale,
+            topk_length=topk_length,
+            dq=dq,
+            dkv=dkv,
+        )
+        d_sink_runs.append(final_result["d_sink"])
+    torch.cuda.synchronize()
+    assert final_result is not None
+    for d_sink in d_sink_runs[1:]:
+        assert torch.equal(bitwise_bits(d_sink), bitwise_bits(d_sink_runs[0]))
+    delta = (out.double() * dout.double()).sum(dim=-1)
+    denominator = torch.logaddexp(lse.double(), attn_sink.double().unsqueeze(0))
+    tail_contribution = -torch.exp(attn_sink.double() - denominator[-1]) * delta[-1]
+    assert tail_contribution.abs().max() > 1e-8
+    d_sink_ref = (-torch.exp(attn_sink.double().unsqueeze(0) - denominator) * delta).sum(dim=0)
+    torch.testing.assert_close(
+        final_result["d_sink"].double(),
+        d_sink_ref,
+        atol=2e-6,
+        rtol=2e-6,
+    )
+    assert torch.isfinite(final_result["dq"]).all()
+    assert torch.isfinite(final_result["dkv"]).all()
 
 
 @pytest.mark.L0

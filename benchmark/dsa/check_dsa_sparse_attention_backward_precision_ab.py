@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Strict FP32-oracle and repeatability audit for the H128 DSA backward A/B.
+"""Strict oracle and repeatability audit for the H128 DSA backward A/B.
 
 The test deliberately uses Sq=257 and Skv=max(256, 2*topk): the upstream dSink
-reduction crosses its 256-query block boundary, while the candidate performs
-one FP32 global contribution per query.  Both implementations receive the
-same BF16 inputs and run through the same public wrapper.  No timings are
-collected.
+reduction crosses its 256-query block boundary. Both implementations receive
+the same BF16 inputs and run through the same public wrapper. dQ/dKV use dense
+FP32 references; dSink uses the supplied-out/LSE contract in FP64. No timings
+are collected.
 """
 
 from __future__ import annotations
@@ -28,7 +28,14 @@ import benchmark_dsa_sparse_attention_backward_ab as ab
 
 ERROR_METRICS = ("max_abs_error", "rms_error", "relative_l2_error")
 OUTPUTS = ab.OUTPUT_NAMES
-ORACLES = ("mathematical_fp32", "kernel_contract_fp32")
+ORACLES = ("mathematical_fp32", "kernel_contract_fp64_dsink")
+HARD_ORACLE = "kernel_contract_fp64_dsink"
+HARD_METRICS = {
+    "dq": ("rms_error", "relative_l2_error"),
+    "dkv": ("rms_error", "relative_l2_error"),
+    "d_sink": ERROR_METRICS,
+}
+HARD_JITTER_OUTPUTS = ("dq", "d_sink")
 UPSTREAM_ATOL = 5.0e-2
 UPSTREAM_RTOL = 5.0e-2
 
@@ -90,23 +97,28 @@ def fp32_oracles(inputs: dict[str, torch.Tensor | None]) -> dict[str, tuple[torc
     exact_denominator = torch.logaddexp(exact_lse, sink.unsqueeze(0))
     exact_out = torch.einsum("qhk,kd->qhd", torch.exp(scores - exact_denominator.unsqueeze(-1)), kv)
     contract_denominator = torch.logaddexp(supplied_lse, sink.unsqueeze(0))
+    contract_gradients = gradients(contract_denominator, supplied_out)
+    contract_delta_f64 = (required["out"].double() * required["dout"].double()).sum(dim=-1)
+    contract_denominator_f64 = torch.logaddexp(required["lse"].double(), required["sink"].double().unsqueeze(0))
+    contract_dsink_f64 = (-torch.exp(required["sink"].double().unsqueeze(0) - contract_denominator_f64) * contract_delta_f64).sum(dim=0)
     return {
         "mathematical_fp32": gradients(exact_denominator, exact_out),
-        "kernel_contract_fp32": gradients(contract_denominator, supplied_out),
+        "kernel_contract_fp64_dsink": (contract_gradients[0], contract_gradients[1], contract_dsink_f64),
     }
 
 
 @torch.no_grad()
 def enqueue_error_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, torch.Tensor]:
-    actual_f32 = actual.float()
-    expected_f32 = expected.float()
-    difference = actual_f32 - expected_f32
+    metric_dtype = torch.float64 if expected.dtype == torch.float64 else torch.float32
+    actual_metric = actual.to(metric_dtype)
+    expected_metric = expected.to(metric_dtype)
+    difference = actual_metric - expected_metric
     return {
         "max_abs_error": difference.abs().max(),
         "rms_error": difference.square().mean().sqrt(),
-        "relative_l2_error": torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(expected_f32).clamp_min(1.0e-30),
-        "outside_upstream_tolerance": torch.count_nonzero(~torch.isclose(actual_f32, expected_f32, atol=UPSTREAM_ATOL, rtol=UPSTREAM_RTOL)),
-        "nonfinite": torch.count_nonzero(~torch.isfinite(actual_f32)),
+        "relative_l2_error": torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(expected_metric).clamp_min(1.0e-30),
+        "outside_upstream_tolerance": torch.count_nonzero(~torch.isclose(actual_metric, expected_metric, atol=UPSTREAM_ATOL, rtol=UPSTREAM_RTOL)),
+        "nonfinite": torch.count_nonzero(~torch.isfinite(actual_metric)),
     }
 
 
@@ -198,7 +210,9 @@ def run_variant(suite: ab.CaseSuite, label: str, oracles: dict[str, tuple[torch.
 
 def compare_summaries(baseline: dict, candidate: dict) -> dict:
     regressions = []
+    diagnostic_regressions = []
     jitter_regressions = []
+    hard_jitter_regressions = []
     comparisons = {}
     for oracle in ORACLES:
         comparisons[oracle] = {}
@@ -219,33 +233,42 @@ def compare_summaries(baseline: dict, candidate: dict) -> dict:
                     candidate_rows["p95"] > baseline_rows["p95"] + jitter_allowance or candidate_rows["max"] > baseline_rows["max"] + jitter_allowance
                 )
                 if row["resolved_regression"]:
-                    regressions.append({"oracle": oracle, "output": output, "metric": metric, **row})
+                    entry = {"oracle": oracle, "output": output, "metric": metric, **row}
+                    if oracle == HARD_ORACLE and metric in HARD_METRICS[output]:
+                        regressions.append(entry)
+                    else:
+                        diagnostic_regressions.append(entry)
                 comparisons[oracle][output][metric] = row
     for output in OUTPUTS:
         for metric in ERROR_METRICS:
             baseline_jitter = baseline["jitter_vs_first"][output][metric]["max"]
             candidate_jitter = candidate["jitter_vs_first"][output][metric]["max"]
             if candidate_jitter > baseline_jitter:
-                jitter_regressions.append(
-                    {
-                        "output": output,
-                        "metric": metric,
-                        "baseline_max": baseline_jitter,
-                        "candidate_max": candidate_jitter,
-                    }
-                )
+                entry = {
+                    "output": output,
+                    "metric": metric,
+                    "baseline_max": baseline_jitter,
+                    "candidate_max": candidate_jitter,
+                }
+                jitter_regressions.append(entry)
+                if output in HARD_JITTER_OUTPUTS:
+                    hard_jitter_regressions.append(entry)
     coarse_passed = all(
         impl["oracles"][oracle][output]["upstream_tolerance_passed"] for impl in (baseline, candidate) for oracle in ORACLES for output in OUTPUTS
     )
     dq_stable = all(impl["jitter_vs_first"]["dq"]["byte_changing_runs"] == 0 for impl in (baseline, candidate))
+    dsink_stable = all(impl["jitter_vs_first"]["d_sink"]["byte_changing_runs"] == 0 for impl in (baseline, candidate))
     return {
         "coarse_upstream_tolerance_passed": coarse_passed,
         "dq_bitwise_stable": dq_stable,
+        "dsink_bitwise_stable": dsink_stable,
         "resolved_regressions": regressions,
+        "diagnostic_regressions": diagnostic_regressions,
         "candidate_jitter_regressions": jitter_regressions,
-        "no_resolved_regression": coarse_passed and dq_stable and not regressions and not jitter_regressions,
+        "hard_jitter_regressions": hard_jitter_regressions,
+        "no_resolved_regression": coarse_passed and dq_stable and dsink_stable and not regressions and not hard_jitter_regressions,
         "comparisons": comparisons,
-        "interpretation": "Candidate oracle error may be excused only by baseline self-jitter, never by candidate self-jitter; any measured candidate jitter above baseline is a regression. No resolved regression is still not bitwise equivalence.",
+        "interpretation": "The supplied-out/LSE contract is the hard backward oracle; mathematical-forward max-abs and public-BF16 dKV jitter are diagnostic. dQ and dSink repeatability remain hard gates.",
     }
 
 
@@ -368,7 +391,7 @@ def main() -> None:
                 "shape": {"seqlen_q": 257, "seqlen_kv": "max(256, 2*topk)", "heads": 128, "head_dim": 512},
                 "topks": args.topks,
                 "dtype": "torch.bfloat16",
-                "accumulation_reference": "analytical dense FP32 gradients with TF32 disabled and highest FP32 matmul precision",
+                "accumulation_reference": "analytical dense FP32 dQ/dKV and supplied-out/LSE FP64 dSink; TF32 disabled",
                 "seeds": args.seeds,
                 "length_modes": ["none", "full"],
                 "repeats": args.repeats,

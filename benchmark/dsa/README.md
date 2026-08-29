@@ -137,11 +137,11 @@ python benchmark_dsa_sparse_attention_backward_ab.py \
 ```
 
 Run the separate strict precision audit before making a performance claim. It
-uses analytical FP32 references with TF32 disabled, three fixed seeds, both
-top-k-length paths, all four specialized widths, and 50 unsynchronized repeats
-per implementation. It also
-reports baseline/baseline and candidate/candidate jitter rather than treating
-the upstream `5e-2` tolerance as proof of equal precision:
+uses analytical FP32 dQ/dKV references and a supplied-out/LSE FP64 dSink
+reference with TF32 disabled, three fixed seeds, both top-k-length paths, all
+four specialized widths, and 50 unsynchronized repeats per implementation. It
+also reports baseline/baseline and candidate/candidate jitter rather than
+treating the upstream `5e-2` tolerance as proof of equal precision:
 
 ```bash
 NVIDIA_TF32_OVERRIDE=0 python check_dsa_sparse_attention_backward_precision_ab.py \
