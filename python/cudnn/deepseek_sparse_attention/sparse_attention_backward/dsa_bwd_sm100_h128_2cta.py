@@ -8,8 +8,6 @@ public dispatcher selects this implementation only for its validated shape
 envelope and retains the generic SM100 kernels for every other configuration.
 """
 
-from __future__ import annotations
-
 import math
 from typing import Optional, Tuple, Type
 
