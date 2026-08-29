@@ -173,16 +173,7 @@ PyTorch GPU Name: NVIDIA B200
 PyTorch SM Arch Version: (10, 0)
 PyTorch CUDA Version: 13.3
 PyTorch cuDNN Version: 92400
-============================= test session starts ==============================
-platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /home/scratch.longcheng_gpu/cudnn-frontend-dsa-bwd-2cta-g56/.venv/bin/python
-cachedir: .pytest_cache
-rootdir: /home/scratch.longcheng_gpu/cudnn-frontend-dsa-bwd-2cta-g56/repo/test/python
-configfile: pytest.ini
-plugins: xdist-3.8.0, typeguard-4.5.2, anyio-4.14.2
-collecting ... collected 1 item
-
-test/python/fe_api/dsa/test_DSA_sparse_attention_backward.py::test_DSA_sparse_attention_backward_sm100_h128_hierarchical_dsink_repeatability PASSED [100%]
-
+.                                                                        [100%]
 =============================== warnings summary ===============================
 ../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:1488
 ../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:1488
@@ -190,7 +181,5 @@ test/python/fe_api/dsa/test_DSA_sparse_attention_backward.py::test_DSA_sparse_at
     warnings.warn(
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-==================================== PASSES ====================================
-PASSED test/python/fe_api/dsa/test_DSA_sparse_attention_backward.py::test_DSA_sparse_attention_backward_sm100_h128_hierarchical_dsink_repeatability
-======================== 1 passed, 2 warnings in 16.50s ========================
+1 passed, 2 warnings in 16.91s
 ```

@@ -22,7 +22,8 @@ Evidence source:
 - Raw artifacts are retained outside the checkout under
   `/home/longcheng/cudnn-frontend-dsa-bwd-hier-results-20260829/`.
 - SHA256: precision `63297000...ff07`, Graph50/full
-  `05df7b77...e659`, eager-hot200 `3bcea921...79f`.
+  `05df7b77...e659`, eager-hot200 `3bcea921...79f`, final focused
+  gate `1d3b32c6...c39c`.
 
 Environment:
 
