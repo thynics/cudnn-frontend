@@ -1437,19 +1437,19 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             stream=stream,
             min_blocks_per_mp=1,
         )
-        self.block_seq = 4 if self.max_topk == 2048 else 32
-        self.num_threads_D_convert = 32
-        self.num_threads_seq = 4 if self.max_topk == 2048 else self.block_seq
-        convert_grid_x = (mKV.shape[0] + self.block_seq - 1) // self.block_seq
-        self.convert_canonical(mdKV_acc, mdKV, mKV.shape[0]).launch(
-            grid=[convert_grid_x, 1, 1], block=[self.num_threads_D_convert, self.num_threads_seq, 1], stream=stream
-        )
         self.sum_dSink(sum_odo, scaled_lse, mAttnSink, mdSink, problem_shape).launch(
             grid=(cute.ceil_div(problem_shape[0], self.DSINK_BLOCK_Q), problem_shape[3][0], problem_shape[3][1]),
             block=[self.DSINK_THREADS, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+        )
+        self.block_seq = 4 if self.max_topk == 2048 else 32
+        self.num_threads_D_convert = 32
+        self.num_threads_seq = 4 if self.max_topk == 2048 else self.block_seq
+        convert_grid_x = (mKV.shape[0] + self.block_seq - 1) // self.block_seq
+        self.convert_canonical(mdKV_acc, mdKV, mKV.shape[0]).launch(
+            grid=[convert_grid_x, 1, 1], block=[self.num_threads_D_convert, self.num_threads_seq, 1], stream=stream
         )
 
     @cute.jit
