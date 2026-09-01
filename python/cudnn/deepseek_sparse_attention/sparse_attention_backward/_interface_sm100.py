@@ -32,12 +32,12 @@ def _select_sm100_backend(
     """Return the tuned SM100 kernel variant and its sparse-row tile size.
 
     The two-CTA specialization is deliberately fail-closed.  It is selected
-    only for the exact SM100 (10, 0) BF16 H128/D512 envelope validated by its
-    kernel; every other supported configuration retains the established
-    backend.
+    only for SM100 (10, 0) and the SM103 ablation target (10, 3) within the
+    BF16 H128/D512 envelope; every other supported configuration retains the
+    established backend.
     """
     if (
-        device_capability == (10, 0)
+        device_capability in ((10, 0), (10, 3))
         and dtype == torch.bfloat16
         and num_heads == 128
         and head_dim == 512
