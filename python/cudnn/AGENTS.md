@@ -325,6 +325,15 @@ rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.
 
+**An MMA release does not retire software readers of the same shared slab.**
+When gather warps reuse a score operand for another computation, prove that
+every shared-memory read finishes before any warp refills the slab. A
+producer acquire that waits for UMMA completion does not order those reads
+across warps. Use the participating group's rendezvous before reuse, and
+exercise the ordering with a delayed-reader stress run; ordinary numerical
+tests can pass despite this race. Keep scheduling perturbations in isolated
+test artifacts, outside production kernel code.
+
 ## The APIBase contract (`api_base.py`)
 
 Every OSS kernel API extends `APIBase` and implements:

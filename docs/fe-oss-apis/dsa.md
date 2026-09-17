@@ -24,7 +24,7 @@ The module packages the following operations:
 1. **Sparse Attention Forward** – sparse Prefill MQA for the supported SM100
    H64/H128 shapes.
 2. **Sparse Attention Backward** – DSA backward for flat MQA tensors on
-   SM90/SM100.
+   SM90/SM100, plus BF16 H128 D512/D576 on Rubin SM107.
 3. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask) that materializes dense scores.
 4. **Combined Indexer Forward + Top-K** – SM100 compact score generation,
@@ -205,8 +205,10 @@ Contiguous BF16 H128 with `head_dim = 576`, `head_dim_v = 512`, and the same
 `topk_max` set uses the H128/D576 two-CTA specialization. H16 with
 `head_dim=576` uses the dedicated M128 sparse-row pipeline. FP16, other head
 counts and dimensions, every other `topk_max`, and noncontiguous H128/D576
-inputs retain the existing generic/H16/H32 selection. Other compute
-capabilities, including SM107, do not select the two-CTA paths. No backend or
+inputs retain the existing generic/H16/H32 selection. On Rubin SM107 (10, 7),
+contiguous BF16 H128 inputs with D512/V512 or D576/V512 and the same
+`topk_max` set select dedicated Rubin implementations. These require
+CuTe DSL 4.7.0 or newer with Rubin (sm_107a) support. No backend or
 tile-size argument is required. SM90 continues to use its Hopper-specific
 implementation.
 
@@ -223,6 +225,13 @@ accumulates dKV in that workspace, and converts it to the public BF16 output
 with a helper kernel. Short query batches split each query's top-k range
 across otherwise idle two-SM clusters; the split count is fixed when the plan
 is compiled.
+
+Rubin preserves the same inputs, outputs, sparse-slot masking, and FP32 dKV
+workspace contract. Its D512 schedule depends on the declared query length
+and top-k width; its D576 schedule also selects prefetch and writeback options
+from the declared sequence extents. Rubin D576 splits short query batches
+only when explicit `topk_length` is provided. Schedule selection and compilation
+happen when the plan is built, without reading device tensor values.
 
 On SM100 with H16/H32/H64/H96/H128, `deterministic=True` selects a bounded-wave
 M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA lane
@@ -242,19 +251,20 @@ atomics.
 Treat this as a reproducibility requirement rather than a performance-tuning
 knob: keep the default `False` when bitwise run-to-run stability is not needed.
 
-`SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
+`SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100/SM107
 scratch requirement. Pass a contiguous CUDA `uint8` tensor of at least this
 size to `execute(..., workspace=workspace)` and reuse it across calls; the
 compiled kernel initializes the dKV accumulator on every execution. The
 high-level wrapper accepts the same optional `workspace=` argument and only
-allocates convenience scratch when it is omitted. The H128/D576 two-CTA plan
-compiles its kernel in `compile()`, and its `execute()` additionally requires
+allocates convenience scratch when it is omitted. The Blackwell H128/D576
+two-CTA plan and both Rubin H128 plans compile their kernels in `compile()`;
+their `execute()` additionally requires
 caller-provided `dq`, `dkv`, and `d_sink` buffers: it never allocates or
 compiles during execution. The wrapper allocates those outputs when they are
 omitted. Other backends do not accept a caller-provided `d_sink`.
 
 - **Outputs** — tuple `(dq, dkv, d_sink)`
-- **Constraints** — SM90 or Blackwell SM100/SM103; SM90 supports flat MQA tensors with `head_dim ∈ {512, 576}`
+- **Constraints** — SM90, Blackwell SM100/SM103, or the Rubin SM107 BF16 H128 envelope above; SM90 supports flat MQA tensors with `head_dim ∈ {512, 576}`
 
 ```python
 result = DSA.sparse_attention_backward_wrapper(
@@ -681,7 +691,9 @@ result = DSA.dense_indexer_backward_wrapper(
 - **Architecture support** — Sparse Attention Forward supports the mapped
   SM100-family capabilities 10.0, 10.3, and 10.7 only.
   Sparse Attention Backward, Score Recompute, Indexer Forward, Indexer Top-K,
-  and Indexer Backward support SM90 and SM100. The combined compressed-logits
+  and Indexer Backward support SM90 and SM100. Sparse Attention Backward also
+  provides dedicated Rubin SM107 BF16 H128 D512/D576 implementations.
+  The combined compressed-logits
   + Top-K forward is SM100-only; the standalone Indexer Top-K remains SM90+.
 - **Forward scope** — only the 11 supported Prefill instances described above;
   no SM90, regular H128, FP8 cache, decode, or split-KV forward path.

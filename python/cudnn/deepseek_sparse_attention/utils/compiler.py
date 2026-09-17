@@ -55,16 +55,24 @@ def gpu_arch_flag() -> str:
     return arch
 
 
-def compile_options(extra: str = "") -> str:
+def compile_options(extra: str = "", *, device_capability: tuple[int, int] | None = None) -> str:
     """Build the ``options=`` string for ``cute.compile``.
 
     Always emits ``--enable-tvm-ffi`` and a runtime-chosen ``--gpu-arch``;
     pass any kernel-specific knobs (``--opt-level 3`` etc.) via ``extra``.
+    A plan may pass ``device_capability`` explicitly to avoid depending on the
+    cached ambient device when compiling for more than one architecture.
 
     Example:
         cute.compile(..., options=compile_options("--opt-level 3"))
     """
-    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch_flag()}"]
+    if device_capability is None:
+        arch = gpu_arch_flag()
+    else:
+        arch = _ARCH_MAP.get(device_capability)
+        if arch is None:
+            raise RuntimeError(f"Unsupported GPU compute capability {device_capability} for DSA CuTe kernels")
+    parts = ["--enable-tvm-ffi", f"--gpu-arch {arch}"]
     if extra:
         parts.append(extra)
     return " ".join(parts)
