@@ -20,6 +20,7 @@ from typing import Optional, Tuple, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory as cutlass_memory
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -195,6 +196,17 @@ def _extract_u64x4(value, *, loc=None, ip=None) -> U64x4:
     return tuple(cutlass.Uint64(llvm.extractvalue(T.i64(), value, [index], loc=loc, ip=ip)) for index in range(4))
 
 
+def _regroup_fragment_mk(tensor: cute.Tensor) -> cute.Tensor:
+    """Expose a partitioned MMA A fragment as a plain (M, K[, rest]) view."""
+
+    layout = tensor.layout
+    shape = layout.shape
+    stride = layout.stride
+    new_shape = ((shape[0][0], shape[1]), (shape[0][1], shape[2]), *shape[3:])
+    new_stride = ((stride[0][0], stride[1]), (stride[0][1], stride[2]), *stride[3:])
+    return cute.make_tensor(tensor.iterator, cute.make_layout(new_shape, stride=new_stride))
+
+
 @dsl_user_op
 def _prefetch_o_row_l2(source: cute.Pointer, *, loc=None, ip=None) -> None:
     """Pull one immutable O row chunk into L2 ahead of the reducer sweep."""
@@ -204,6 +216,22 @@ def _prefetch_o_row_l2(source: cute.Pointer, *, loc=None, ip=None) -> None:
         [source_i64],
         "prefetch.global.L2 [$0];",
         "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _prefetch_o_row_bulk_l2(source: cute.Pointer, *, loc=None, ip=None) -> None:
+    """Best-effort bulk-prefetch one contiguous 1024-byte BF16 O row."""
+
+    source_i64 = source.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [source_i64, Int32(1024).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -256,7 +284,81 @@ def _dot_bf16x16_mixed(
     loc=None,
     ip=None,
 ) -> Float32:
-    """Accumulate one BF16 dot directly with mixed-precision FP32 FMAs."""
+    """Accumulate one BF16 dot through two independent FP32 FMA chains."""
+
+    result = llvm.inline_asm(
+        T.f32(),
+        [
+            *[cutlass.Uint64(value).ir_value(loc=loc, ip=ip) for value in out_bits],
+            *[cutlass.Uint64(value).ir_value(loc=loc, ip=ip) for value in dout_bits],
+        ],
+        """{
+        .reg .b32 xword<8>;
+        .reg .b32 yword<8>;
+        .reg .b16 x<16>;
+        .reg .b16 y<16>;
+        .reg .f32 acc0, acc1;
+        mov.b64 {xword0, xword1}, $1;
+        mov.b64 {xword2, xword3}, $2;
+        mov.b64 {xword4, xword5}, $3;
+        mov.b64 {xword6, xword7}, $4;
+        mov.b64 {yword0, yword1}, $5;
+        mov.b64 {yword2, yword3}, $6;
+        mov.b64 {yword4, yword5}, $7;
+        mov.b64 {yword6, yword7}, $8;
+        mov.b32 {x0, x1}, xword0;
+        mov.b32 {x2, x3}, xword1;
+        mov.b32 {x4, x5}, xword2;
+        mov.b32 {x6, x7}, xword3;
+        mov.b32 {x8, x9}, xword4;
+        mov.b32 {x10, x11}, xword5;
+        mov.b32 {x12, x13}, xword6;
+        mov.b32 {x14, x15}, xword7;
+        mov.b32 {y0, y1}, yword0;
+        mov.b32 {y2, y3}, yword1;
+        mov.b32 {y4, y5}, yword2;
+        mov.b32 {y6, y7}, yword3;
+        mov.b32 {y8, y9}, yword4;
+        mov.b32 {y10, y11}, yword5;
+        mov.b32 {y12, y13}, yword6;
+        mov.b32 {y14, y15}, yword7;
+        mov.f32 acc0, 0f00000000;
+        mov.f32 acc1, 0f00000000;
+        fma.rn.f32.bf16 acc0, x0, y0, acc0;
+        fma.rn.f32.bf16 acc1, x8, y8, acc1;
+        fma.rn.f32.bf16 acc0, x1, y1, acc0;
+        fma.rn.f32.bf16 acc1, x9, y9, acc1;
+        fma.rn.f32.bf16 acc0, x2, y2, acc0;
+        fma.rn.f32.bf16 acc1, x10, y10, acc1;
+        fma.rn.f32.bf16 acc0, x3, y3, acc0;
+        fma.rn.f32.bf16 acc1, x11, y11, acc1;
+        fma.rn.f32.bf16 acc0, x4, y4, acc0;
+        fma.rn.f32.bf16 acc1, x12, y12, acc1;
+        fma.rn.f32.bf16 acc0, x5, y5, acc0;
+        fma.rn.f32.bf16 acc1, x13, y13, acc1;
+        fma.rn.f32.bf16 acc0, x6, y6, acc0;
+        fma.rn.f32.bf16 acc1, x14, y14, acc1;
+        fma.rn.f32.bf16 acc0, x7, y7, acc0;
+        fma.rn.f32.bf16 acc1, x15, y15, acc1;
+        add.rn.f32 $0, acc0, acc1;
+        }""",
+        "=f,l,l,l,l,l,l,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Float32(result)
+
+
+@dsl_user_op
+def _dot_bf16x16_serial(
+    out_bits: U64x4,
+    dout_bits: U64x4,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Accumulate one BF16 dot in the original single FP32 chain."""
 
     result = llvm.inline_asm(
         T.f32(),
@@ -587,6 +689,62 @@ def _red_global_add_f32x2_evict_last(
 
 
 @dsl_user_op
+def _red_global_add_f32x4_relaxed(
+    destination: cute.Pointer,
+    value_0: Float32,
+    value_1: Float32,
+    value_2: Float32,
+    value_3: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Reduce four FP32 values without returning the discarded old values."""
+
+    llvm.inline_asm(
+        None,
+        [
+            destination.toint(loc=loc, ip=ip).ir_value(),
+            Float32(value_0).ir_value(loc=loc, ip=ip),
+            Float32(value_1).ir_value(loc=loc, ip=ip),
+            Float32(value_2).ir_value(loc=loc, ip=ip),
+            Float32(value_3).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.v4.f32.add [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _red_global_add_f32x2_relaxed(
+    destination: cute.Pointer,
+    value_0: Float32,
+    value_1: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Reduce two FP32 values without returning the discarded old values."""
+
+    llvm.inline_asm(
+        None,
+        [
+            destination.toint(loc=loc, ip=ip).ir_value(),
+            Float32(value_0).ir_value(loc=loc, ip=ip),
+            Float32(value_1).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.v2.f32.add [$0], {$1, $2};",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _store_bf16x4_ordinary(
     destination: cute.Pointer,
     packed01: cutlass.Uint32,
@@ -694,6 +852,10 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
     TMEM_DQ1_OFFSET = 256
     TMEM_DKV0_OFFSET = 384
     TMEM_DKV1_OFFSET = 448
+    # Rubin-only columns 512..575 can hold one raw-BF16 D256xH128 A panel.
+    # The long-row plan uses them for dO^T round 0, avoiding four round-TMA
+    # generations per sparse tile without increasing shared-memory storage.
+    TMEM_DOT_DO_OFFSET = 512
     SCORE_DONE_STAGES = 2
     DP_DONE_STAGES = 1
     TAIL_WARP = 19
@@ -707,13 +869,10 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
     UTILITY_SETMAXREG = 96
     MATH_SETMAXREG = 96
     REDUCER_SETMAXREG = 96
-    # Epilogue-phase register hand-off.  The reducer warps are finished
-    # once the last dKV drain retires, while the math warps still have the
-    # whole 128-value dQ panel-1 TMEM->RMEM->global epilogue in front of
-    # them.  Handing the reducers' registers to the math warp group at
-    # that exact boundary widens the epilogue without inflating the
-    # register budget the steady-state tile loop is compiled against.
-    MATH_EPI_SETMAXREG = 200
+    # Finished gather warps donate registers before the wide dQ epilogue,
+    # allowing its panel-1 drain to overlap the reducers' final dKV drain.
+    # The 192-register grant leaves 1024 registers of CTA-level slack.
+    MATH_EPI_SETMAXREG = 192
     REDUCER_EPI_SETMAXREG = 24
 
     def __init__(
@@ -744,6 +903,10 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         self.head_dim_main = head_dim_v
         self.same_hdim_kv = False
         self.max_topk = max_topk
+        self.TMEM_RESIDENT_DO = max_topk == 2048 and not short_sq
+        self.TMEM_ALLOC_COLUMNS = 576 if self.TMEM_RESIDENT_DO else self.TMEM_COLUMNS
+        self.TMEM_ARCH = "sm_107" if self.TMEM_RESIDENT_DO else "sm_100"
+        self.RING_GENS_PER_TILE = self.ROUND_GENS_PER_TILE - self.H_TILE_CLUSTER // self.ROUND_K_HEADS if self.TMEM_RESIDENT_DO else self.ROUND_GENS_PER_TILE
         # Keep short-query and full-grid schedules in one implementation.
         self.RETAIN_DKV_IN_L2 = not short_sq and max_topk >= 1024
         if max_topk == 128 and not short_sq:
@@ -757,14 +920,19 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         if enable_zero16_k128 and max_topk != 128:
             raise ValueError("zero16 K128 initialization requires max_topk=128")
         self.WIDE_K2048_FINALIZE = enable_wide_k2048_finalize
-        self.KV_PREFETCH = enable_kv_prefetch
+        # Full-grid TopK1152/2048 rows have long sparse-tile walks; warm the
+        # next tile's first eight rank-owned KV rows as the tuned mid widths
+        # do.  The operation remains a guarded advisory prefetch.
+        self.KV_PREFETCH = enable_kv_prefetch or (max_topk in (1152, 2048) and not short_sq)
         # Use sixteen rows per zeroing block for wide top-k or long Topk128
         # queries, eight for Topk128 without PDL, and four otherwise.
         self.ZERO_ROWS_PER_BLOCK = (
             16 if max_topk in (512, 1024, 2048) or full_k1152 or (max_topk == 128 and enable_zero16_k128) else 8 if max_topk == 128 and not enable_pdl else 4
         )
         self.PDL_MAX_TOPK = max_topk if enable_pdl or full_k1152 else 0
-        self.DSINK_BLOCK_Q = 8 if max_topk == 2048 else 16
+        # One-plane statistics halve per-query work; larger chunks reduce
+        # trailing blocks before the four-head vector deposit below.
+        self.DSINK_BLOCK_Q = 16 if max_topk == 2048 else 32
         if max_topk == 128 and enable_pdl:
             self.MATH_EPI_SETMAXREG = 208
         # A single query has no cross-query dSink reduction.  Its owner
@@ -997,6 +1165,75 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             else:
                 self._zero_sparse_k_d128_row(kd_rows_0, local_n, index_in_group)
                 self._zero_sparse_k_d128_row(kd_rows_1, local_n, index_in_group)
+
+    @cute.jit
+    def _fill_dot_a_tmem(
+        self,
+        mA: cute.Tensor,
+        dot_a_mn_view: cute.Tensor,
+        ready_mbar: cute.Pointer,
+        token_idx: Int32,
+        batch_idx: Int32,
+        rank: Int32,
+        mtx: Int32,
+        d_round: cutlass.Constexpr[int],
+    ) -> None:
+        """Stage one stationary transposed D256 operand into Rubin TMEM."""
+
+        view_stage = dot_a_mn_view[None, None, 0]
+        tmem_store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)),
+            self.element_dtype,
+        )
+        tiled_r2t = tcgen05.make_tmem_copy(tmem_store_atom, view_stage)
+        thread_r2t = tiled_r2t.get_slice(mtx)
+        c_panel = cute.make_identity_tensor((self.D_TILE_CTA, self.H_TILE_CLUSTER))
+        thread_coordinates = thread_r2t.partition_S(c_panel)
+        thread_destination = thread_r2t.partition_D(view_stage)
+        input_token = mA[None, None, (token_idx, batch_idx)]
+        d_base = Int32(d_round * self.D_TILE_CLUSTER) + rank * Int32(self.D_TILE_CTA)
+        for half in cutlass.range_constexpr(2):
+            half_coordinates = self.split_wg(thread_coordinates, 2, half)
+            half_destination = self.split_wg(thread_destination, 2, half)
+            fill_values = cute.make_rmem_tensor(half_coordinates.shape, self.element_dtype)
+            for i in cutlass.range_constexpr(cute.size(fill_values)):
+                coordinate = half_coordinates[i]
+                d_row = Int32(cute.get(coordinate, mode=[0]))
+                head = Int32(cute.get(coordinate, mode=[1]))
+                fill_values[i] = input_token[head, d_base + d_row]
+            cute.copy(tiled_r2t, fill_values, half_destination)
+        cute.arch.fence_view_async_tmem_store()
+        with cute.arch.elect_one():
+            # Both CTAs target rank zero's cluster-visible readiness barrier.
+            cute.arch.mbarrier_arrive(ready_mbar, Int32(0))
+
+    @cute.jit
+    def _issue_dkv_tmem_sweep(
+        self,
+        dkv_tmem_mma: cute.TiledMma,
+        t_dkv: cute.Tensor,
+        dot_a_fragment: cute.Tensor,
+        b_fragment_0: cute.Tensor,
+        b_fragment_1: cute.Tensor,
+        first_accumulate: cutlass.Constexpr[bool],
+    ) -> None:
+        """Accumulate one dV/dK pass from a resident full-H128 TMEM A panel."""
+
+        k_blocks = cute.size(dot_a_fragment, mode=[2])
+        assert k_blocks == self.H_TILE_CLUSTER // 16
+        half_blocks = k_blocks // 2
+        mma = dkv_tmem_mma.with_()
+        mma.set(tcgen05.Field.ACCUMULATE, first_accumulate)
+        for k_block in cutlass.range_constexpr(k_blocks):
+            b_fragment = b_fragment_0 if k_block < half_blocks else b_fragment_1
+            cute.gemm(
+                mma,
+                t_dkv,
+                dot_a_fragment[None, None, k_block, 0],
+                b_fragment[None, None, k_block % half_blocks, 0],
+                t_dkv,
+            )
+            mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
     def _issue_dkv_sweep(
@@ -1433,6 +1670,16 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         dkv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype, self.element_dtype, OperandMajorMode.MN, OperandMajorMode.K, self.acc_dtype, cg2, self.DKV_MMA_TILER[:2]
         )
+        dkv_tmem_mma = sm100_utils.make_trivial_tiled_mma(
+            self.element_dtype,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            self.acc_dtype,
+            cg2,
+            self.DKV_MMA_TILER[:2],
+            tcgen05.OperandSource.TMEM,
+        )
         dq_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype, self.element_dtype, OperandMajorMode.MN, OperandMajorMode.MN, self.acc_dtype, cg2, self.DQ_MMA_TILER[:2]
         )
@@ -1582,6 +1829,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             dq_tiled_mma,
             dqt_tiled_mma,
             dkt_warp_mma,
+            dkv_tmem_mma,
             score_a_layout_staged,
             score_b_layout_staged,
             round_a_layout_staged,
@@ -1610,7 +1858,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             min_blocks_per_mp=1,
             use_pdl=self.max_topk <= self.PDL_MAX_TOPK,
         )
-        self.block_seq = 32 if self.max_topk != 2048 or self.WIDE_K2048_FINALIZE else 4
+        self.block_seq = 8 if self.max_topk != 2048 or self.WIDE_K2048_FINALIZE else 4
         self.num_threads_D_convert = 32
         self.num_threads_seq = self.block_seq
         convert_grid_x = (mKV.shape[0] + self.block_seq - 1) // self.block_seq
@@ -1840,7 +2088,13 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                         cache_policy,
                     )
                 else:
-                    cute.arch.atomic_add(target_frg_0.iterator.llvm_ptr, rdkv_frg_0.load())
+                    _red_global_add_f32x4_relaxed(
+                        target_frg_0.iterator,
+                        rdkv_frg_0[0],
+                        rdkv_frg_0[1],
+                        rdkv_frg_0[2],
+                        rdkv_frg_0[3],
+                    )
 
         done_pipeline.consumer_wait(wait_state)
         wait_state.advance()
@@ -1872,7 +2126,13 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                         cache_policy,
                     )
                 else:
-                    cute.arch.atomic_add(target_frg_1.iterator.llvm_ptr, rdkv_frg_1.load())
+                    _red_global_add_f32x4_relaxed(
+                        target_frg_1.iterator,
+                        rdkv_frg_1[0],
+                        rdkv_frg_1[1],
+                        rdkv_frg_1[2],
+                        rdkv_frg_1[3],
+                    )
 
         return (wait_state, release_state)
 
@@ -1882,8 +2142,12 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         out_bits: U64x4,
         dout_bits: U64x4,
     ) -> Float32:
-        """Accumulate one packed segment pair with Rubin mixed-BF16 FMAs."""
-        return _dot_bf16x16_mixed(out_bits, dout_bits)
+        """Use the dependency depth tuned for this public TopK regime."""
+        if cutlass.const_expr(self.max_topk == 2048):
+            result = _dot_bf16x16_serial(out_bits, dout_bits)
+        else:
+            result = _dot_bf16x16_mixed(out_bits, dout_bits)
+        return result
 
     @cute.kernel
     def convert_dkv(
@@ -1951,18 +2215,13 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                     acc_2 = Float32(0.0)
                     acc_3 = Float32(0.0)
                     while q_idx + 3 < q_end:
-                        p_0 = sink_probability[head_idx, (q_idx, batch_idx)]
-                        p_1 = sink_probability[head_idx, (q_idx + 1, batch_idx)]
-                        p_2 = sink_probability[head_idx, (q_idx + 2, batch_idx)]
-                        p_3 = sink_probability[head_idx, (q_idx + 3, batch_idx)]
-                        acc_0 += p_0 * sum_odo[head_idx, (q_idx, batch_idx)]
-                        acc_1 += p_1 * sum_odo[head_idx, (q_idx + 1, batch_idx)]
-                        acc_2 += p_2 * sum_odo[head_idx, (q_idx + 2, batch_idx)]
-                        acc_3 += p_3 * sum_odo[head_idx, (q_idx + 3, batch_idx)]
+                        acc_0 += sum_odo[head_idx, (q_idx, batch_idx)]
+                        acc_1 += sum_odo[head_idx, (q_idx + 1, batch_idx)]
+                        acc_2 += sum_odo[head_idx, (q_idx + 2, batch_idx)]
+                        acc_3 += sum_odo[head_idx, (q_idx + 3, batch_idx)]
                         q_idx += self.DSINK_UNROLL
                     while q_idx < q_end:
-                        p_tail = sink_probability[head_idx, (q_idx, batch_idx)]
-                        acc_0 += p_tail * sum_odo[head_idx, (q_idx, batch_idx)]
+                        acc_0 += sum_odo[head_idx, (q_idx, batch_idx)]
                         q_idx += 1
                     partial = (acc_0 + acc_1) + (acc_2 + acc_3)
                 ptr = d_sink.iterator + cute.crd2idx(
@@ -1970,18 +2229,39 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                     d_sink.layout,
                 )
                 if cutlass.const_expr(chunks_per_block == 1):
-                    cute.arch.atomic_add(ptr.llvm_ptr, partial)
+                    # One warp owns 32 adjacent heads. Group four head
+                    # partials into one return-free vector reduction.
+                    lane = flat_thread % Int32(32)
+                    group_lane = lane & Int32(-4)
+                    partial_1 = cute.arch.shuffle_sync(partial, group_lane + Int32(1))
+                    partial_2 = cute.arch.shuffle_sync(partial, group_lane + Int32(2))
+                    partial_3 = cute.arch.shuffle_sync(partial, group_lane + Int32(3))
+                    if (head_idx & Int32(3)) == Int32(0):
+                        _red_global_add_f32x4_relaxed(
+                            ptr,
+                            partial,
+                            partial_1,
+                            partial_2,
+                            partial_3,
+                        )
                 else:
                     # One 1024-thread block covers eight Q chunks for every
                     # head. Fold those eight partials through 4 KiB of SMEM
                     # so only one FP32 atomic per head reaches L2.
                     dsink_partials[flat_thread] = partial
                     cute.arch.sync_threads()
-                    if chunk_in_block == Int32(0):
-                        combined = Float32(0.0)
-                        for chunk in cutlass.range_constexpr(chunks_per_block):
-                            combined += dsink_partials[head_idx + Int32(chunk * self.DSINK_THREADS)]
-                        cute.arch.atomic_add(ptr.llvm_ptr, combined)
+                    if chunk_in_block == Int32(0) and (head_idx & Int32(3)) == Int32(0):
+                        combined = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                        for head_offset in cutlass.range_constexpr(4):
+                            for chunk in cutlass.range_constexpr(chunks_per_block):
+                                combined[head_offset] += dsink_partials[head_idx + Int32(head_offset + chunk * self.DSINK_THREADS)]
+                        _red_global_add_f32x4_relaxed(
+                            ptr,
+                            combined[0],
+                            combined[1],
+                            combined[2],
+                            combined[3],
+                        )
         seq_id = self.block_seq * seq_block_idx + tidy
         if seq_id < seqlen:
             acc_row = mdKV_acc[None, seq_id, (0, batch_idx)]
@@ -2234,20 +2514,30 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         rank: Int32,
         reducer_tidx: Int32,
     ) -> None:
-        """Warm every O chunk this reducer thread will read before the LSE fold."""
-        stats_warp = reducer_tidx // Int32(32)
-        lane = reducer_tidx % Int32(32)
-        row_base = stats_warp * Int32(8)
-        row = row_base + lane // Int32(4)
-        group_lane = lane % Int32(4)
-        head = rank * Int32(self.H_TILE_CTA) + row
-        # Each O row is 512 BF16 = 1024 B = eight aligned 128-byte lines.
-        # Four lanes own one row, so two requests per lane cover the row with
-        # exactly one prefetch per line instead of four per line.
-        for chunk in cutlass.range_constexpr(2):
-            dim = (group_lane + Int32(4 * chunk)) * Int32(64)
-            source = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
-            _prefetch_o_row_l2(source)
+        """Warm the saved-O rows this CTA reduces before the LSE fold."""
+
+        if cutlass.const_expr(self.max_topk == 2048):
+            # The TopK2048 sparse walk leaves reducer lanes idle long enough
+            # that one bulk request per rank-owned O row wins over spreading
+            # eight scalar line prefetches across four lanes per row.
+            if reducer_tidx < Int32(self.H_TILE_CTA):
+                head = rank * Int32(self.H_TILE_CTA) + reducer_tidx
+                source = mOut.iterator + mOut.layout((head, Int32(0), (token_idx, batch_idx)))
+                _prefetch_o_row_bulk_l2(source)
+        else:
+            stats_warp = reducer_tidx // Int32(32)
+            lane = reducer_tidx % Int32(32)
+            row_base = stats_warp * Int32(8)
+            row = row_base + lane // Int32(4)
+            group_lane = lane % Int32(4)
+            head = rank * Int32(self.H_TILE_CTA) + row
+            # Each O row is 512 BF16 = 1024 B = eight aligned 128-byte lines.
+            # Four lanes own one row, so two requests per lane cover the row
+            # with exactly one prefetch per line instead of four per line.
+            for chunk in cutlass.range_constexpr(2):
+                dim = (group_lane + Int32(4 * chunk)) * Int32(64)
+                source = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
+                _prefetch_o_row_l2(source)
 
     @cute.jit
     def _compute_global_odo(
@@ -2402,8 +2692,10 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             if cutlass.const_expr(self.SINGLE_QUERY):
                 d_sink[head, (0, batch_idx)] = p_sink * softmax_stats[row, 1]
             else:
-                sum_odo[head, (token_idx, batch_idx)] = softmax_stats[row, 1]
-                sink_probability[head, (token_idx, batch_idx)] = p_sink
+                # Store the same FP32 product the finalizer formerly formed
+                # after reloading two separate planes. This removes one
+                # call-local plane write and read without changing arithmetic.
+                sum_odo[head, (token_idx, batch_idx)] = p_sink * softmax_stats[row, 1]
 
     @cute.kernel
     def zero_init(
@@ -2490,6 +2782,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         dq_tiled_mma: cute.TiledMma,
         dqt_tiled_mma: cute.TiledMma,
         dkt_warp_mma: cute.TiledMma,
+        dkv_tmem_mma: cute.TiledMma,
         score_a_layout_staged: cute.ComposedLayout,
         score_b_layout_staged: cute.ComposedLayout,
         round_a_layout_staged: cute.ComposedLayout,
@@ -2550,6 +2843,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         p_ready_mbars = storage.p_ready_mbars.data_ptr()
         ds_local_ready_mbar = storage.ds_local_ready_mbar.data_ptr()
         tail_ld_mbar = storage.tail_ld_mbar.data_ptr()
+        resident_do_ready_mbar = storage.resident_do_ready_mbar.data_ptr()
 
         stationary_do_raw = storage.stationary_do.data_ptr()
         round_buf_raw = storage.round_buf.data_ptr()
@@ -2728,6 +3022,13 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                 assert k_block_offset + k_block_cosize <= self.ROUND_STAGE_ELEMENTS
         p_fragments = (dkv_tiled_mma.make_fragment_B(p_blocks[0]), dkv_tiled_mma.make_fragment_B(p_blocks[1]))
         ds_fragments = (dkv_tiled_mma.make_fragment_B(ds_blocks[0]), dkv_tiled_mma.make_fragment_B(ds_blocks[1]))
+        if cutlass.const_expr(self.TMEM_RESIDENT_DO):
+            p_fragments_tmem = (
+                dkv_tmem_mma.make_fragment_B(p_blocks[0]),
+                dkv_tmem_mma.make_fragment_B(p_blocks[1]),
+            )
+        else:
+            p_fragments_tmem = None
         kv_copy_atom = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), self.element_dtype, num_bits_per_copy=128)
         kv_thread_copy = cute.make_tiled_copy_tv(kv_copy_atom, cute.make_layout((1,)), cute.make_layout((8,))).get_slice(0)
         # Start the supplied-length load before barrier initialization, the
@@ -2784,6 +3085,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                 pipe_dq0_free = self._make_umma_async_pipeline(1, leader_group, gather_group, storage.dq0_free_mbars.data_ptr(), cluster_layout_vmnk)
         pipe_dkv_done = self._make_umma_async_pipeline(self.MMA_DONE_STAGES, leader_group, reduce_group, storage.dkv_done_mbars.data_ptr(), cluster_layout_vmnk)
         pipe_dq_done = self._make_umma_async_pipeline(1, leader_group, math_group, storage.dq_done_mbars.data_ptr(), cluster_layout_vmnk)
+        pipe_dqt_done = self._make_umma_async_pipeline(1, leader_group, gather_group, storage.dqt_done_mbars.data_ptr(), cluster_layout_vmnk)
         # Dedicated full/empty pair for the split dQ epilogue.  Its
         # full barrier is committed immediately after the final DQ0
         # UMMA, independently of the DQ1 completion pipeline.
@@ -2823,6 +3125,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             if cutlass.const_expr(split_regime):
                 cute.arch.mbarrier_init(ds_local_ready_mbar, 2 * self.MATH_WARPS)
             cute.arch.mbarrier_init(tail_ld_mbar, self.GATHER_WARPS)
+            if cutlass.const_expr(self.TMEM_RESIDENT_DO):
+                cute.arch.mbarrier_init(resident_do_ready_mbar, 2 * self.MATH_WARPS)
 
         cute.arch.fence_view_async_shared()
         pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=False)
@@ -3000,14 +3304,24 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                         cute.arch.mbarrier_arrive_and_expect_tx(stationary_tma_mbars + 1, score_a_stage_bytes * self.K_CHUNKS)
                     cute.copy(tma_atom_q, t_q_gmem[None, rank, 0], t_q_smem[None, 0], tma_bar_ptr=stationary_tma_mbars)
                     cute.copy(tma_atom_do, t_do_gmem[None, rank, 0], t_do_smem[None, 0], tma_bar_ptr=stationary_tma_mbars + 1)
-        tmem = utils.TmemAllocator(
-            tmem_holding_buf_ptr,
-            barrier_for_retrieve=self.tmem_alloc_barrier,
-            allocator_warp_id=self.MATH_WARP_BEGIN,
-            is_two_cta=True,
-            two_cta_tmem_dealloc_mbar_ptr=tmem_dealloc_mbar_ptr,
-        )
-        tmem.allocate(self.TMEM_COLUMNS)
+        if cutlass.const_expr(self.TMEM_RESIDENT_DO):
+            tmem = cutlass_memory.TmemAllocator(
+                tmem_holding_buf_ptr,
+                barrier_for_retrieve=self.tmem_alloc_barrier,
+                allocator_warp_id=self.MATH_WARP_BEGIN,
+                is_two_cta=True,
+                two_cta_tmem_dealloc_mbar_ptr=tmem_dealloc_mbar_ptr,
+                arch=self.TMEM_ARCH,
+            )
+        else:
+            tmem = utils.TmemAllocator(
+                tmem_holding_buf_ptr,
+                barrier_for_retrieve=self.tmem_alloc_barrier,
+                allocator_warp_id=self.MATH_WARP_BEGIN,
+                is_two_cta=True,
+                two_cta_tmem_dealloc_mbar_ptr=tmem_dealloc_mbar_ptr,
+            )
+        tmem.allocate(self.TMEM_ALLOC_COLUMNS)
         if cutlass.const_expr(mTopkLength is None):
             if warp_idx == Int32(self.LOAD_WARP):
                 if my_tile_count > Int32(0):
@@ -3035,6 +3349,16 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         t_dqt = cute.make_tensor(tmem_ptr + self.TMEM_DQT_OFFSET, dqt_c_layout)
         t_dq = (cute.make_tensor(tmem_ptr + self.TMEM_DQ0_OFFSET, dq_c_layout), cute.make_tensor(tmem_ptr + self.TMEM_DQ1_OFFSET, dq_c_layout))
         t_dkv = (cute.make_tensor(tmem_ptr + self.TMEM_DKV0_OFFSET, dkv_c_layout), cute.make_tensor(tmem_ptr + self.TMEM_DKV1_OFFSET, dkv_c_layout))
+        if cutlass.const_expr(self.TMEM_RESIDENT_DO):
+            dot_a_shape = dkv_tmem_mma.partition_shape_A((self.D_TILE_CLUSTER, self.H_TILE_CLUSTER))
+            dot_a_fragment_fake = dkv_tmem_mma.make_fragment_A(cute.append(dot_a_shape, 1))
+            dot_do_fragment = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + self.TMEM_DOT_DO_OFFSET, dtype=self.element_dtype),
+                dot_a_fragment_fake.layout,
+            )
+            dot_do_mn_view = _regroup_fragment_mk(dot_do_fragment)
+        else:
+            dot_do_fragment = None
         if cutlass.const_expr(mTopkLength is not None):
             topk = raw_topk
             if topk > Int32(mTopkIdxs.shape[0]):
@@ -3065,6 +3389,19 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             # guard is position-based and unchanged.
             walk_base = my_tile_base
             walk_step = my_tile_stride
+        if cutlass.const_expr(self.TMEM_RESIDENT_DO):
+            if my_tile_count > Int32(0):
+                if warp_idx >= Int32(self.MATH_WARP_BEGIN) and warp_idx < Int32(self.REDUCE_WARP_BEGIN):
+                    self._fill_dot_a_tmem(
+                        mdO,
+                        dot_do_mn_view,
+                        resident_do_ready_mbar,
+                        token_idx,
+                        batch_idx,
+                        rank,
+                        tidx - Int32(self.MATH_THREAD_BEGIN),
+                        0,
+                    )
         if warp_idx < Int32(self.MATH_WARP_BEGIN):
             if cutlass.const_expr(self.GATHER_SETMAXREG > 96):
                 cute.arch.setmaxregister_increase(self.GATHER_SETMAXREG)
@@ -3090,6 +3427,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             if cutlass.const_expr(not split_regime and self.max_topk != 128):
                 dq0_free_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             dq0_done_gather_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+            dqt_done_gather_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             gather_kd_rows_0 = self._kd_round_rows(kdq_loan[0])
             gather_kd_rows_1 = self._kd_round_rows(kdq_loan[1])
             if my_tile_count > Int32(0):
@@ -3483,10 +3821,25 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                         batch_idx,
                         rank,
                         tidx,
-                        4 if self.max_topk == 128 else 2,
+                        4,
                     )
                     pipe_dq0_done.consumer_release(dq0_done_gather_state)
                     dq0_done_gather_state.advance()
+                    # The D64 tail has its own completion edge.  Finished
+                    # gather warps drain it while the math warpgroup drains
+                    # panel 1, removing the former serial tail epilogue.
+                    pipe_dqt_done.consumer_wait(dqt_done_gather_state)
+                    self._store_dqt_epi(
+                        t_dqt,
+                        dqt_tiled_mma,
+                        mdQ,
+                        token_idx,
+                        batch_idx,
+                        rank,
+                        tidx,
+                    )
+                    pipe_dqt_done.consumer_release(dqt_done_gather_state)
+                    dqt_done_gather_state.advance()
                 pipe_kscore.producer_tail(gather_state)
             elif cutlass.const_expr(mTopkLength is not None):
                 # Retire the speculative Q-tail, index staging and first
@@ -3494,8 +3847,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                 # worker) row.
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
-            if cutlass.const_expr(self.max_topk == 128):
-                cute.arch.setmaxregister_decrease(24)
+            cute.arch.setmaxregister_decrease(24)
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
             if my_tile_count > Int32(0):
@@ -3769,7 +4121,6 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                     self._store_dq_epi_scalar_direct(
                         t_dq[1], dq_tmem_load, rank_dq_coordinates, mdQ, 1, token_idx, batch_idx, rank, mtx, self.DQ_EPI_BATCH_CHUNKS
                     )
-                    self._store_dqt_epi(t_dqt, dqt_tiled_mma, mdQ, token_idx, batch_idx, rank, mtx)
                     pipe_dq_done.consumer_release(dq_done_state)
                     dq_done_state.advance()
                 else:
@@ -3890,6 +4241,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                     if cutlass.const_expr(self.max_topk != 128):
                         dq0_free_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
                 dq_done_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+                dqt_done_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
                 dq0_done_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
                 if my_tile_count > Int32(0):
                     _mbarrier_wait_acquire_cluster(stationary_ready_mbar, Int32(0))
@@ -3897,6 +4249,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                         pipe_dq0_done.producer_acquire(dq0_done_prod)
                 if is_dq_owner:
                     pipe_dq_done.producer_acquire(dq_done_prod)
+                    pipe_dqt_done.producer_acquire(dqt_done_prod)
                 relay_phase = Int32(0)
                 for loop_iter in cutlass.range(my_tile_count):
                     pipe_kscore.consumer_wait(kscore_cons)
@@ -3963,6 +4316,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                                 dq0_done_prod,
                                 pipe_dq_done,
                                 dq_done_prod,
+                                pipe_dqt_done,
+                                dqt_done_prod,
                                 loop_iter == my_tile_count - Int32(1),
                                 pipe_pds,
                                 pds_cons,
@@ -3991,6 +4346,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                                 dq0_done_prod,
                                 pipe_dq_done,
                                 dq_done_prod,
+                                pipe_dqt_done,
+                                dqt_done_prod,
                                 loop_iter == my_tile_count - Int32(1),
                                 pipe_pds,
                                 pds_cons,
@@ -4051,6 +4408,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                             dq0_done_prod,
                             pipe_dq_done,
                             dq_done_prod,
+                            pipe_dqt_done,
+                            dqt_done_prod,
                             loop_iter == my_tile_count - Int32(1),
                             pipe_dq0_free if self.max_topk != 128 else None,
                             dq0_free_prod if self.max_topk != 128 else None,
@@ -4069,7 +4428,9 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                     if is_dq_owner:
                         dq0_done_prod.advance()
                         dq_done_prod.advance()
+                        dqt_done_prod.advance()
                         pipe_dq_done.producer_tail(dq_done_prod)
+                        pipe_dqt_done.producer_tail(dqt_done_prod)
                         pipe_dq0_done.producer_tail(dq0_done_prod)
         elif warp_idx == Int32(self.TAIL_WARP):
             # In non-split mode, the utility warp is the second UMMA issuer.
@@ -4083,28 +4444,41 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                     dkv_acq = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.MMA_DONE_STAGES)
                     dkv_com = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.MMA_DONE_STAGES)
                     relay_phase = Int32(0)
+                    if cutlass.const_expr(self.TMEM_RESIDENT_DO):
+                        if my_tile_count > Int32(0):
+                            _mbarrier_wait_acquire_cluster(resident_do_ready_mbar, Int32(0))
                     for loop_iter in cutlass.range(my_tile_count):
                         pipe_dkv_done.producer_acquire(dkv_acq)
                         dkv_acq.advance()
                         pipe_p_free.consumer_wait(p_free_tail_cons)
                         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
-                        round_cons = self._issue_dkv_sweep(
-                            dkv_tiled_mma,
-                            t_dkv[0],
-                            round_fragments[0 % len(round_fragments)],
-                            round_fragments[1 % len(round_fragments)],
-                            round_fragments[2 % len(round_fragments)],
-                            round_fragments[3 % len(round_fragments)],
-                            round_fragments[4 % len(round_fragments)],
-                            round_fragments[5 % len(round_fragments)],
-                            round_fragments[6 % len(round_fragments)],
-                            round_fragments[7 % len(round_fragments)],
-                            p_fragments[0],
-                            p_fragments[1],
-                            False,
-                            pipe_round,
-                            round_cons,
-                        )
+                        if cutlass.const_expr(self.TMEM_RESIDENT_DO):
+                            self._issue_dkv_tmem_sweep(
+                                dkv_tmem_mma,
+                                t_dkv[0],
+                                dot_do_fragment,
+                                p_fragments_tmem[0],
+                                p_fragments_tmem[1],
+                                False,
+                            )
+                        else:
+                            round_cons = self._issue_dkv_sweep(
+                                dkv_tiled_mma,
+                                t_dkv[0],
+                                round_fragments[0 % len(round_fragments)],
+                                round_fragments[1 % len(round_fragments)],
+                                round_fragments[2 % len(round_fragments)],
+                                round_fragments[3 % len(round_fragments)],
+                                round_fragments[4 % len(round_fragments)],
+                                round_fragments[5 % len(round_fragments)],
+                                round_fragments[6 % len(round_fragments)],
+                                round_fragments[7 % len(round_fragments)],
+                                p_fragments[0],
+                                p_fragments[1],
+                                False,
+                                pipe_round,
+                                round_cons,
+                            )
                         pipe_dkv_done.producer_acquire(dkv_acq)
                         dkv_acq.advance()
                         round_cons = self._issue_dkv_sweep(
@@ -4201,25 +4575,25 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                 if has_dkv:
                     round_count = my_tile_count
                 for loop_iter in cutlass.range(round_count):
-                    # ROUND_GENS_PER_TILE generations per KV tile.  Split
-                    # workers interleave dO/Q generations. The
-                    # non-split two-issuer schedule groups both dO rounds
-                    # before both Q rounds so the tail warp can finish and
-                    # release P after dV0+dV1 while the load warp fills the Q
-                    # generations needed by dK0+dK1.
+                    # The resident-dO plan skips the first dO D-round and
+                    # streams dO round 1 followed by both Q rounds. Other
+                    # plans retain the complete original generation order.
                     gens_per_group = self.H_TILE_CLUSTER // self.ROUND_K_HEADS
-                    for micro_gen in cutlass.range_constexpr(self.ROUND_GENS_PER_TILE):
+                    for micro_gen in cutlass.range_constexpr(self.RING_GENS_PER_TILE):
+                        shifted_gen = micro_gen
+                        if cutlass.const_expr(self.TMEM_RESIDENT_DO):
+                            shifted_gen = micro_gen + gens_per_group
                         if cutlass.const_expr(split_regime):
-                            grad_round = micro_gen // (2 * gens_per_group)
-                            tensor_kind = (micro_gen // gens_per_group) % 2
+                            grad_round = shifted_gen // (2 * gens_per_group)
+                            tensor_kind = (shifted_gen // gens_per_group) % 2
                         else:
-                            tensor_kind = micro_gen // (2 * gens_per_group)
-                            grad_round = (micro_gen // gens_per_group) % 2
-                        h_half = micro_gen % gens_per_group
+                            tensor_kind = shifted_gen // (2 * gens_per_group)
+                            grad_round = (shifted_gen // gens_per_group) % 2
+                        h_half = shifted_gen % gens_per_group
                         round_slot = micro_gen % self.ROUND_STAGES
                         round_acq = pipeline.PipelineState(
                             self.ROUND_STAGES,
-                            loop_iter * Int32(self.ROUND_GENS_PER_TILE) + Int32(micro_gen),
+                            loop_iter * Int32(self.RING_GENS_PER_TILE) + Int32(micro_gen),
                             Int32(round_slot),
                             Int32(1 ^ micro_gen // self.ROUND_STAGES & 1),
                         )
@@ -4240,7 +4614,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                                 tma_bar_ptr=round_completion_mbar,
                             )
                 if has_dkv:
-                    round_tail = pipeline.PipelineState(self.ROUND_STAGES, my_tile_count * Int32(self.ROUND_GENS_PER_TILE), Int32(0), Int32(1))
+                    round_tail = pipeline.PipelineState(self.ROUND_STAGES, my_tile_count * Int32(self.RING_GENS_PER_TILE), Int32(0), Int32(1))
                     pipe_round.producer_tail(round_tail)
             else:
                 if cutlass.const_expr(mTopkLength is not None and self.max_topk == 128):
@@ -4302,7 +4676,15 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
         if warp_idx == Int32(self.MATH_WARP_BEGIN):
-            cute.arch.dealloc_tmem(tmem_ptr, self.TMEM_COLUMNS, is_two_cta=True)
+            if cutlass.const_expr(self.TMEM_RESIDENT_DO):
+                cute.arch.dealloc_tmem(
+                    tmem_ptr,
+                    self.TMEM_ALLOC_COLUMNS,
+                    is_two_cta=True,
+                    arch=self.TMEM_ARCH,
+                )
+            else:
+                cute.arch.dealloc_tmem(tmem_ptr, self.TMEM_COLUMNS, is_two_cta=True)
 
     @staticmethod
     def _make_umma_async_pipeline(num_stages, producer_group, consumer_group, barrier_storage, cluster_layout_vmnk):
@@ -4393,6 +4775,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             dq0_free_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            dqt_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dq0_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             stationary_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             stationary_ready_mbar: cute.struct.MemRange[cutlass.Int64, 2]
@@ -4403,6 +4786,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             p_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
             ds_local_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             tail_ld_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            resident_do_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             stationary_q: cute.struct.Align[cute.struct.MemRange[element_dtype, 32768], 1024]
@@ -4442,6 +4826,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         dq0_done_state: pipeline.PipelineState,
         dq1_done_pipeline,
         dq1_done_state: pipeline.PipelineState,
+        dqt_done_pipeline,
+        dqt_done_state: pipeline.PipelineState,
         commit_final: cutlass.Boolean,
         dq0_free_pipeline=None,
         dq0_free_commit_state: Optional[pipeline.PipelineState] = None,
@@ -4486,6 +4872,10 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                         t_dq_1,
                     )
                     mma.set(tcgen05.Field.ACCUMULATE, True)
+        if commit_final:
+            # Panel 1 can drain independently of the D64 tail below.
+            cute.arch.fence_view_async_tmem_store()
+            dq1_done_pipeline.producer_commit(dq1_done_state)
         # The score_kv loan backs only the two main dQ panels above.  The
         # D64 tail below reads the independent dS image and K-tail buffer, so
         # return the loan here and let the gather warps start the next score
@@ -4513,7 +4903,7 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             dqt_mma.set(tcgen05.Field.ACCUMULATE, True)
         cute.arch.fence_view_async_tmem_store()
         if commit_final:
-            dq1_done_pipeline.producer_commit(dq1_done_state)
+            dqt_done_pipeline.producer_commit(dqt_done_state)
         return kscore_consumer_state
 
     @cute.jit
@@ -4538,6 +4928,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         dq0_done_state: pipeline.PipelineState,
         dq1_done_pipeline,
         dq1_done_state: pipeline.PipelineState,
+        dqt_done_pipeline,
+        dqt_done_state: pipeline.PipelineState,
         commit_final: cutlass.Boolean,
         pds_pipeline,
         pds_consumer_state: pipeline.PipelineState,
@@ -4563,6 +4955,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             dq0_done_state,
             dq1_done_pipeline,
             dq1_done_state,
+            dqt_done_pipeline,
+            dqt_done_state,
             commit_final,
         )
         return (kscore_consumer_state, pds_consumer_state)
@@ -4703,6 +5097,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
         dq0_done_state: pipeline.PipelineState,
         dq1_done_pipeline,
         dq1_done_state: pipeline.PipelineState,
+        dqt_done_pipeline,
+        dqt_done_state: pipeline.PipelineState,
         commit_final: cutlass.Boolean,
         pds_pipeline,
         pds_consumer_state: pipeline.PipelineState,
@@ -4748,6 +5144,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
             dq0_done_state,
             dq1_done_pipeline,
             dq1_done_state,
+            dqt_done_pipeline,
+            dqt_done_state,
             commit_final,
         )
 
@@ -4851,8 +5249,8 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                     for line in cutlass.range_constexpr(4):
                         _prefetch_o_row_l2(row_base + Int32(64 * (5 + line)))
         else:
-            # Prefetch the first sixteen rank-owned KV rows while the dKV
-            # atomic stream competes for L2 capacity.
+            # Prefetch eight rank-owned KV rows while the dKV atomic stream
+            # competes for L2 capacity.
             for wave in cutlass.range_constexpr(1):
                 linear = role_tidx + Int32(wave * self.GATHER_THREADS)
                 # Declared ahead of the dynamic branch: DSL 4.5 rejects a
@@ -5183,7 +5581,11 @@ class FlashAttentionDSABackwardSm107H128D576TwoCTA:
                                 tail_cache_policy,
                             )
                         else:
-                            cute.arch.atomic_add(pointer.llvm_ptr, pair_values.load())
+                            _red_global_add_f32x2_relaxed(
+                                pointer,
+                                pair_values[0],
+                                pair_values[1],
+                            )
                 else:
                     row = idx_hi
                     if kv0 == row_lo:

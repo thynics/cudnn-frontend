@@ -218,14 +218,30 @@ def _prefetch_o_row_bulk_l2(source: cute.Pointer, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _prefetch_stats_row_bulk_l2(source: cute.Pointer, *, loc=None, ip=None) -> None:
+    """Best-effort bulk-prefetch one contiguous 256-byte FP32 stats half-row."""
+
+    source_i64 = source.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [source_i64, Int32(256).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _load_o_bf16x16(source: cute.Pointer, *, loc=None, ip=None) -> U64x4:
-    """Policy-neutral O load; pure because O is immutable during this kernel."""
+    """Load immutable O without allocating its one-use line in L1."""
     source_i64 = source.toint(loc=loc, ip=ip).ir_value()
     result_type = llvm.StructType.get_literal([T.i64()] * 4)
     value = llvm.inline_asm(
         result_type,
         [source_i64],
-        "ld.global.v4.u64 {$0, $1, $2, $3}, [$4];",
+        "ld.global.L1::no_allocate.v4.u64 {$0, $1, $2, $3}, [$4];",
         "=l,=l,=l,=l,l",
         has_side_effects=False,
         is_align_stack=False,
@@ -975,14 +991,18 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
         # are fixed by the plan; sequence extents themselves remain dynamic.
         self.COMPACT_SHORT = max_topk == 128 and short_sq
         self.EARLY_DQ0_RELEASE = not self.COMPACT_SHORT
-        self.USE_TMA_TAIL = self.COMPACT_SHORT or max_topk == 512
+        # Every schedule's finalizer grid has enough dKV conversion blocks to
+        # hide the dSink descriptor/store issue, so all plans use the bulk
+        # reduce-add tail: one TMA reduction per query chunk replaces 128
+        # relaxed FP32 dSink atomics while keeping FP32 addition throughout.
+        self.USE_TMA_TAIL = True
         self.DSINK_TMA_BLOCK_Q = 32 if short_sq else 64
         # The short compact schedule gathers both halves. Other schedules
         # reuse the rank-owned score operand and refetch only the peer half.
         self.KDQ_REFETCH_HALF = not self.COMPACT_SHORT
-        # All selected schedules use K64/depth-2; resident operands reduce
-        # the number of ring generations at TopK512 and above.
-        self.ROUND_K_HEADS = 64
+        # TopK128 uses four K32 stages so its TMA producer can run a
+        # complete dKV sweep ahead. Other schedules use a K64/depth-2 ring.
+        self.ROUND_K_HEADS = 32 if max_topk == 128 else 64
         assert self.H_TILE_CLUSTER % self.ROUND_K_HEADS == 0
         self.ROUND_TILER = (self.D_TILE_CLUSTER, self.N_TILE, self.ROUND_K_HEADS)
         self.ROUND_STAGE_ELEMENTS = self.D_TILE_CTA * self.ROUND_K_HEADS
@@ -1319,10 +1339,12 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
         slot: Int32,
         tidx: Int32,
     ) -> None:
-        """Sixteen threads copy one complete N64 index tile to one SMEM slot."""
+        """Each gather warp stages the four index vectors it consumes."""
 
-        if tidx < Int32(16):
-            lane_base = tidx * Int32(4)
+        gather_warp = tidx // Int32(32)
+        gather_lane = tidx % Int32(32)
+        if gather_lane < Int32(4):
+            lane_base = gather_warp * Int32(4) + gather_lane * Int32(16)
             position = tile_index * Int32(self.N_TILE) + lane_base
             source = mTopkIdxs.iterator + mTopkIdxs.layout((position, (token_idx, batch_idx)))
             destination = tile_indices.iterator + tile_indices.layout((lane_base, slot))
@@ -1692,12 +1714,12 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
             min_blocks_per_mp=1,
             use_pdl=True,
         )
-        # 16-row convert blocks double the non-2048 tail grid (SKV/16 vs
-        # SKV/32 blocks), covering all 216 SMs during the bandwidth-bound
-        # FP32-to-BF16 conversion.
-        self.block_seq = 4 if self.max_topk == 2048 else 16
+        # K2048 uses an eight-row, 256-thread conversion block: its grid still
+        # fills GR100 while halving scheduler traffic versus four-row blocks.
+        # Other widths retain the established sixteen-row partition.
+        self.block_seq = 8 if self.max_topk == 2048 else 16
         self.num_threads_D_convert = 32
-        self.num_threads_seq = 4 if self.max_topk == 2048 else self.block_seq
+        self.num_threads_seq = self.block_seq
         convert_grid_x = (mKV.shape[0] + self.block_seq - 1) // self.block_seq
         dsink_rows_per_block = self.DSINK_TMA_BLOCK_Q if self.USE_TMA_TAIL else self.DSINK_BLOCK_Q
         dsink_grid_x = cute.ceil_div(problem_shape[0], dsink_rows_per_block)
@@ -1924,8 +1946,6 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
 
         cute.copy(tiled_t2r_0, thread_source_0, thread_values_0)
         cute.arch.fence_view_async_tmem_load()
-        if cutlass.const_expr(self.max_topk == 128):
-            cute.arch.sync_warp()
         with cute.arch.elect_one():
             done_pipeline.consumer_release(release_state)
         release_state.advance()
@@ -1958,8 +1978,6 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
         wait_state.advance()
         cute.copy(tiled_t2r_1, thread_source_1, thread_values_1)
         cute.arch.fence_view_async_tmem_load()
-        if cutlass.const_expr(self.max_topk == 128):
-            cute.arch.sync_warp()
         with cute.arch.elect_one():
             done_pipeline.consumer_release(release_state)
         release_state.advance()
@@ -2655,6 +2673,10 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
         updates.
         """
 
+        # This is the first PDL-enabled launch of an invocation.  Preserve
+        # same-stream RAW/WAR/WAW ordering with an arbitrary preceding grid
+        # before clearing caller-owned outputs and scratch.
+        cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, batch_idx = cute.arch.block_idx()
@@ -3037,6 +3059,18 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
                     tidx,
                 )
                 cute.arch.cp_async_commit_group()
+        # On the long TopK128 schedule the folded-LSE chain is a visible
+        # prologue; warm its rank-owned LSE and sink half-rows before the TMEM
+        # allocation rendezvous. Other schedules compile this block away.
+        if cutlass.const_expr(self.max_topk == 128 and not self.COMPACT_SHORT):
+            if warp_idx >= Int32(self.REDUCE_WARP_BEGIN) and warp_idx < Int32(self.MMA_WARP):
+                stats_tidx_early = tidx - Int32(self.REDUCE_THREAD_BEGIN)
+                if stats_tidx_early == Int32(0):
+                    lse_source = mLSE.iterator + mLSE.layout((rank * Int32(self.H_TILE_CTA), (token_idx, batch_idx)))
+                    _prefetch_stats_row_bulk_l2(lse_source)
+                if stats_tidx_early == Int32(32):
+                    sink_source = mAttnSink.iterator + mAttnSink.layout((rank * Int32(self.H_TILE_CTA), (0, batch_idx)))
+                    _prefetch_stats_row_bulk_l2(sink_source)
         if cutlass.const_expr(self.TMEM_RESIDENT_OPERANDS):
             tmem = cutlass_memory.TmemAllocator(
                 tmem_holding_buf_ptr,
@@ -3157,7 +3191,7 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
                 # the TMEM allocation rendezvous.
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.fence_view_async_shared()
-                self.gather_barrier.arrive_and_wait()
+                cute.arch.sync_warp()
                 pipe_kscore.producer_acquire(gather_state)
                 self._load_score_kv_indexed(
                     mKV,
@@ -3194,51 +3228,33 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
                             next_index_slot,
                             tidx,
                         )
-                    if cutlass.const_expr(True):
-                        pre_kv_0, pre_kv_1, pre_kv_2, pre_kv_3 = self._resolve_kdq_row_indices(
-                            staged_indices[None, index_slot],
-                            tile_count - Int32(1) - score_iter,
-                            topk,
-                            rank,
-                            tidx,
-                        )
-                        pipe_kscore.producer_acquire(gather_state)
-                        self._gather_kdq_indexed(
-                            mKV,
-                            mTopkIdxs,
-                            staged_indices[None, index_slot],
-                            gather_kd_rows_0,
-                            gather_kd_rows_1,
-                            token_idx,
-                            batch_idx,
-                            tile_count - Int32(1) - score_iter,
-                            topk,
-                            rank,
-                            tidx,
-                            kv_copy_atom,
-                            kv_thread_copy,
-                            pre_kv_index_0=pre_kv_0,
-                            pre_kv_index_1=pre_kv_1,
-                            pre_kv_index_2=pre_kv_2,
-                            pre_kv_index_3=pre_kv_3,
-                        )
-                    else:
-                        pipe_kscore.producer_acquire(gather_state)
-                        self._gather_kdq_indexed(
-                            mKV,
-                            mTopkIdxs,
-                            staged_indices[None, index_slot],
-                            gather_kd_rows_0,
-                            gather_kd_rows_1,
-                            token_idx,
-                            batch_idx,
-                            tile_count - Int32(1) - score_iter,
-                            topk,
-                            rank,
-                            tidx,
-                            kv_copy_atom,
-                            kv_thread_copy,
-                        )
+                    pre_kv_0, pre_kv_1, pre_kv_2, pre_kv_3 = self._resolve_kdq_row_indices(
+                        staged_indices[None, index_slot],
+                        tile_count - Int32(1) - score_iter,
+                        topk,
+                        rank,
+                        tidx,
+                    )
+                    pipe_kscore.producer_acquire(gather_state)
+                    self._gather_kdq_indexed(
+                        mKV,
+                        mTopkIdxs,
+                        staged_indices[None, index_slot],
+                        gather_kd_rows_0,
+                        gather_kd_rows_1,
+                        token_idx,
+                        batch_idx,
+                        tile_count - Int32(1) - score_iter,
+                        topk,
+                        rank,
+                        tidx,
+                        kv_copy_atom,
+                        kv_thread_copy,
+                        pre_kv_index_0=pre_kv_0,
+                        pre_kv_index_1=pre_kv_1,
+                        pre_kv_index_2=pre_kv_2,
+                        pre_kv_index_3=pre_kv_3,
+                    )
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
@@ -3246,7 +3262,7 @@ class FlashAttentionDSABackwardSm107TwoIssuerDq4:
                         pipe_kscore.producer_commit(gather_state)
                     gather_state.advance()
                     if score_iter != tile_count - Int32(1):
-                        self.gather_barrier.arrive_and_wait()
+                        cute.arch.sync_warp()
                         next_iter = score_iter + Int32(1)
                         if cutlass.const_expr(self.EARLY_DQ0_RELEASE):
                             pipe_dq0_free.consumer_wait(dq0_free_state)
