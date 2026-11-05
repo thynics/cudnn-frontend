@@ -307,6 +307,7 @@ class SparseAttentionBackward(APIBase):
                 head_dim,
                 num_heads,
                 self.deterministic_relay_cluster_size,
+                max_topk=self.topk_idxs_desc.shape[1],
             )
         elif major == 10 and self.deterministic_relay_cluster_size is not None:
             raise ValueError("deterministic_relay_cluster_size is supported only by the deterministic SM100 generic_m64 backend")
@@ -369,11 +370,16 @@ class SparseAttentionBackward(APIBase):
                     self.deterministic,
                     self.q_desc.shape[1],
                     (
-                        _iface_d576._deterministic_compact_slots(torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count)
+                        _iface_d576._deterministic_compact_slots(
+                            torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count,
+                            _iface_d576._rank_shard_rounds(self.kv_desc.shape[0], self.topk_idxs_desc.shape[1], self.deterministic, self.q_desc.shape[1]),
+                        )
                         if self.deterministic
                         else 74
                     ),
                     self._wide_addressing,
+                    _iface_d576._rank_shard_rounds(self.kv_desc.shape[0], self.topk_idxs_desc.shape[1], self.deterministic, self.q_desc.shape[1]),
+                    _iface_d576._odo_precompute(self.kv_desc.shape[0], self.topk_idxs_desc.shape[1], self.deterministic, self.q_desc.shape[1]),
                 )
             return
         if self.deterministic and self._device_major == 10:
@@ -387,6 +393,7 @@ class SparseAttentionBackward(APIBase):
                 head_dim,
                 num_heads,
                 self.deterministic_relay_cluster_size,
+                max_topk=self.topk_idxs_desc.shape[1],
             )
             shards = kernel_cls.num_dkv_shards
             relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1)
@@ -404,6 +411,8 @@ class SparseAttentionBackward(APIBase):
                     shards,
                     relay_cluster_size,
                     self._wide_addressing,
+                    rank_fused=getattr(kernel_cls, "rank_fused", False),
+                    rank_few_planes=getattr(kernel_cls, "rank_few_planes", False),
                 )
             return
         if self._device_major == 10:
@@ -435,8 +444,13 @@ class SparseAttentionBackward(APIBase):
         masks; the eight-plane memory-first tier is selected when the preferred
         relay would exceed 32 GiB. An explicit relay cluster size reports that
         exact specialization even when it exceeds the automatic budget.
-        Deterministic H96/H128 D576 two-CTA plans use the compact 96-plane
-        capacity. On SM90, logical cluster sizes 4, 8, 16, 32, and 64 use 32,
+        Deterministic H128 D512 and D576 two-CTA plans use conflict-rank dKV
+        storage when it fits their private-plane layout (128 D512 or 96 D576
+        FP32 planes) and that layout otherwise; H96 D576 plans use the 96-plane
+        layout. The D576 conflict-rank size depends on the SM count of the plan
+        device (the cluster pairs each wave round launches), so query it for
+        the device that executes the plan: a size from a device with fewer SMs
+        can be too small, and ``execute()`` then rejects the workspace. On SM90, logical cluster sizes 4, 8, 16, 32, and 64 use 32,
         16, 8, 4, and 2 FP32 planes respectively, followed by packed relay-mask
         rows. The returned size is authoritative for this plan; ``execute()``
         accepts a larger contiguous uint8 buffer on the plan device but never
@@ -462,6 +476,13 @@ class SparseAttentionBackward(APIBase):
                 deterministic=self.deterministic,
                 deterministic_relay_cluster_size=self._sm90_deterministic_relay_cluster_size,
             )
+        launch_pairs = None
+        if self.deterministic and self._backend in _iface_d576.BACKENDS:
+            # Conflict-rank slot regions follow the wave this device launches.
+            launch_pairs = _iface_d576._deterministic_compact_slots(
+                torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count,
+                _iface_d576._rank_shard_rounds(total_s_kv, self.topk_idxs_desc.shape[1], self.deterministic, self.q_desc.shape[1]),
+            )
         return _iface_sm100.flash_attn_bwd_sm100_workspace_size(
             total_s_q,
             total_s_kv,
@@ -470,6 +491,8 @@ class SparseAttentionBackward(APIBase):
             self.deterministic,
             backend=self._backend,
             deterministic_relay_cluster_size=self.deterministic_relay_cluster_size,
+            max_topk=self.topk_idxs_desc.shape[1],
+            launch_pairs=launch_pairs,
         )
 
     def execute(

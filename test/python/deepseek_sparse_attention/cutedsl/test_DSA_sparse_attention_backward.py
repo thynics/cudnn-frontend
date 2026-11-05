@@ -11,6 +11,7 @@ import inspect
 import math
 import re
 import textwrap
+import types
 
 import pytest
 import torch
@@ -1298,6 +1299,554 @@ def test_DSA_sparse_attention_backward_sm100_d576_two_cta_repeat1000(num_heads):
         _exercise_deterministic_sm100_case(num_heads, 576, 257, 256, repeats=1000, topk=128)
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+# Deterministic H128 two-CTA KV extents per head dim and top-k width that select conflict-rank dKV
+# storage, and extents that keep the private-plane layout (checked by ``_h128_conflict_rank_selected``).
+_H128_CONFLICT_RANK_S_KV = {
+    512: {
+        "conflict_rank": {128: 4096, 512: 4096, 1024: 4096, 1152: 4096, 2048: 4096},
+        "private_plane": {128: 64, 512: 256, 1024: 512, 1152: 576, 2048: 1024},
+    },
+    576: {
+        "conflict_rank": {128: 4096, 512: 4096, 1024: 4096, 1152: 4096, 2048: 4096},
+        "private_plane": {128: 256, 512: 2048, 1024: 1024, 1152: 2048, 2048: 2048},
+    },
+}
+# Scratch bytes past ``scratch_workspace_bytes()`` that the H128 deterministic tests allocate with a
+# sentinel value and check afterwards: a launch that writes beyond the reported size changes them.
+_H128_SCRATCH_TAIL_BYTES = 1 << 20
+_H128_SCRATCH_TAIL_VALUE = 0x5A
+
+
+def _h128_conflict_rank_selected(head_dim, s_kv, topk):
+    """Whether the deterministic H128 two-CTA plan for this KV extent and top-k width uses conflict-rank dKV storage."""
+    if head_dim == 512:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+        kernel_cls = interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, s_kv, 512, 128, None, max_topk=topk)
+        return bool(getattr(kernel_cls, "rank_shard", False))
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+    return interface._rank_shard_rounds(s_kv, topk, True, 128) > 0
+
+
+def _h128_private_plane_workspace_bytes(s_q, s_kv, head_dim):
+    """Caller scratch of the private-plane deterministic H128 layout (``max_topk`` omitted)."""
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    backend = "h128_2cta_m64" if head_dim == 512 else "h128_d576_2cta_m64"
+    return interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, 128, True, backend=backend)
+
+
+def _h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, *, has_topk_length, invalid_entries=True):
+    """Deterministic H128 inputs with duplicate, ``-1`` and out-of-range top-k entries and edge lengths."""
+    device = "cuda"
+    q = torch.randn(s_q, 128, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(128, dtype=torch.float32, device=device)
+    if s_kv >= topk:
+        topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    else:
+        # Fewer KV rows than top-k slots: every query selects rows more than once.
+        topk_idxs = torch.randint(0, s_kv, (s_q, topk), dtype=torch.int32, device=device)
+    if invalid_entries:
+        # Every query repeats one row and carries a -1 sentinel and an out-of-range row (both inactive).
+        topk_idxs[:, 1] = topk_idxs[:, 0]
+        topk_idxs[:, 2] = -1
+        topk_idxs[:, topk - 1] = s_kv
+    topk_length = None
+    if has_topk_length:
+        topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device)
+        topk_length[0] = 0
+        topk_length[1 % s_q] = topk
+        topk_length[2 % s_q] = 1
+    softmax_scale = head_dim**-0.5
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
+    dout = torch.randn_like(out) / 10
+    return (q, kv, out, dout, lse, attn_sink, topk_idxs), topk_length, softmax_scale
+
+
+def _h128_deterministic_plan(head_dim, inputs, topk_length, softmax_scale):
+    """Compile a deterministic H128 two-CTA plan and allocate its outputs and its caller scratch.
+
+    Returns ``(plan, workspace, outputs, tail)``: ``workspace`` is exactly ``scratch_workspace_bytes()``
+    long and is followed in the same allocation by ``tail``, sentinel bytes that no launch may write
+    (``_assert_h128_scratch_tail_untouched``).
+    """
+    from cudnn import DSA
+
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    plan = DSA.SparseAttentionBackward(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        deterministic=True,
+    )
+    assert plan.check_support()
+    plan.compile()
+    assert plan._backend == ("h128_2cta_m64" if head_dim == 512 else "h128_d576_2cta_m64")
+    required = plan.scratch_workspace_bytes()
+    scratch = torch.full((required + _H128_SCRATCH_TAIL_BYTES,), _H128_SCRATCH_TAIL_VALUE, dtype=torch.uint8, device=q.device)
+    outputs = (torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink))
+    return plan, scratch[:required], outputs, scratch[required:]
+
+
+def _assert_h128_scratch_tail_untouched(tail):
+    """The sentinel bytes after the reported scratch size are intact: no launch wrote past it."""
+    torch.cuda.synchronize()
+    assert bool((tail == _H128_SCRATCH_TAIL_VALUE).all()), "a launch wrote past scratch_workspace_bytes()"
+
+
+def _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream):
+    dq, dkv, d_sink = outputs
+    return plan.execute(*inputs, dq, dkv, topk_length=topk_length, softmax_scale=softmax_scale, workspace=workspace, current_stream=stream, d_sink=d_sink)
+
+
+def _require_h128_two_cta():
+    _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("H128 two-CTA requires compute capability 10.0 or 10.3")
+
+
+def _check_h128_deterministic_case(head_dim, s_q, s_kv, topk, *, has_topk_length, layout, repeats, label):
+    """Run one deterministic H128 two-CTA case on poisoned scratch and outputs.
+
+    Checks the selected dKV layout (``layout``) and its scratch bound, the reference gradients, bitwise
+    reruns and the sentinel tail after the scratch.
+    """
+    from cuda.bindings import driver as cuda
+
+    assert _h128_conflict_rank_selected(head_dim, s_kv, topk) == (layout == "conflict_rank")
+    inputs, topk_length, softmax_scale = _h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, has_topk_length=has_topk_length)
+    plan, workspace, outputs, tail = _h128_deterministic_plan(head_dim, inputs, topk_length, softmax_scale)
+    private_plane = _h128_private_plane_workspace_bytes(s_q, s_kv, head_dim)
+    if layout == "conflict_rank":
+        assert workspace.numel() <= private_plane
+    else:
+        assert workspace.numel() == private_plane
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def run():
+        for buffer in (workspace, *outputs):
+            bitwise_bits(buffer).fill_(0xA5)
+        result = _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+        return tuple(tensor.clone() for tensor in result)
+
+    first = run()
+    torch.cuda.synchronize()
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    check_ref_dsa_sparse_attention_backward(
+        q, kv, attn_sink, topk_idxs, out, dout, lse, *first, softmax_scale=softmax_scale, topk_length=topk_length, atol=5e-2, rtol=5e-2
+    )
+    assert_bitwise_runs(run, repeats=repeats, label=label)
+    _assert_h128_scratch_tail_untouched(tail)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [512, 576], ids=["d512", "d576"])
+@pytest.mark.parametrize("topk", [128, 512, 1024, 1152, 2048])
+def test_DSA_sparse_attention_backward_h128_conflict_rank_workspace_bound(head_dim, topk):
+    """Conflict-rank plans are selected only where their scratch fits the private-plane layout."""
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    backend = "h128_2cta_m64" if head_dim == 512 else "h128_d576_2cta_m64"
+    pair_options = (None,) if head_dim == 512 else (None, 66, 74, 76)
+    selected = 0
+    for s_kv in (64, 256, 1024, 2048, 2097, 4096, 8192, 32768, 131072, 1 << 20):
+        for s_q in (1, 75, 4096):
+            private_plane = _h128_private_plane_workspace_bytes(s_q, s_kv, head_dim)
+            for launch_pairs in pair_options:
+                extra = {} if launch_pairs is None else {"launch_pairs": launch_pairs}
+                size = interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, 128, True, backend=backend, max_topk=topk, **extra)
+                assert size <= private_plane, f"S_kv={s_kv} S_q={s_q} pairs={launch_pairs}: {size} > {private_plane}"
+                if _h128_conflict_rank_selected(head_dim, s_kv, topk):
+                    selected += 1
+                else:
+                    assert size == private_plane
+    assert selected > 0
+    if topk in _H128_CONFLICT_RANK_S_KV[head_dim]["conflict_rank"]:
+        assert _h128_conflict_rank_selected(head_dim, _H128_CONFLICT_RANK_S_KV[head_dim]["conflict_rank"][topk], topk)
+        assert not _h128_conflict_rank_selected(head_dim, _H128_CONFLICT_RANK_S_KV[head_dim]["private_plane"][topk], topk)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sm_count", [132, 148, 152, 160, 264])
+def test_DSA_sparse_attention_backward_d576_conflict_rank_rounds_fit_ordinal_words(sm_count):
+    """Multi-round D576 conflict-rank waves keep their ordinal bits within the setup kernel's words."""
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+    rank_shard = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta_rank_shard")
+
+    unclamped = interface._deterministic_compact_slots(sm_count)
+    assert interface._deterministic_compact_slots(sm_count, 0) == unclamped
+    for rounds in (1, 2, 3):
+        pairs = interface._deterministic_compact_slots(sm_count, rounds)
+        assert rank_shard.rank_ordinal_words(rounds * pairs) <= rank_shard.RANK_MAX_ORDINAL_WORDS
+        assert pairs == min(unclamped, rank_shard.rank_max_round_pairs(rounds))
+    if sm_count == 148:
+        # B200 launches 74 pairs per round whatever the round count.
+        assert all(interface._deterministic_compact_slots(sm_count, rounds) == 74 for rounds in (0, 1, 2, 3))
+    if sm_count >= 152:
+        assert interface._deterministic_compact_slots(sm_count, 3) == 74
+
+
+def _h128_kernel_geometry(kernel, *names):
+    """Evaluate a conflict-rank kernel's layout methods (``rank_geometry``, ``rank_offsets``, ...) in Python integers.
+
+    The methods run at trace time on DSL integers built from trace-time attributes, so executing their
+    source with Python ints (``cute.round_up`` and ``cutlass.const_expr`` taken by their integer
+    meaning) yields the plane count and region offsets the kernels use. Floor division differs from
+    the DSL's only for a negative plane budget, which both clamp to the same plane count. Returns an
+    object whose ``names`` are those methods bound to ``kernel``; other attributes come from ``kernel``.
+    """
+    shims = {
+        "Int32": int,
+        "Int64": int,
+        "cute": types.SimpleNamespace(round_up=lambda value, multiple: -(-value // multiple) * multiple),
+        "cutlass": types.SimpleNamespace(const_expr=lambda value: value),
+    }
+    functions = {}
+    for name in names:
+        owner = next(cls for cls in type(kernel).__mro__ if name in vars(cls))
+        class_node = ast.parse(textwrap.dedent(inspect.getsource(owner))).body[0]
+        method = next(node for node in class_node.body if isinstance(node, ast.FunctionDef) and node.name == name)
+        method.decorator_list = []
+        namespace = {**vars(inspect.getmodule(owner)), **shims}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), f"<{owner.__name__}.{name}>", "exec"), namespace)
+        functions[name] = namespace[name]
+
+    class Geometry:
+        def __getattr__(self, attribute):
+            if attribute in functions:
+                return types.MethodType(functions[attribute], self)
+            return getattr(kernel, attribute)
+
+    return Geometry()
+
+
+# KV extents for the host-versus-kernel layout checks: about 1% apart from 1 to 4M rows, so plane-count
+# boundaries of both formulas fall between neighbouring extents.
+_H128_GEOMETRY_S_KV = sorted({int(1.01**step) for step in range(1530)} | {2097, 4097, (3 << 20) + 5})
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_d512_conflict_rank_host_layout_matches_kernel():
+    """The host D512 conflict-rank sizes equal the plane count and regions the kernels address."""
+    cutlass = _import_or_skip("cutlass")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    common = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common")
+    rank = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2cta_rank_shard")
+    geometries = {}
+    checked = 0
+    for topk in (128, 512, 1024, 1152, 2048):
+        for s_kv in _H128_GEOMETRY_S_KV:
+            kernel_cls = interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, s_kv, 512, 128, None, max_topk=topk)
+            if not getattr(kernel_cls, "rank_shard", False):
+                continue
+            if (kernel_cls, topk) not in geometries:
+                geometries[kernel_cls, topk] = _h128_kernel_geometry(kernel_cls(cutlass.BFloat16, 512, 512, 64, topk), "rank_geometry", "rank_offsets")
+            geometry = kernel = geometries[kernel_cls, topk]
+            wave = kernel.max_query_pairs_per_wave
+            pitch, planes = geometry.rank_geometry(s_kv)
+            counters = geometry.rank_offsets(pitch, planes)[-1]
+            fused = rank.rank_merged_fused(s_kv, topk, kernel.rank_record, wave)
+            case = f"K={topk} S_kv={s_kv}"
+            assert kernel.rank_fused == fused, case
+            assert planes == rank.rank_merged_planes(s_kv, topk, kernel.rank_record, wave, fused), case
+            device_words = counters + rank.RANK_MERGED_COUNTER_WORDS
+            assert device_words == rank.rank_merged_workspace_words(s_kv, topk, kernel.rank_record, wave), case
+            _, dkv_shape = common._workspace_shapes_sm100(1, s_kv, 512, 128, True, "h128_2cta_m64", max_topk=topk)
+            assert math.prod(dkv_shape) >= 4 * device_words, case
+            checked += 1
+    assert checked > 0
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sm_count", [132, 148, 152, 160])
+def test_DSA_sparse_attention_backward_d576_conflict_rank_host_layout_covers_kernel(sm_count):
+    """The host D576 conflict-rank sizes cover the plane count and regions the kernels address on a device."""
+    cutlass = _import_or_skip("cutlass")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+    common = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common")
+    rank = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta_rank_shard")
+    kernels = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta")
+    geometries = {}
+    checked = 0
+    for topk in (128, 512, 1024, 1152, 2048):
+        for s_kv in _H128_GEOMETRY_S_KV:
+            rounds = interface._rank_shard_rounds(s_kv, topk, True, 128)
+            if rounds == 0:
+                continue
+            pairs = interface._deterministic_compact_slots(sm_count, rounds)
+            if (topk, rounds) not in geometries:
+                kernel = kernels.FlashAttentionDSABackwardSm100H128D576TwoCTADeterministicRankShard(
+                    element_dtype=cutlass.BFloat16,
+                    head_dim=576,
+                    head_dim_v=512,
+                    block_tile=64,
+                    max_topk=topk,
+                    num_heads=128,
+                    compact_slots=pairs,
+                    rank_rounds=rounds,
+                )
+                geometries[topk, rounds] = _h128_kernel_geometry(kernel, "rank_geometry", "rank_offsets", "rank_sorted_base")
+            geometry = kernel = geometries[topk, rounds]
+            pitch, planes = geometry.rank_geometry(s_kv)
+            device_words = geometry.rank_offsets(pitch, planes)[6] + rank.RANK_COUNTER_REGION_WORDS
+            if kernel.rank_sorts():
+                # End of the last sorted-row parity.
+                device_words = geometry.rank_sorted_base(pitch, planes, rank.RANK_SORT_PARITIES - 1) + kernel.max_query_pairs_per_wave * topk
+            host_wave = interface._MAX_DETERMINISTIC_COMPACT_SLOTS
+            case = f"K={topk} S_kv={s_kv} SMs={sm_count}"
+            assert planes == min(rank.conflict_rank_planes(s_kv, topk, kernel.rank_record, host_wave), kernel.max_query_pairs_per_wave), case
+            assert device_words <= rank.conflict_rank_words(s_kv, topk, kernel.rank_record, host_wave, launch_pairs=pairs), case
+            _, dkv_shape = common._workspace_shapes_sm100(1, s_kv, 576, 128, True, "h128_d576_2cta_m64", max_topk=topk, launch_pairs=pairs)
+            assert math.prod(dkv_shape) >= 4 * device_words, case
+            checked += 1
+    assert checked > 0
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_d576_conflict_rank_rejects_oversized_wave():
+    """A conflict-rank class refuses a wave whose ordinal bits exceed the setup kernel's words."""
+    cutlass = _import_or_skip("cutlass")
+    kernels = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta")
+    arguments = dict(element_dtype=cutlass.BFloat16, head_dim=576, head_dim_v=512, block_tile=64, max_topk=512, num_heads=128)
+    kernels.FlashAttentionDSABackwardSm100H128D576TwoCTADeterministicRankShard(**arguments, compact_slots=74, rank_rounds=3)
+    with pytest.raises(ValueError, match="cluster pairs per round"):
+        kernels.FlashAttentionDSABackwardSm100H128D576TwoCTADeterministicRankShard(**arguments, compact_slots=76, rank_rounds=3)
+
+
+def _h128_conflict_rank_cases():
+    cases = []
+    for head_dim in (512, 576):
+        for layout in ("conflict_rank", "private_plane"):
+            for topk in (128, 512, 1024, 1152, 2048):
+                for has_topk_length in (True, False):
+                    level = pytest.mark.L1 if has_topk_length else pytest.mark.L2
+                    case_id = f"d{head_dim}-{layout}-k{topk}-{'lengths' if has_topk_length else 'full'}"
+                    cases.append(pytest.param(head_dim, layout, topk, has_topk_length, marks=level, id=case_id))
+    return cases
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("head_dim,layout,topk,has_topk_length", _h128_conflict_rank_cases())
+@torch_fork_set_rng(seed=20261104)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_deterministic(head_dim, layout, topk, has_topk_length):
+    """Conflict-rank and private-plane H128 plans: reference gradients, bounded scratch, bitwise reruns.
+
+    Several waves (more queries than one wave's cluster pairs), duplicate rows, -1 and out-of-range
+    entries, and zero, one and full ``topk_length`` values; workspace and outputs are poisoned before
+    every launch, and the bytes after the scratch keep their sentinel.
+    """
+    try:
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+
+    s_kv = _H128_CONFLICT_RANK_S_KV[head_dim][layout][topk]
+    s_q = 240 if (head_dim == 576 and topk == 512) else 160
+    _check_h128_deterministic_case(
+        head_dim, s_q, s_kv, topk, has_topk_length=has_topk_length, layout=layout, repeats=4, label=f"H128/D{head_dim} {layout} K={topk}"
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "head_dim,topk,s_q,s_kv",
+    [
+        pytest.param(512, 128, 160, 4096, id="d512-k128-fused"),
+        pytest.param(576, 1024, 10, 2097, id="d576-k1024-sorted-rows"),
+    ],
+)
+@torch_fork_set_rng(seed=20261108)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_smoke(head_dim, topk, s_q, s_kv):
+    """One conflict-rank plan per head dim at the default level.
+
+    D512: fused waves (each main kernel runs the previous wave's tail and prepares the next wave) over
+    three waves. D576: one-round waves with sorted rows, whose first main kernel reads the rows the
+    leading setup launch sorted.
+    """
+    try:
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+    if head_dim == 512:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+        assert interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, s_kv, 512, 128, None, max_topk=topk).rank_fused
+    else:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+        assert interface._rank_shard_rounds(s_kv, topk, True, 128) == 1
+    _check_h128_deterministic_case(head_dim, s_q, s_kv, topk, has_topk_length=True, layout="conflict_rank", repeats=2, label=f"H128/D{head_dim} smoke K={topk}")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize(
+    "topk,s_q,s_kv,rounds",
+    [
+        pytest.param(512, 240, 16384, 3, id="k512-three-rounds"),
+        pytest.param(1024, 10, 65536, 1, id="k1024-one-round"),
+    ],
+)
+@torch_fork_set_rng(seed=20261109)
+def test_DSA_sparse_attention_backward_d576_conflict_rank_in_kernel_odo(topk, s_q, s_kv, rounds):
+    """D576 conflict-rank plans past the O*dO precompute budget reduce O.dO inside the main kernel."""
+    try:
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+    assert interface._rank_shard_rounds(s_kv, topk, True, 128) == rounds
+    assert not interface._odo_precompute(s_kv, topk, True, 128)
+    _check_h128_deterministic_case(576, s_q, s_kv, topk, has_topk_length=True, layout="conflict_rank", repeats=3, label=f"H128/D576 in-kernel O*dO K={topk}")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize(
+    "head_dim,topk,s_q,s_kv,rounds",
+    [
+        pytest.param(512, 512, 96, 4096, None, id="d512-k512"),
+        pytest.param(512, 2048, 10, 4096, None, id="d512-k2048"),
+        # One wave: 96 queries of a 222-query three-round wave (the deterministic test runs two waves).
+        pytest.param(576, 512, 96, 4096, 3, id="d576-k512-three-rounds"),
+        pytest.param(576, 1024, 10, 2097, 1, id="d576-k1024-sorted-rows"),
+        pytest.param(576, 1152, 10, 2097, 1, id="d576-k1152-sorted-rows"),
+    ],
+)
+@pytest.mark.parametrize("has_topk_length", [True, False], ids=["lengths", "full"])
+@torch_fork_set_rng(seed=20261105)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_back_to_back_inputs(head_dim, topk, s_q, s_kv, rounds, has_topk_length):
+    """Back-to-back calls with different inputs on one workspace each match their own reference.
+
+    Repeating identical inputs would mask a launch that reads the previous call's rows or records,
+    so every call takes new indices, and the last one is rerun on poisoned scratch for a bitwise check.
+    ``rounds`` is the D576 wave round count the shapes select.
+    """
+    try:
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+    assert _h128_conflict_rank_selected(head_dim, s_kv, topk)
+    if rounds is not None:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+        assert interface._rank_shard_rounds(s_kv, topk, True, 128) == rounds
+
+    calls = [_h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, has_topk_length=has_topk_length) for _ in range(3)]
+    plan, workspace, outputs, tail = _h128_deterministic_plan(head_dim, *calls[0])
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    bitwise_bits(workspace).fill_(0xA5)
+    results = []
+    for inputs, topk_length, softmax_scale in calls:
+        results.append(tuple(tensor.clone() for tensor in _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)))
+    torch.cuda.synchronize()
+    for call, ((inputs, topk_length, softmax_scale), result) in enumerate(zip(calls, results)):
+        q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+        try:
+            check_ref_dsa_sparse_attention_backward(
+                q, kv, attn_sink, topk_idxs, out, dout, lse, *result, softmax_scale=softmax_scale, topk_length=topk_length, atol=5e-2, rtol=5e-2
+            )
+        except AssertionError as error:
+            raise AssertionError(f"back-to-back call {call} differs from its reference") from error
+    inputs, topk_length, softmax_scale = calls[-1]
+    bitwise_bits(workspace).fill_(0xA5)
+    rerun = _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+    torch.cuda.synchronize()
+    for name, actual, expected in zip(("dQ", "dKV", "dSink"), rerun, results[-1]):
+        assert torch.equal(bitwise_bits(actual), bitwise_bits(expected)), f"{name} depends on the previous call's scratch"
+    _assert_h128_scratch_tail_untouched(tail)
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("head_dim,topk", [(512, 512), (512, 1024), (576, 512), (576, 1024)], ids=["d512-k512", "d512-k1024", "d576-k512", "d576-k1024"])
+@torch_fork_set_rng(seed=20261106)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_cuda_graph_replay(head_dim, topk):
+    """A captured conflict-rank plan replays new inputs written into the captured buffers bitwise like eager calls."""
+    try:
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+
+    s_q, s_kv = 96, 4096
+    assert _h128_conflict_rank_selected(head_dim, s_kv, topk)
+    inputs, topk_length, softmax_scale = _h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, has_topk_length=True)
+    plan, workspace, outputs, tail = _h128_deterministic_plan(head_dim, inputs, topk_length, softmax_scale)
+    launch_stream = torch.cuda.Stream()
+    launch_stream.wait_stream(torch.cuda.current_stream())
+    stream = cuda.CUstream(launch_stream.cuda_stream)
+
+    with torch.cuda.stream(launch_stream):
+        _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=launch_stream):
+            _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+        for replay in range(2):
+            new_inputs, new_topk_length, _ = _h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, has_topk_length=True)
+            # The new inputs were produced on the current stream; the captured buffers are rewritten and
+            # replayed on the launch stream after them.
+            launch_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(launch_stream):
+                for buffer, value in zip(inputs, new_inputs):
+                    buffer.copy_(value)
+                topk_length.copy_(new_topk_length)
+                for buffer in (workspace, *outputs):
+                    bitwise_bits(buffer).fill_(0xA5)
+                graph.replay()
+            torch.cuda.synchronize()
+            replayed = tuple(tensor.clone() for tensor in outputs)
+            with torch.cuda.stream(launch_stream):
+                for buffer in (workspace, *outputs):
+                    bitwise_bits(buffer).fill_(0xA5)
+                eager = _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+            torch.cuda.synchronize()
+            for name, actual, expected in zip(("dQ", "dKV", "dSink"), replayed, eager):
+                assert torch.equal(bitwise_bits(actual), bitwise_bits(expected)), f"{name} graph replay {replay} differs from eager"
+            q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+            check_ref_dsa_sparse_attention_backward(
+                q, kv, attn_sink, topk_idxs, out, dout, lse, *replayed, softmax_scale=softmax_scale, topk_length=topk_length, atol=5e-2, rtol=5e-2
+            )
+        _assert_h128_scratch_tail_untouched(tail)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L2
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("head_dim,topk,s_kv", [(512, 1024, 131072), (576, 128, 131072)], ids=["d512-few-planes", "d576-two-rounds"])
+@torch_fork_set_rng(seed=20261107)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_long_kv(head_dim, topk, s_kv):
+    """Long KV extents: the few-plane D512 plan and the two-round top-k 128 D576 plan stay exact and reproducible."""
+    try:
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+    if head_dim == 512:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+        assert getattr(interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, s_kv, 512, 128, None, max_topk=topk), "rank_few_planes", False)
+    else:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+        assert interface._rank_shard_rounds(s_kv, topk, True, 128) == 2
+
+    _check_h128_deterministic_case(
+        head_dim, 160, s_kv, topk, has_topk_length=True, layout="conflict_rank", repeats=3, label=f"H128/D{head_dim} long KV K={topk}"
+    )
 
 
 @pytest.mark.L2
@@ -5809,6 +6358,8 @@ def test_DSA_sparse_attention_backward_sm90_relay_cuda_graph(relay_cluster_size)
         pytest.param(128, 576, 128, False, "off", "h128_d576_2cta_m64", id="h128-d576-2cta"),
         pytest.param(64, 576, 64, True, "off", "generic_m64", id="deterministic"),
         pytest.param(96, 576, 128, True, "off", "h96_d576_2cta_m64", id="deterministic-h96-d576-2cta"),
+        pytest.param(128, 512, 128, True, "off", "h128_2cta_m64", id="deterministic-h128-2cta"),
+        pytest.param(128, 576, 1024, True, "off", "h128_d576_2cta_m64", id="deterministic-h128-d576-2cta"),
         pytest.param(16, 576, 512, False, "adaptive_pair", "h16_m128", id="qcluster-h16"),
         pytest.param(32, 576, 512, False, "adaptive_pair", "h32_m64", id="qcluster-h32"),
     ],
@@ -5844,6 +6395,9 @@ def test_DSA_sparse_attention_backward_sm100_execute_allocates_nothing_and_never
     )
     assert plan._backend == expected_backend
     assert (plan._qcluster_plan is not None) == (q_cluster_mode == "adaptive_pair")
+    if deterministic and num_heads == 128:
+        # The deterministic H128 two-CTA entries run conflict-rank dKV storage (setup launches each wave).
+        assert _h128_conflict_rank_selected(head_dim, max(256, 2 * topk), topk)
     _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outputs, topk_length, softmax_scale, workspace)
 
 

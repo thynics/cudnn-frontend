@@ -16,6 +16,9 @@ from cudnn.frost.buffers import cutedsl_requirement_error, memset_zero_async
 from ._interface_sm100_common import (
     _BLACKWELL_CAPABILITIES,
     _align_workspace_bytes,
+    _h128_d512_rank_few_planes_selected,
+    _h128_d512_rank_fused_selected,
+    _h128_d512_rank_shard_selected,
     _requires_wide_data_addressing,
     _workspace_shapes_sm100,
     flash_attn_bwd_sm100_workspace_size,
@@ -165,8 +168,20 @@ def _get_sm100_kernel_class(
     head_dim: Optional[int] = None,
     num_heads: int = 64,
     deterministic_relay_cluster_size: Optional[int] = None,
+    max_topk: Optional[int] = None,
+    rank_shard: Optional[bool] = None,
+    rank_fused: Optional[bool] = None,
+    rank_few_planes: Optional[bool] = None,
 ):
     """Load the selected implementation without perturbing other variants.
+
+    Deterministic H128 D512 two-CTA plans use conflict-rank dKV storage when
+    its workspace for the KV extent and top-k width fits the private-plane
+    layout. Conflict-rank plans then run each wave's tail in the next main
+    kernel (fused) for narrow top-k with enough dense planes, or a setup launch
+    per wave, with the few-plane variant when they keep at most three dense planes.
+    ``rank_shard``, ``rank_fused`` and ``rank_few_planes`` override these shape
+    policies; ``None`` selects them from ``total_s_kv`` and ``max_topk``.
 
     Each variant lives in its own CuTe DSL class: embedding variant
     conditionals in a shared class measurably perturbs the code generation
@@ -178,9 +193,30 @@ def _get_sm100_kernel_class(
         if backend != "generic_m64":
             raise ValueError("deterministic_relay_cluster_size is supported only by the deterministic generic_m64 backend")
     if backend == "h128_2cta_m64":
-        from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA, FlashAttentionDSABackwardSm100H128TwoCTADeterministic
+        from .dsa_bwd_sm100_h128_2cta import (
+            FlashAttentionDSABackwardSm100H128TwoCTA,
+            FlashAttentionDSABackwardSm100H128TwoCTADeterministic,
+            FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShard,
+            FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFewPlanes,
+            FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFused,
+        )
 
-        return FlashAttentionDSABackwardSm100H128TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128TwoCTA
+        if not deterministic:
+            return FlashAttentionDSABackwardSm100H128TwoCTA
+        if rank_shard is None:
+            rank_shard = total_s_kv is not None and _h128_d512_rank_shard_selected(total_s_kv, max_topk)
+        if not rank_shard:
+            return FlashAttentionDSABackwardSm100H128TwoCTADeterministic
+        if rank_fused is None:
+            rank_fused = total_s_kv is not None and _h128_d512_rank_fused_selected(total_s_kv, max_topk)
+        if not rank_fused:
+            if rank_few_planes is None:
+                rank_few_planes = total_s_kv is not None and _h128_d512_rank_few_planes_selected(total_s_kv, max_topk)
+            if rank_few_planes:
+                # At most three dense planes: most shared rows overflow, so the drains overlap their lookups.
+                return FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFewPlanes
+            return FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShard
+        return FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFused
     if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
         from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA, FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic
 
@@ -332,12 +368,20 @@ def _compile_deterministic_sm100(
     deterministic_shards: int,
     deterministic_relay_cluster_size: int,
     wide_addressing: bool = False,
+    rank_fused: bool = False,
+    rank_few_planes: bool = False,
 ):
     """Compile one device-owned, shape-dynamic artifact from plan metadata.
 
     Query and KV extents remain symbolic, while dtype, head geometry, top-k
     width, optional-length presence, plane count, relay width, and address
-    width are compile-time facts.
+    width are compile-time facts. For the H128 D512 two-CTA backend, one
+    workspace plane selects conflict-rank storage, and ``rank_fused`` /
+    ``rank_few_planes`` pick its plan (``_get_sm100_kernel_class``). Those
+    choices follow the plan's KV extent and top-k width, so plans whose KV
+    extents select different layouts or plans compile different artifacts;
+    within one choice the extents stay symbolic. Overrides must match the
+    choice the workspace was sized for.
     The returned launchable belongs to ``device_index``'s CUDA context and may
     be reused only for plans with the same cached signature.
     """
@@ -349,7 +393,14 @@ def _compile_deterministic_sm100(
     if backend == "generic_m64":
         kernel_cls = _deterministic_kernel_class_for_config(deterministic_shards, deterministic_relay_cluster_size)
     else:
-        kernel_cls = _get_sm100_kernel_class(backend, True)
+        # The H128 D512 conflict-rank class is the only one-plane two-CTA view.
+        kernel_cls = _get_sm100_kernel_class(
+            backend,
+            True,
+            rank_shard=backend == "h128_2cta_m64" and deterministic_shards == 1,
+            rank_fused=rank_fused,
+            rank_few_planes=rank_few_planes,
+        )
         required_shards = kernel_cls.num_dkv_shards
         required_relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1)
         if required_shards != deterministic_shards:
@@ -573,6 +624,7 @@ def flash_attn_bwd_sm100(
         head_dim,
         num_head,
         deterministic_relay_cluster_size,
+        max_topk=max_topk,
     )
     if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
         # The D576 two-CTA kernel has its own plan-time compile and launch
@@ -612,6 +664,7 @@ def flash_attn_bwd_sm100(
         deterministic,
         backend,
         deterministic_relay_cluster_size,
+        max_topk=max_topk,
     )
     workspace_LSE_OdO, workspace_dKV = _carve_workspace_sm100(
         workspace,
@@ -623,7 +676,8 @@ def flash_attn_bwd_sm100(
         # The two-CTA kernel shares the generic workspace geometry, which keeps
         # ``flash_attn_bwd_sm100_workspace_size`` backend-agnostic for callers.
         assert kernel_cls._get_workspace_size_LSE_OdO(total_S_q, head_dim, num_head, batch_size, cutlass.Float32) == tuple(workspace_lse_odo_shape)
-        assert kernel_cls._get_workspace_size_dKV(total_S_kv, head_dim, batch_size, cutlass.Float32) == tuple(workspace_dkv_shape)
+        if not getattr(kernel_cls, "rank_shard", False):
+            assert kernel_cls._get_workspace_size_dKV(total_S_kv, head_dim, batch_size, cutlass.Float32) == tuple(workspace_dkv_shape)
 
     # Every route clears its FP32 dKV accumulator in-kernel and its finalizer
     # overwrites every public dKV element, so dkv needs no reset. Ordinary
@@ -650,6 +704,8 @@ def flash_attn_bwd_sm100(
         block_tile,
         deterministic_shards,
         selected_relay_cluster_size,
+        getattr(kernel_cls, "rank_fused", False),
+        getattr(kernel_cls, "rank_few_planes", False),
         device.index,
         pool_size,
         max_topk,

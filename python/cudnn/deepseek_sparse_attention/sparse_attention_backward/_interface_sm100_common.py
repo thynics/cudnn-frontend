@@ -10,10 +10,45 @@ import cutlass
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic, deterministic_kernel_class
+from .dsa_bwd_sm100_2cta_rank_shard import rank_merged_few_planes, rank_merged_fused, rank_merged_selected, rank_merged_workspace_words
+from .dsa_bwd_sm100_h128_d576_2cta_rank_shard import conflict_rank_rows, conflict_rank_selected, rank_d576_record
 
 _BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
 _WORKSPACE_ALIGNMENT = 128
 _INT32_ADDRESSABLE_ELEMENTS = 1 << 31
+_H128_D512_TWO_CTA_WAVE = 74
+_H128_D512_TWO_CTA_RECORD = 512
+# D576 conflict-rank waves launch up to 76 cluster pairs per round (one per two SMs); workspace sizes
+# assume the maximum unless the launched pairs are given.
+_H128_D576_TWO_CTA_MAX_WAVE = 76
+
+
+def _h128_d512_rank_shard_selected(total_s_kv: int, max_topk: Optional[int]) -> bool:
+    """Return whether a deterministic H128 D512 two-CTA plan uses conflict-rank dKV storage."""
+    if max_topk is None or total_s_kv <= 0:
+        return False
+    private_bytes = math.prod(FlashAttentionDSABackwardSm100Deterministic._get_workspace_size_dKV(total_s_kv, _H128_D512_TWO_CTA_RECORD, 1, cutlass.Float32))
+    return rank_merged_selected(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE, private_bytes)
+
+
+def _h128_d512_rank_fused_selected(total_s_kv: int, max_topk: int) -> bool:
+    """Return whether a conflict-rank H128 D512 plan runs its wave tails inside the next main kernel."""
+    return rank_merged_fused(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE)
+
+
+def _h128_d512_rank_few_planes_selected(total_s_kv: int, max_topk: int) -> bool:
+    """Return whether a per-wave-setup conflict-rank H128 D512 plan keeps at most ``RANK_FEW_PLANES`` (three) dense planes."""
+    return rank_merged_few_planes(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE)
+
+
+def _h128_d576_rank_shard_selected(total_s_kv: int, max_topk: Optional[int]) -> bool:
+    """Return whether a deterministic H128 D576 two-CTA plan uses conflict-rank dKV records."""
+    if max_topk is None or total_s_kv <= 0:
+        return False
+    from .dsa_bwd_sm100_h128_d576_2cta_deterministic import TwoCTADeterministicReduction
+
+    private_bytes = math.prod(TwoCTADeterministicReduction._get_workspace_size_dKV(total_s_kv, 576, 1, cutlass.Float32))
+    return conflict_rank_selected(total_s_kv, max_topk, rank_d576_record(max_topk), _H128_D576_TWO_CTA_MAX_WAVE, private_bytes)
 
 
 def _align_workspace_bytes(num_bytes: int) -> int:
@@ -29,13 +64,19 @@ def _workspace_shapes_sm100(
     deterministic: bool,
     backend: Optional[str] = None,
     deterministic_relay_cluster_size: Optional[int] = None,
+    max_topk: Optional[int] = None,
+    launch_pairs: Optional[int] = None,
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch.
 
     Generic deterministic M64 launches use the adaptive shard specialization,
-    including the row-aware cluster relay for large KV extents. H96/H128 D576
-    two-CTA kernels use their compact 96-plane workspace. An unspecified
-    backend retains the conservative 128-plane capacity.
+    including the row-aware cluster relay for large KV extents. Deterministic
+    H128 D512 and D576 two-CTA plans use conflict-rank dKV storage when it fits
+    their private-plane layout (128 D512 planes, 96 D576 planes), which they use
+    otherwise, as do H96 D576 plans. An unspecified backend retains the
+    conservative 128-plane capacity. Conflict-rank D576 plans size their
+    per-slot regions for ``launch_pairs`` cluster pairs per round (the device's
+    launched wave) when given, else for the maximum.
     """
     if deterministic_relay_cluster_size is not None:
         if not deterministic:
@@ -50,6 +91,14 @@ def _workspace_shapes_sm100(
         1,
         acc_dtype,
     )
+    if deterministic and backend == "h128_2cta_m64" and head_dim == _H128_D512_TWO_CTA_RECORD and _h128_d512_rank_shard_selected(total_s_kv, max_topk):
+        words = rank_merged_workspace_words(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE)
+        rows = -(-words // _H128_D512_TWO_CTA_RECORD)
+        return workspace_lse_odo_shape, (1, 1, rows, _H128_D512_TWO_CTA_RECORD * (acc_dtype.width // 8))
+    if deterministic and backend == "h128_d576_2cta_m64" and num_heads == 128 and _h128_d576_rank_shard_selected(total_s_kv, max_topk):
+        record = rank_d576_record(max_topk)
+        rows = conflict_rank_rows(total_s_kv, max_topk, record, _H128_D576_TWO_CTA_MAX_WAVE, launch_pairs)
+        return workspace_lse_odo_shape, (1, 1, rows, record * (acc_dtype.width // 8))
     if deterministic:
         if backend == "generic_m64":
             dkv_kernel_cls = deterministic_kernel_class(
@@ -124,6 +173,7 @@ def _requires_wide_data_addressing(
                 deterministic,
                 backend,
                 deterministic_relay_cluster_size,
+                max_topk=max_topk,
             )
         )
     return any(span > _INT32_ADDRESSABLE_ELEMENTS for span in spans)
@@ -138,6 +188,8 @@ def flash_attn_bwd_sm100_workspace_size(
     *,
     backend: Optional[str] = None,
     deterministic_relay_cluster_size: Optional[int] = None,
+    max_topk: Optional[int] = None,
+    launch_pairs: Optional[int] = None,
 ) -> int:
     """Return the reusable caller scratch required by one SM100 launch.
 
@@ -150,10 +202,19 @@ def flash_attn_bwd_sm100_workspace_size(
     or 64-CTA logical relay and reports that specialization's complete
     workspace. The 32-/64-CTA options use two/four ordered 16-CTA physical
     launches.
-    H96/H128 D576 two-CTA backends use a compact 96-plane layout; unspecified
-    backends use the conservative fixed 128-plane layout. The result includes
-    alignment padding and is the minimum byte count for a contiguous
-    ``torch.uint8`` workspace.
+    Deterministic H128 D512 (``h128_2cta_m64``) and H128 D576
+    (``h128_d576_2cta_m64``) plans size conflict-rank dKV storage when
+    ``max_topk`` is given and the extents select it; it never exceeds their
+    private-plane layout (128 D512 or 96 D576 FP32 planes), which they use
+    otherwise and which ``max_topk=None`` reports as an upper bound for every
+    top-k width. The D576 conflict-rank size also depends on the cluster pairs
+    each wave round launches, which follow the device's SM count:
+    ``launch_pairs`` (``_deterministic_compact_slots`` of that SM count) gives
+    one device's size, and ``None`` sizes for the maximum of 76 pairs, an
+    upper bound for every device. H96 D576 two-CTA backends use the 96-plane
+    layout; unspecified backends use the conservative fixed 128-plane layout.
+    The result includes alignment padding and is the minimum byte count for a
+    contiguous ``torch.uint8`` workspace.
     """
     workspace_lse_odo_shape, workspace_dkv_shape = _workspace_shapes_sm100(
         total_s_q,
@@ -163,5 +224,7 @@ def flash_attn_bwd_sm100_workspace_size(
         deterministic,
         backend,
         deterministic_relay_cluster_size,
+        max_topk=max_topk,
+        launch_pairs=launch_pairs,
     )
     return _align_workspace_bytes(math.prod(workspace_lse_odo_shape)) + _align_workspace_bytes(math.prod(workspace_dkv_shape))

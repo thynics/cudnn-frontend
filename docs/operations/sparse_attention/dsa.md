@@ -316,11 +316,66 @@ full table and environment are recorded in `benchmark/dsa/README.md`.
 
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in
-same-stream waves of at most 74 query tokens, with one two-CTA pair per query.
-Private FP32 accumulator slots and ordered duplicate-index writers give each
-update a fixed accumulation order. Stream ordering serializes slot reuse
-between waves, and fixed-order reductions produce `dKV` and `d_sink`. Both
-specializations keep the public workspace capacity of 128 FP32 dKV planes.
+same-stream waves with one two-CTA pair per query: D512 spreads the queries
+evenly over waves of at most 74, and D576 waves hold one query per two-SM
+cluster (at most 76) per wave round, at most 74 per round in three-round plans
+(devices with 152 or more SMs leave the remaining SMs idle there). Each wave
+accumulates dKV either in private FP32 slots or in conflict-rank storage
+(below); ordered duplicate-index writers and stream ordering between waves give
+each update a fixed accumulation order, and fixed-order reductions produce
+`dKV` and `d_sink`. With either H128 two-CTA layout, duplicate indices within a
+query row are inside the deterministic contract, unlike the bounded-wave M64
+and SM90 deterministic paths. The private-plane layouts hold 128 FP32 dKV
+planes for D512 and 96 for D576; H96/D576 always uses its 96-plane layout.
+
+**Conflict-rank dKV storage (deterministic H128 D512/D576).** Within a wave,
+the queries that select a KV row are ranked by their position in the wave. The
+query of rank `k < P` accumulates into dense FP32 plane `k` (the first write of
+a row above plane 0 stores, later ones add); higher ranks write compact
+overflow records, so every plane row and every record has a single writer per
+wave and the main kernel needs no writer ordering. A row that one query selects
+more than once takes per-slot records in every slot of that wave that selects
+it.
+A per-wave tail adds the overflow records to plane 0 in a fixed order (rank
+order, with long chains summed in fixed segments) and the per-slot records in
+(query, slot) order, with sorted slots for D576 top-k 1024 and wider; the final
+fold adds each row's used planes in plane order. Small setup kernels chained
+to the main kernels with programmatic dependent launch compute each wave's
+ranks and destination records before it runs. D512 plans with top-k 512 or
+less that keep at least three dense planes next to a doubled overflow area run
+these steps in a setup warp in each CTA of the preceding main kernel instead,
+and each wave's tail in the next main kernel's reducer warps, which shift a
+row's ranks off plane 0 while that tail is pending.
+
+- **When it is selected** — automatically, from the KV extent and the top-k
+  width, whenever the conflict-rank workspace fits the private-plane layout
+  (D576 at top-k 128 also requires the layout sized for its expected conflict
+  load to need at most three quarters of it). Short KV extents relative to the
+  top-k width, where the private planes are already small, keep the
+  private-plane layout. The choice depends only on shapes, so one problem
+  always takes the same path.
+- **Workspace** — `scratch_workspace_bytes()` reports the selected layout; it
+  never exceeds the private-plane size of the same problem. The dense planes
+  fill a budget of about 1 GiB, but at least one plane (and the per-row state)
+  is kept, so past a few hundred thousand KV rows the workspace grows with the
+  KV extent: at `total_S_q=4096` about 2.1-2.4 GiB per million KV rows for D512
+  and 2.5-2.7 GiB for D576, about 1% of the private-plane layout (256 and
+  216 GiB per million rows). The D576 size also depends on the plan device's SM
+  count, through the cluster pairs each wave round launches: query
+  `scratch_workspace_bytes()` for the device that executes the plan, since a
+  size from a device with fewer SMs can be too small (`execute()` then rejects
+  the workspace). Every execution re-initializes the conflict-rank state it
+  reads, so one workspace can be reused across executions with different
+  `topk_idxs` and `topk_length`, and a captured plan replays new input contents
+  like the private-plane plans.
+- **Determinism** — outputs are bitwise reproducible run to run. Duplicate
+  indices within a query row, `-1` and out-of-range indices, and any
+  `topk_length` are inside this contract. The order of every FP32 sum is fixed
+  by the plan: D512 waves depend only on the query count, D576 waves also on the
+  device's SM count, so results are bitwise identical between GPUs of the same
+  compute capability whose plans launch the same waves. Conflict-rank and
+  private-plane plans sum in different orders; their results agree within FP32
+  rounding, not bitwise.
 
 Other deterministic envelopes with H16/H32/H64/H96/H128 use the bounded-wave
 M64 implementation. Ordinary extents select 32 dKV shards for
