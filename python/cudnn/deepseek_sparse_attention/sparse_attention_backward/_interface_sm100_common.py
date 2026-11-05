@@ -9,11 +9,33 @@ from typing import Optional, Tuple
 import cutlass
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
-from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic, deterministic_kernel_class
+from .dsa_bwd_sm100_deterministic import DETERMINISTIC_DKV_MODES, FlashAttentionDSABackwardSm100Deterministic, deterministic_kernel_class
 
 _BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
 _WORKSPACE_ALIGNMENT = 128
 _INT32_ADDRESSABLE_ELEMENTS = 1 << 31
+
+
+# Backends on which a ``deterministic_dkv_mode="chain"`` plan can run (``None``: backend not yet selected):
+# the generic M64 kernel, and the H64 + H32 composition that deterministic H96 D576 keeps where neither
+# conflict-rank layout applies to the shape.
+_CHAIN_MODE_BACKENDS = ("generic_m64", "h96_h64_h32")
+
+
+def deterministic_dkv_mode_error(dkv_mode, deterministic: bool, backend: Optional[str] = None) -> Optional[str]:
+    """Return why a plan cannot honor ``deterministic_dkv_mode``, or ``None``.
+
+    The option selects the dKV storage of deterministic SM100 generic M64 plans. Unknown values are
+    rejected, every value but the default needs ``deterministic=True``, and ``'chain'`` is rejected on a
+    backend that never runs the generic M64 kernel (the SM90 and two-CTA backends) rather than ignored.
+    """
+    if not isinstance(dkv_mode, str) or dkv_mode not in DETERMINISTIC_DKV_MODES:
+        return f"deterministic_dkv_mode must be one of {DETERMINISTIC_DKV_MODES}, got {dkv_mode!r}"
+    if dkv_mode != "records" and not deterministic:
+        return f"deterministic_dkv_mode={dkv_mode!r} requires deterministic=True"
+    if dkv_mode == "chain" and backend is not None and backend not in _CHAIN_MODE_BACKENDS:
+        return "deterministic_dkv_mode='chain' is supported only by the deterministic SM100 generic_m64 backend"
+    return None
 
 
 def _align_workspace_bytes(num_bytes: int) -> int:
@@ -29,14 +51,20 @@ def _workspace_shapes_sm100(
     deterministic: bool,
     backend: Optional[str] = None,
     deterministic_relay_cluster_size: Optional[int] = None,
+    max_topk: Optional[int] = None,
+    dkv_mode: str = "records",
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch.
 
     Generic deterministic M64 launches use the adaptive shard specialization,
     including the row-aware cluster relay for large KV extents. H96/H128 D576
     two-CTA kernels use their compact 96-plane workspace. An unspecified
-    backend retains the conservative 128-plane capacity.
+    backend retains the conservative 128-plane capacity. ``dkv_mode`` is the
+    plan's ``deterministic_dkv_mode`` (see ``deterministic_dkv_mode_error``).
     """
+    mode_error = deterministic_dkv_mode_error(dkv_mode, deterministic, backend)
+    if mode_error is not None:
+        raise ValueError(mode_error)
     if deterministic_relay_cluster_size is not None:
         if not deterministic:
             raise ValueError("deterministic_relay_cluster_size requires deterministic=True")
@@ -58,6 +86,8 @@ def _workspace_shapes_sm100(
                 head_dim,
                 num_heads,
                 deterministic_relay_cluster_size,
+                max_topk=max_topk,
+                dkv_mode=dkv_mode,
             )
         elif backend in {"h96_d576_2cta_m64", "h128_d576_2cta_m64"}:
             from .dsa_bwd_sm100_h128_d576_2cta_deterministic import TwoCTADeterministicReduction
@@ -67,7 +97,10 @@ def _workspace_shapes_sm100(
             dkv_kernel_cls = FlashAttentionDSABackwardSm100Deterministic
     else:
         dkv_kernel_cls = FlashAttentionDSABackwardSm100
-    if hasattr(dkv_kernel_cls, "_get_workspace_size_dKV_for_q"):
+    if hasattr(dkv_kernel_cls, "_get_workspace_size_dKV_for_rank"):
+        # Conflict-rank plans (generic M64 only) size their waves from the plan (``rank_m64_wave``).
+        workspace_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV_for_rank(total_s_kv, head_dim, max_topk, 1, acc_dtype, num_heads, total_s_q)
+    elif hasattr(dkv_kernel_cls, "_get_workspace_size_dKV_for_q"):
         workspace_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV_for_q(
             total_s_q,
             total_s_kv,
@@ -98,6 +131,7 @@ def _requires_wide_data_addressing(
     *,
     include_workspace: bool,
     deterministic_relay_cluster_size: Optional[int] = None,
+    dkv_mode: str = "records",
 ) -> bool:
     """Return whether a compact plan tensor can exceed signed Int32 offsets.
 
@@ -124,6 +158,8 @@ def _requires_wide_data_addressing(
                 deterministic,
                 backend,
                 deterministic_relay_cluster_size,
+                max_topk=max_topk,
+                dkv_mode=dkv_mode,
             )
         )
     return any(span > _INT32_ADDRESSABLE_ELEMENTS for span in spans)
@@ -138,6 +174,8 @@ def flash_attn_bwd_sm100_workspace_size(
     *,
     backend: Optional[str] = None,
     deterministic_relay_cluster_size: Optional[int] = None,
+    max_topk: Optional[int] = None,
+    dkv_mode: str = "records",
 ) -> int:
     """Return the reusable caller scratch required by one SM100 launch.
 
@@ -154,6 +192,15 @@ def flash_attn_bwd_sm100_workspace_size(
     backends use the conservative fixed 128-plane layout. The result includes
     alignment padding and is the minimum byte count for a contiguous
     ``torch.uint8`` workspace.
+
+    Deterministic generic M64 plans store dKV in conflict-rank storage where
+    ``rank_dkv_route`` selects it, which needs the plan's top-k width: pass
+    ``max_topk`` and ``dkv_mode`` (the plan's ``deterministic_dkv_mode``) to
+    get the plan's exact size. Without ``max_topk`` the result is the shard or
+    relay layout's size, an upper bound of every conflict-rank plan of the
+    shape except chain-mode H96 D576 plans (bounded by the 128-plane layout).
+    Pass the backend the plan selects; for deterministic H96 D576 it depends on
+    the extents, ``max_topk`` and ``dkv_mode`` (``_select_sm100_backend``).
     """
     workspace_lse_odo_shape, workspace_dkv_shape = _workspace_shapes_sm100(
         total_s_q,
@@ -163,5 +210,7 @@ def flash_attn_bwd_sm100_workspace_size(
         deterministic,
         backend,
         deterministic_relay_cluster_size,
+        max_topk=max_topk,
+        dkv_mode=dkv_mode,
     )
     return _align_workspace_bytes(math.prod(workspace_lse_odo_shape)) + _align_workspace_bytes(math.prod(workspace_dkv_shape))
