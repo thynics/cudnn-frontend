@@ -14,7 +14,7 @@ Passes:
   fwd   ``cudnn.DSA.SparseAttentionForward.execute`` with preallocated
         outputs (SM100-family only).
   bwd   ``cudnn.DSA.SparseAttentionBackward.execute`` with preallocated
-        gradients and workspace (SM90 / SM100). The ``out``/``lse`` it
+        gradients and workspace (SM90 / SM100 / SM107). The ``out``/``lse`` it
         consumes come from a chunked PyTorch reference, so no forward launch
         sits in the timed region.
 
@@ -200,6 +200,7 @@ def setup_bwd(args, q, kv, topk_idxs, attn_sink, topk_length, softmax_scale):
     op.compile()
     workspace_bytes = op.scratch_workspace_bytes()
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device) if workspace_bytes else None
+    d_sink = torch.empty_like(attn_sink)
 
     def run():
         op.execute(
@@ -216,6 +217,7 @@ def setup_bwd(args, q, kv, topk_idxs, attn_sink, topk_length, softmax_scale):
             topk_length=topk_length,
             softmax_scale=softmax_scale,
             workspace=workspace,
+            d_sink=d_sink,
         )
 
     detail = f"SparseAttentionBackward.execute workspace_bytes={workspace_bytes} deterministic={args.deterministic}"
@@ -259,7 +261,7 @@ def main():
     if args.profile_pass == "fwd" and major != 10:
         unsupported(f"DSA sparse forward requires an SM100-family GPU, found SM{major}{minor}")
     if args.profile_pass == "bwd" and major not in (9, 10):
-        unsupported(f"DSA sparse backward requires SM90 or SM100, found SM{major}{minor}")
+        unsupported(f"DSA sparse backward requires SM90, SM100 or SM107, found SM{major}{minor}")
     try:
         import cudnn
         from cudnn import DSA

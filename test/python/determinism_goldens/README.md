@@ -3312,6 +3312,29 @@ to the target alone. Replay/reference cases also cover nonzero dO for every
 sequence. Empty-row sentinels retain their actual float dtype and raw bits;
 NaNs and non-finite outputs/gradients still fail.
 
+#### SM107 ordinary H128 two-CTA validation (2026-11-17)
+
+The BF16 H128 D512/V512 and D576/V512 two-CTA routes are selected only with
+`deterministic=False`; their atomic dKV accumulation does not promise raw-byte
+replay or batch invariance. Deterministic plans retain the generic SM107 route.
+
+On a 216-SM device of compute capability 10.7, with CuTe DSL 4.8.0 (CUDA 13.4
+compiler), Torch `2.13.0a0+9186a08b2c.nv26.07` (CUDA 13.3), and cuDNN 9.24.0:
+
+- The three `test_DSA_sparse_attention_backward_rubin*.py` suites,
+  `test_DSA_runtime.py`, and the backward suite's
+  `test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering`,
+  selected with `-m "L0 or L1"`, passed 226 tests and skipped 8. Coverage
+  includes schedule selection, invalid storage, numerical references,
+  workspace reuse, boundaries, and explicit streams.
+- `test_DSA_determinism.py -m L0`, with `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
+  passed 49 tests and skipped 52 under the suite's existing conditions.
+  No skip was added, no tolerance was relaxed, and no golden was regenerated.
+
+These results preserve the deterministic-route coverage and its existing
+limitations; they do not establish determinism for the ordinary two-CTA routes.
+Other GPU architectures were not requalified by this run.
+
 ### DSA deterministic dKV layouts: 45 cases
 
 `TestDSADeterministicDKV` runs on SM100/SM103, where deterministic backward

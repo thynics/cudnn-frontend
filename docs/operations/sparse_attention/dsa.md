@@ -33,7 +33,7 @@ The module packages the following operations:
 
 1. **Sparse Attention Forward** – sparse Prefill MQA on SM90 and SM100.
 2. **Sparse Attention Backward** – DSA backward for flat MQA tensors on
-   SM90/SM100.
+   SM90/SM100, plus BF16 H128 D512/D576 on SM107.
 3. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask) that materializes dense scores.
 4. **Combined Indexer Forward + Top-K** – SM90/SM100 compact score generation,
@@ -281,8 +281,11 @@ Contiguous BF16 H128 with `head_dim = 576`, `head_dim_v = 512`, and the same
 `topk_max` set uses the H128/D576 two-CTA specialization. H16 with
 `head_dim=576` uses the dedicated M128 sparse-row pipeline. FP16, other head
 counts and dimensions, and every other `topk_max` retain the existing
-generic/H16/H32 selection. Other compute capabilities, including SM107, do not
-select the two-CTA paths. No backend or tile-size argument is required. SM90
+generic/H16/H32 selection. In the PyTorch API on SM107, contiguous BF16 H128 inputs with
+D512/V512 or D576/V512 and the same `topk_max` set select dedicated two-CTA
+implementations when `deterministic=False`. These require a CuTe DSL build
+with the `sm_107a` target. Plans requiring Int64 data or workspace addressing
+retain the generic implementation. No backend or tile-size argument is required. SM90
 continues to use its Hopper-specific implementation. Every input must be
 contiguous on every route: `check_support()` declines a strided tensor with
 `NotImplementedError` naming it and its strides, and `execute()` rejects one
@@ -317,6 +320,15 @@ accumulates dKV in that workspace, and converts it to the public BF16 output
 with a helper kernel. With the default `deterministic=False`, short query
 batches split each query's top-k range across otherwise idle two-SM clusters;
 the split count is fixed when the plan is compiled.
+
+The SM107 kernels preserve the sparse-slot masking and FP32 dKV workspace
+contract. D512 schedules depend on declared query length and top-k width;
+D576 also selects prefetch and writeback options from the sequence extents.
+D576 splits short query batches only with explicit `topk_length`. Schedule
+selection and compilation use tensor metadata without reading device values.
+The kernels accumulate dKV with FP32 atomics and do not guarantee bitwise
+repeatability. `deterministic=True` retains the established generic route on
+SM107.
 
 On SM90, `deterministic=True` uses a row-aware relay with logical cluster size
 `C in {4, 8, 16, 32, 64}` for H16/H32/H64/H96/H128. The public
