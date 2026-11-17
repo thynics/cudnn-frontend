@@ -452,6 +452,11 @@ a row alone and inside a batch under the entry's own picks.
   rows by ranges of the batch's KV extent, which also changes dQ. SM107 plans
   keep the shard and relay layouts: `'records'` runs as `'shards'` and
   `'chain'` is rejected.
+- SM107 BF16 H128 D512/V512 and D576/V512 two-CTA backward plans are selected
+  only with `deterministic=False`. They use FP32 atomic dKV accumulation and
+  do not guarantee repeatability or batch invariance. Setting
+  `deterministic=True` retains the existing generic deterministic route and
+  its documented limits above.
 - QSA backward (`qsa_backward`, `qsa_indexed_backward`): set
   `deterministic=True`. `dq`, `dk` and `dv` then repeat for fixed inputs and a
   fixed packed layout: every FP32 accumulation adds in an order the layout

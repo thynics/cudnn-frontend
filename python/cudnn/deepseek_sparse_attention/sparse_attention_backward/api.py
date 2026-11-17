@@ -24,6 +24,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_
 
 from . import _interface_sm100 as _iface_sm100
 from . import _interface_sm100_d576 as _iface_d576
+from . import _interface_sm107 as _iface_sm107
 from ._sm90_relay import (
     SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
     sm90_deterministic_relay_accumulator_elements,
@@ -138,6 +139,7 @@ class SparseAttentionBackward(APIBase):
         self._two_cta_split_count = 1
         self._qcluster_plan = None
         self._wide_addressing = False
+        self._rubin_config = None
 
     def _validate_compiled_inputs(self, q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length) -> None:
         """Require execution inputs to match the plan's compiled contract."""
@@ -324,13 +326,41 @@ class SparseAttentionBackward(APIBase):
                 f"topk_length must have shape {(total_s_q,)}, got {self.topk_length_desc.shape}",
             )
 
-        # Resolve the SM100 backend once so compile()/execute() and the wrapper
-        # agree on the route; the interface repeats the selection for direct
-        # callers of ``flash_attn_bwd_sm100``.
-        self._backend = None
+        # Resolve the backend from declared metadata before compilation.
+        self._backend = _iface_sm107._select_sm107_backend(
+            num_heads,
+            head_dim,
+            head_dim_v=head_dim_v,
+            dtype=self.q_desc.dtype,
+            max_topk=self.topk_idxs_desc.shape[1],
+            device_capability=capability,
+            deterministic=self.deterministic,
+            is_contiguous=all(desc.is_contiguous() for desc in descriptors),
+        )
+        if self._backend is not None and _iface_sm100._requires_wide_data_addressing(
+            total_s_q,
+            self.kv_desc.shape[0],
+            head_dim,
+            head_dim_v,
+            num_heads,
+            self.topk_idxs_desc.shape[1],
+            False,
+            self._backend,
+            include_workspace=True,
+        ):
+            # The generic route retains support for tensors requiring Int64 addressing.
+            self._backend = None
         self._backend_block_tile = None
         self._wide_addressing = False
-        if major == 10:
+        if self._backend in _iface_sm107.BACKENDS:
+            error = _iface_sm107.cutedsl_requirement_error("Rubin DSA backward") or _iface_sm107.cutedsl_arch_requirement_error(capability)
+            self._runtime_error_if(error is not None, error)
+            self._value_error_if(total_s_q <= 0 or self.kv_desc.shape[0] <= 0, "Q and KV sequence extents must be positive")
+            sm_count = torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count if head_dim == 576 else 0
+            self._rubin_config, self._two_cta_split_count = _iface_sm107._select_config(
+                head_dim, total_s_q, self.kv_desc.shape[0], self.topk_idxs_desc.shape[1], self.topk_length_desc is not None, sm_count
+            )
+        elif major == 10:
             self._backend, self._backend_block_tile = _iface_sm100._select_sm100_backend(
                 num_heads,
                 head_dim,
@@ -420,6 +450,12 @@ class SparseAttentionBackward(APIBase):
         from concrete tensors on its first execution.
         """
         self._ensure_support_checked()
+        if self._backend in _iface_sm107.BACKENDS:
+            with torch.cuda.device(self.q_desc.device):
+                self._compiled_kernel = _iface_sm107._compile_sm107(
+                    self.q_desc.device.index, self.q_desc.shape[2], self.topk_idxs_desc.shape[1], self.topk_length_desc is not None, self._rubin_config
+                )
+            return
         if self.q_cluster_mode == "adaptive_pair":
             from ._qcluster_sm100 import compile_plan
 
@@ -662,6 +698,25 @@ class SparseAttentionBackward(APIBase):
             if self._compiled_kernel is None:
                 raise RuntimeError("call compile() before execute()")
             self._validate_compiled_inputs(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length)
+        if self._backend in _iface_sm107.BACKENDS:
+            return _iface_sm107._execute_sm107(
+                self._compiled_kernel,
+                q,
+                kv,
+                out,
+                dout,
+                lse,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                dq,
+                dkv,
+                d_sink,
+                workspace,
+                scale,
+                self._two_cta_split_count,
+                current_stream,
+            )
         if self._backend in _iface_d576.BACKENDS:
             return _iface_d576._execute_d576_2cta(
                 self._compiled_kernel,
@@ -779,7 +834,7 @@ def sparse_attention_backward_wrapper(
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
-    Dispatches to SM90 or SM100 from the input device and tensor metadata. The
+    Dispatches to SM90, SM100, or SM107 from the input device and tensor metadata. The
     returned ``d_sink`` is computed from ``attn_sink`` and ``dout``. Set
     ``deterministic=True`` for bitwise-reproducible
     H16/H32/H64/H96/H128 gradients on SM90 or SM100. The optional reusable uint8
